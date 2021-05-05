@@ -65,6 +65,56 @@ struct HalfKP {
     }
 };
 
+struct HalfKPFactorized {
+    // Factorized features
+    static constexpr int INPUTS = HalfKP::INPUTS + SQ_NB + Eval::fe_end;
+
+    static constexpr int MAX_K_FEATURES = 1;
+    static constexpr int MAX_ACTIVE_FEATURES = HalfKP::MAX_ACTIVE_FEATURES + MAX_K_FEATURES + PIECE_NUMBER_KING;
+
+    static void fill_features_sparse(int i, const TrainingDataEntry& e, int* features, float* values, int& counter, Color color)
+    {
+        auto counter_before = counter;
+        int offset = HalfKP::fill_features_sparse(i, e, features, values, counter, color);
+        auto& pos = e.pos;
+        Eval::BonaPiece* pieces = (color == BLACK) ?
+            pos->eval_list()->piece_list_fb() :
+            pos->eval_list()->piece_list_fw();
+        PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
+        Square sq_target_k = static_cast<Square>((pieces[target] - Eval::f_king) % SQ_NB);
+        {
+            auto num_added_features = counter - counter_before;
+            // king square factor
+            int idx = counter * 2;
+            features[idx] = i;
+            features[idx + 1] = offset + sq_target_k;
+            values[counter] = static_cast<float>(num_added_features);
+            counter += 1;
+        }
+        offset += SQ_NB;
+
+        // We order the features so that the resulting sparse
+        // tensor is coalesced. Note that we can just sort
+        // the parts where values are all 1.0f and leave the
+        // halfk feature where it was.
+        int features_unordered[PIECE_NUMBER_KING];
+        int j = 0;
+        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
+            features_unordered[j++] = offset + pieces[j];
+        }
+        std::sort(features_unordered, features_unordered + j);
+        for (int k = 0; k < j; ++k)
+        {
+            int idx = counter * 2;
+            features[idx] = i;
+            features[idx + 1] = features_unordered[k];
+            values[counter] = 1.0f;
+            counter += 1;
+        }
+    }
+};
+
+
 //struct HalfKPFactorized {
 //    // Factorized features
 //    static constexpr int K_INPUTS = HalfKP::NUM_SQ;
@@ -434,10 +484,10 @@ extern "C" {
         {
             return new SparseBatch(FeatureSet<HalfKP>{}, entries);
         }
-        //else if (feature_set == "HalfKP^")
-        //{
-        //    return new SparseBatch(FeatureSet<HalfKPFactorized>{}, entries);
-        //}
+        else if (feature_set == "HalfKP^")
+        {
+            return new SparseBatch(FeatureSet<HalfKPFactorized>{}, entries);
+        }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -475,10 +525,10 @@ extern "C" {
         {
             return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
         }
-        //else if (feature_set == "HalfKP^")
-        //{
-        //    return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        //}
+        else if (feature_set == "HalfKP^")
+        {
+            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -505,7 +555,7 @@ extern "C" {
 
 int main()
 {
-    auto stream = create_sparse_batch_stream("HalfKP", 4, "C:\\shogi\\kifu\\suisho-wcsoc2020.20200524.shuffled\\shuffled.000.bin", 8192, true, false, 0);
+    auto stream = create_sparse_batch_stream("HalfKP^", 4, "C:\\shogi\\kifu\\suisho-wcsoc2020.20200524.shuffled\\shuffled.000.bin", 8192, true, false, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i)
     {
