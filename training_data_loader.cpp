@@ -114,59 +114,6 @@ struct HalfKPFactorized {
     }
 };
 
-
-//struct HalfKPFactorized {
-//    // Factorized features
-//    static constexpr int K_INPUTS = HalfKP::NUM_SQ;
-//    static constexpr int PIECE_INPUTS = HalfKP::NUM_SQ * HalfKP::NUM_PT;
-//    static constexpr int INPUTS = HalfKP::INPUTS + K_INPUTS + PIECE_INPUTS;
-//
-//    static constexpr int MAX_K_FEATURES = 1;
-//    static constexpr int MAX_PIECE_FEATURES = 32;
-//    static constexpr int MAX_ACTIVE_FEATURES = HalfKP::MAX_ACTIVE_FEATURES + MAX_K_FEATURES + MAX_PIECE_FEATURES;
-//
-//    static void fill_features_sparse(int i, const TrainingDataEntry& e, int* features, float* values, int& counter, Color color)
-//    {
-//        auto counter_before = counter;
-//        int offset = HalfKP::fill_features_sparse(i, e, features, values, counter, color);
-//        auto& pos = e.pos;
-//        {
-//            auto num_added_features = counter - counter_before;
-//            // king square factor
-//            auto ksq = pos.kingSquare(color);
-//            int idx = counter * 2;
-//            features[idx] = i;
-//            features[idx + 1] = offset + static_cast<int>(orient(color, ksq));
-//            values[counter] = static_cast<float>(num_added_features);
-//            counter += 1;
-//        }
-//        offset += K_INPUTS;
-//        auto pieces = pos.piecesBB() & ~(pos.piecesBB(Piece(PieceType::King, Color::White)) | pos.piecesBB(Piece(PieceType::King, Color::Black)));
-//
-//        // We order the features so that the resulting sparse
-//        // tensor is coalesced. Note that we can just sort
-//        // the parts where values are all 1.0f and leave the
-//        // halfk feature where it was.
-//        int features_unordered[32];
-//        int j = 0;
-//        for(Square sq : pieces)
-//        {
-//            auto p = pos.pieceAt(sq);
-//            auto p_idx = static_cast<int>(p.type()) * 2 + (p.color() != color);
-//            features_unordered[j++] = offset + (p_idx * HalfKP::NUM_SQ) + static_cast<int>(orient(color, sq));
-//        }
-//        std::sort(features_unordered, features_unordered + j);
-//        for (int k = 0; k < j; ++k)
-//        {
-//            int idx = counter * 2;
-//            features[idx] = i;
-//            features[idx + 1] = features_unordered[k];
-//            values[counter] = 1.0f;
-//            counter += 1;
-//        }
-//    }
-//};
-
 template <typename T, typename... Ts>
 struct FeatureSet
 {
