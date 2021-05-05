@@ -10,9 +10,10 @@ function `get_feature_block_clss` at module scope that returns the list
 of feature block classes in that module.
 '''
 import halfkp
-import halfka
+# import halfka
 
-_feature_modules = [halfkp, halfka]
+_feature_modules = [halfkp]
+# _feature_modules = [halfkp, halfka]
 
 _feature_blocks_by_name = dict()
 
@@ -25,8 +26,8 @@ def _add_features_blocks_from_module(module):
     for feature_block_cls in feature_block_clss:
         _add_feature_block(feature_block_cls)
 
-def get_feature_block_from_name(name):
-    return _feature_blocks_by_name[name]
+# def get_feature_block_from_name(name):
+#     return _feature_blocks_by_name[name]
 
 def get_feature_blocks_from_names(names):
     return [_feature_blocks_by_name[name] for name in names]
