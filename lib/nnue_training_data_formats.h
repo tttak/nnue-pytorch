@@ -88,7 +88,7 @@ namespace binpack
 
         ret.pos = std::make_shared<Position>();
         StateInfo state_info = {};
-        ret.pos->set_from_packed_sfen(psv.sfen, &state_info, Threads[0]);
+        ret.pos->set_from_packed_sfen(psv.sfen, &state_info, Threads[0], false, 0, false);
         ret.move = ret.pos->to_move(psv.move);
         ret.score = psv.score;
         ret.ply = psv.gamePly;
