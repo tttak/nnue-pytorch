@@ -9,6 +9,8 @@
 #include <optional>
 #include <string>
 
+#include <ppl.h>
+
 namespace training_data {
     using namespace binpack;
 
@@ -74,9 +76,9 @@ namespace training_data {
         {
             Learner::PackedSfenValue e;
             bool reopenedFileOnce = false;
-            for(;;)
+            for (;;)
             {
-                if(m_stream.read(reinterpret_cast<char*>(&e), sizeof(Learner::PackedSfenValue)))
+                if (m_stream.read(reinterpret_cast<char*>(&e), sizeof(Learner::PackedSfenValue)))
                 {
                     auto entry = packedSfenValueToTrainingDataEntry(e);
                     if (!m_skipPredicate || !m_skipPredicate(entry))
@@ -198,23 +200,11 @@ namespace training_data {
             }
 
             vec.resize(n);
-            std::atomic<int> global_entry_index;
-            global_entry_index = 0;
-            std::vector<std::thread> threads;
-            for (int thread_index = 0; thread_index < m_concurrency; ++thread_index) {
-                auto thread = std::thread([n, &global_entry_index, &vec, &e]{
-                    for (int local_entry_index = global_entry_index++;
-                        local_entry_index < n;
-                        local_entry_index = global_entry_index++) {
-                        // TODO(hnoda): m_skipPredicateとm_skipPredicate(entry)を考慮する。
-                        vec[local_entry_index] = packedSfenValueToTrainingDataEntry(e[local_entry_index]);
-                    }
-                    });
-                threads.push_back(std::move(thread));
-            }
-            for (auto& thread : threads) {
-                thread.join();
-            }
+
+            concurrency::parallel_for(0, static_cast<int>(n), [&vec, &e](int entry_index) {
+                // TODO(hnoda): m_skipPredicateとm_skipPredicate(entry)を考慮する。
+                vec[entry_index] = packedSfenValueToTrainingDataEntry(e[entry_index]);
+                });
         }
 
         bool eof() const override
