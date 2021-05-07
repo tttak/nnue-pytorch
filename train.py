@@ -90,12 +90,7 @@ def main():
   checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
-  if not args.gpus:
-    main_device = 'cpu'
-  elif trainer.root_gpu:
-    main_device = 'cuda:' + str(trainer.root_gpu)
-  else:
-    main_device = trainer.root_device
+  main_device = trainer.root_device if trainer.root_gpu is None else 'cuda:' + str(trainer.root_gpu)
 
   if args.py_data:
     print('Using python data loader')
