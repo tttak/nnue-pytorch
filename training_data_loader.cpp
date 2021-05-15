@@ -374,7 +374,7 @@ private:
 namespace {
     bool initialized = false;
 
-    void EnsureInitializeYaneuraOu(int num_threads) {
+    void EnsureInitializeYaneuraOu() {
         if (initialized) {
             return;
         }
@@ -387,15 +387,13 @@ namespace {
 
         // エンジンオプションの"Threads"があるとは限らないので…。
         //size_t thread_num = Options.count("Threads") ? (size_t)Options["Threads"] : 1;
-        Threads.set(num_threads);
+        Threads.set(std::thread::hardware_concurrency());
 
         //Search::clear();
         Eval::init();
         Eval::load_eval();
 
         TT.resize(1024);
-
-        omp_set_num_threads(num_threads);
 
         initialized = true;
     }
@@ -412,7 +410,7 @@ extern "C" {
         int* results
     )
     {
-        EnsureInitializeYaneuraOu(1);
+        EnsureInitializeYaneuraOu();
 
         std::vector<TrainingDataEntry> entries;
         entries.reserve(num_fens);
@@ -444,7 +442,7 @@ extern "C" {
 
     EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, bool cyclic, bool filtered, int random_fen_skipping)
     {
-        EnsureInitializeYaneuraOu(concurrency);
+        EnsureInitializeYaneuraOu();
 
         std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
         if (filtered || random_fen_skipping)

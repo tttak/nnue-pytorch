@@ -9,6 +9,9 @@
 #include <optional>
 #include <string>
 
+#include <ppl.h>
+#include <concurrent_queue.h>
+
 namespace training_data {
     using namespace binpack;
 
@@ -199,11 +202,19 @@ namespace training_data {
 
             vec.resize(n);
 
-#pragma omp parallel for schedule(dynamic, 256)
-            for (int entry_index = 0; entry_index < n; ++entry_index) {
-                // TODO(hnoda): m_skipPredicate‚Æm_skipPredicate(entry)‚ðl—¶‚·‚éB
-                vec[entry_index] = packedSfenValueToTrainingDataEntry(e[entry_index], omp_get_thread_num());
-                    }
+            concurrency::concurrent_queue<int> thread_indexes;
+            int processor_count = std::thread::hardware_concurrency();
+            for (int thread_index = 0; thread_index < processor_count; ++thread_index) {
+                thread_indexes.push(thread_index);
+            }
+            concurrency::parallel_for(0, static_cast<int>(n), [&vec, &e, &thread_indexes](int entry_index) {
+                int thread_index = 0;
+                while (!thread_indexes.try_pop(thread_index)) {
+                    _mm_pause();
+                }
+                vec[entry_index] = packedSfenValueToTrainingDataEntry(e[entry_index], thread_index);
+                thread_indexes.push(thread_index);
+                });
         }
 
         bool eof() const override
