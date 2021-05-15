@@ -46,6 +46,8 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <mutex>
 #include <random>
 
+#include <omp.h>
+
 #include "rng.h"
 #include "YaneuraOu/learn/learn.h"
 #include "YaneuraOu/movepick.h"
@@ -84,11 +86,20 @@ namespace binpack
 
     [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv)
     {
+        int thread_index = omp_get_thread_num();
+
         TrainingDataEntry ret;
 
         ret.pos = std::make_shared<Position>();
-        StateInfo state_info = {};
-        ret.pos->set_from_packed_sfen(psv.sfen, &state_info, Threads[0], false, 0, false);
+        std::vector<StateInfo> state_info(256);
+        ret.pos->set_from_packed_sfen(psv.sfen, &state_info[0], Threads[thread_index], false, 0, false);
+
+        auto value_and_pv = Learner::qsearch(*ret.pos);
+        auto pv = value_and_pv.second;
+        for (int play = 0; play < pv.size(); ++play) {
+            ret.pos->do_move(pv[play], state_info[play + 1]);
+        }
+
         ret.move = ret.pos->to_move(psv.move);
         ret.score = psv.score;
         ret.ply = psv.gamePly;

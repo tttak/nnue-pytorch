@@ -393,6 +393,10 @@ namespace {
         Eval::init();
         Eval::load_eval();
 
+        TT.resize(1024);
+
+        omp_set_num_threads(num_threads);
+
         initialized = true;
     }
 }
@@ -511,5 +515,8 @@ int main()
     }
     auto t1 = std::chrono::high_resolution_clock::now();
     std::cout << (t1 - t0).count() / 1e9 << "s\n";
+
+    delete stream;
+    stream = nullptr;
 }
 //*/

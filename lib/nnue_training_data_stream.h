@@ -9,8 +9,6 @@
 #include <optional>
 #include <string>
 
-#include <ppl.h>
-
 namespace training_data {
     using namespace binpack;
 
@@ -201,10 +199,11 @@ namespace training_data {
 
             vec.resize(n);
 
-            concurrency::parallel_for(0, static_cast<int>(n), [&vec, &e](int entry_index) {
+#pragma omp parallel for schedule(dynamic)
+            for (int entry_index = 0; entry_index < n; ++entry_index) {
                 // TODO(hnoda): m_skipPredicate‚Æm_skipPredicate(entry)‚ðl—¶‚·‚éB
                 vec[entry_index] = packedSfenValueToTrainingDataEntry(e[entry_index]);
-                });
+            }
         }
 
         bool eof() const override

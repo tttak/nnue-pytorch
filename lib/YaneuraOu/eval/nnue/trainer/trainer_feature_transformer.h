@@ -102,7 +102,7 @@ class Trainer<FeatureTransformer> {
 #endif
 
 #pragma omp for
-      for (IndexType b = 0; b < batch.size(); ++b) {
+      for (int b = 0; b < batch.size(); ++b) {
         const IndexType batch_offset = kOutputDimensions * b;
         for (IndexType c = 0; c < 2; ++c) {
           const IndexType output_offset = batch_offset + kHalfDimensions * c;
@@ -280,7 +280,7 @@ class Trainer<FeatureTransformer> {
 #endif
 
 #pragma omp for private(training_features)
-      for (IndexType j = 0; j < RawFeatures::kDimensions; ++j) {
+      for (int j = 0; j < RawFeatures::kDimensions; ++j) {
         training_features.clear();
         Features::Factorizer<RawFeatures>::AppendTrainingFeatures(
             j, &training_features);
