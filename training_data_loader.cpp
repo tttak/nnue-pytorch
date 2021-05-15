@@ -37,7 +37,7 @@ struct HalfKP {
 
     static int fill_features_sparse(int i, const TrainingDataEntry& e, int* features, float* values, int& counter, Color color)
     {
-        auto& pos = *e.pos;
+        auto& pos = e.pos;
         //std::cout << pos << std::endl;
         Eval::BonaPiece* pieces = (color == BLACK) ?
             pos.eval_list()->piece_list_fb() :
@@ -78,8 +78,8 @@ struct HalfKPFactorized {
         int offset = HalfKP::fill_features_sparse(i, e, features, values, counter, color);
         auto& pos = e.pos;
         Eval::BonaPiece* pieces = (color == BLACK) ?
-            pos->eval_list()->piece_list_fb() :
-            pos->eval_list()->piece_list_fw();
+            pos.eval_list()->piece_list_fb() :
+            pos.eval_list()->piece_list_fw();
         PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
         Square sq_target_k = static_cast<Square>((pieces[target] - Eval::f_king) % SQ_NB);
         {
@@ -186,7 +186,7 @@ private:
     template <typename... Ts>
     void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e)
     {
-        is_black[i] = static_cast<float>(e.pos->side_to_move() == BLACK);
+        is_black[i] = static_cast<float>(e.pos.side_to_move() == BLACK);
         outcome[i] = (e.result + 1.0f) / 2.0f;
         score[i] = e.score;
         fill_features(FeatureSet<Ts...>{}, i, e);
@@ -419,11 +419,10 @@ extern "C" {
         for (int i = 0; i < num_fens; ++i)
         {
             auto& e = entries.emplace_back();
-            e.pos = std::make_shared<Position>();
             StateInfo state_info = {};
-            e.pos->set(fens[i], &state_info, Threads[0]);
+            e.pos.set(fens[i], &state_info, Threads[0]);
             ExtMove moves[1024];
-            generateMoves<MOVE_GEN_TYPE::LEGAL>(*e.pos, moves);
+            generateMoves<MOVE_GEN_TYPE::LEGAL>(e.pos, moves);
             e.move = moves[0];
             e.score = scores[i];
             e.ply = plies[i];

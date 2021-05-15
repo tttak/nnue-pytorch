@@ -62,7 +62,7 @@ namespace binpack
 {
     struct TrainingDataEntry
     {
-        std::shared_ptr<Position> pos;
+        Position pos;
         Move move;
         std::int16_t score;
         std::uint16_t ply;
@@ -70,37 +70,34 @@ namespace binpack
 
         [[nodiscard]] bool isValid() const
         {
-            return pos->pseudo_legal(move) && pos->legal(move);
+            return pos.pseudo_legal(move) && pos.legal(move);
         }
 
         [[nodiscard]] bool isCapturingMove() const
         {
-            return pos->piece_on(to_sq(move)) != Piece::NO_PIECE;
+            return pos.piece_on(to_sq(move)) != Piece::NO_PIECE;
         }
 
         [[nodiscard]] bool isInCheck() const
         {
-            return pos->in_check();
+            return pos.in_check();
         }
     };
 
-    [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv)
+    [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv, int thread_index = 0)
     {
-        int thread_index = omp_get_thread_num();
-
         TrainingDataEntry ret;
 
-        ret.pos = std::make_shared<Position>();
         StateInfo state_info[MAX_PLY];
-        ret.pos->set_from_packed_sfen(psv.sfen, &state_info[0], Threads[thread_index], false, 0, false);
+        ret.pos.set_from_packed_sfen(psv.sfen, &state_info[0], Threads[thread_index], false, 0, false);
 
-        auto value_and_pv = Learner::qsearch(*ret.pos);
+        auto value_and_pv = Learner::qsearch(ret.pos);
         auto pv = value_and_pv.second;
         for (int play = 0; play < pv.size(); ++play) {
-            ret.pos->do_move(pv[play], state_info[play + 1]);
+            ret.pos.do_move(pv[play], state_info[play + 1]);
         }
 
-        ret.move = ret.pos->to_move(psv.move);
+        ret.move = ret.pos.to_move(psv.move);
         ret.score = psv.score;
         ret.ply = psv.gamePly;
         ret.result = psv.game_result;

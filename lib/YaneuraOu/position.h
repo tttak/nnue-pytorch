@@ -171,8 +171,8 @@ public:
 	// 評価関数テーブルを参照するが、isready()が呼び出されていないのでこの初期化が出来ない。
 	Position() = default;
 
-	Position(const Position&) = delete;
-	Position& operator=(const Position&) = delete;
+	//Position(const Position&) = delete;
+	//Position& operator=(const Position&) = delete;
 
 	// Positionで用いるZobristテーブルの初期化
 	static void init();
