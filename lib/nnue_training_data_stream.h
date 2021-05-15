@@ -199,7 +199,7 @@ namespace training_data {
 
             vec.resize(n);
 
-#pragma omp parallel for schedule(dynamic)
+#pragma omp parallel for schedule(dynamic, 256)
             for (int entry_index = 0; entry_index < n; ++entry_index) {
                 // TODO(hnoda): m_skipPredicate‚Æm_skipPredicate(entry)‚ðl—¶‚·‚éB
                 vec[entry_index] = packedSfenValueToTrainingDataEntry(e[entry_index]);
