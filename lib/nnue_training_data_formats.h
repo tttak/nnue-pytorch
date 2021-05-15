@@ -91,7 +91,7 @@ namespace binpack
         TrainingDataEntry ret;
 
         ret.pos = std::make_shared<Position>();
-        std::vector<StateInfo> state_info(256);
+        StateInfo state_info[MAX_PLY];
         ret.pos->set_from_packed_sfen(psv.sfen, &state_info[0], Threads[thread_index], false, 0, false);
 
         auto value_and_pv = Learner::qsearch(*ret.pos);
