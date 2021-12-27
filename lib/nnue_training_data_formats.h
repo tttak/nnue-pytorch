@@ -84,8 +84,12 @@ namespace binpack
         }
     };
 
+    std::vector<std::mutex> mutexes(std::thread::hardware_concurrency());
+
     [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv, int thread_index = 0)
     {
+        std::lock_guard<std::mutex> lock(mutexes[thread_index]);
+
         TrainingDataEntry ret;
 
         StateInfo state_info[MAX_PLY];
