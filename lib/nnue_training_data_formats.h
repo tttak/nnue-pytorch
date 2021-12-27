@@ -95,14 +95,18 @@ namespace binpack
         StateInfo state_info[MAX_PLY];
         ret.pos.set_from_packed_sfen(psv.sfen, &state_info[0], Threads[thread_index], false, 0, false);
 
+        auto root_color = ret.pos.side_to_move();
+
         auto value_and_pv = Learner::qsearch(ret.pos);
         auto pv = value_and_pv.second;
         for (int play = 0; play < pv.size(); ++play) {
             ret.pos.do_move(pv[play], state_info[play + 1]);
         }
 
+        auto leaf_color = ret.pos.side_to_move();
+
         ret.move = ret.pos.to_move(psv.move);
-        ret.score = psv.score;
+        ret.score = (root_color == leaf_color ? psv.score : -psv.score);
         ret.ply = psv.gamePly;
         ret.result = psv.game_result;
 
