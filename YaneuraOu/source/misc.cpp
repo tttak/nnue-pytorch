@@ -285,7 +285,7 @@ const std::string config_info()
 {
 	std::string config = "\nconfigured by config.h";
 
-	auto o  = [](std::string(p) , std::string(q)) { return "\n" + (p + std::string(20,' ')).substr(0,20) + " : " + q; };
+	auto o  = [](std::string p, std::string q) { return "\n" + (p + std::string(20,' ')).substr(0,20) + " : " + q; };
 	auto o1 = [&o](const char* p , u64  u ) { return o(std::string(p) , std::to_string(u) ); };
 	auto o2 = [&o](const char* p , bool b ) { return o(std::string(p) , b ? "true":"false"); };
 
