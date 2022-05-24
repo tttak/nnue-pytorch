@@ -4,9 +4,9 @@ import feature_block
 from collections import OrderedDict
 from feature_block import *
 
-NUM_SQ = 64
-NUM_PT = 10
-NUM_PLANES = (NUM_SQ * NUM_PT + 1)
+NUM_SQ = 81
+# NUM_PT = 10
+NUM_PLANES = 1548
 
 def orient(is_white_pov: bool, sq: int):
   return (63 * (not is_white_pov)) ^ sq
