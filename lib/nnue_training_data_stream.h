@@ -9,6 +9,8 @@
 #include <string>
 #include <memory>
 
+#include <ppl.h>
+
 namespace training_data {
 
     using namespace binpack;
@@ -100,6 +102,42 @@ namespace training_data {
 
                     m_eof = true;
                     return std::nullopt;
+                }
+            }
+        }
+
+        void fill(std::vector<TrainingDataEntry>& vec, std::size_t n) override
+        {
+            std::vector<Learner::PackedSfenValue> packedSfenValues(n);
+            bool reopenedFileOnce = false;
+            for (;;)
+            {
+                if (m_stream.read(reinterpret_cast<char*>(&packedSfenValues[0]), sizeof(Learner::PackedSfenValue) * n))
+                {
+                    vec.resize(n);
+                    concurrency::parallel_for(size_t(0), n, [&vec, &packedSfenValues](size_t i)
+                        {
+                            vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues[i]);
+                        });
+                    return;
+                }
+                else
+                {
+                    if (m_cyclic)
+                    {
+                        if (reopenedFileOnce)
+                            return;
+
+                        m_stream = std::fstream(m_filename, openmode);
+                        reopenedFileOnce = true;
+                        if (!m_stream)
+                            return;
+
+                        continue;
+                    }
+
+                    m_eof = true;
+                    return;
                 }
             }
         }
