@@ -108,23 +108,6 @@ namespace training_data {
 
         void fill(std::vector<TrainingDataEntry>& vec, std::size_t n) override
         {
-            if (first) {
-                first = false;
-                fill_internal(vec, n);
-            }
-            else {
-                read_task.wait();
-                vec.clear();
-                vec.swap(read_buffer);
-            }
-
-            read_task = concurrency::task<void>([this, n]() {
-                fill_internal(read_buffer, n);
-                });
-        }
-
-        void fill_internal(std::vector<TrainingDataEntry>& vec, std::size_t n)
-        {
             std::vector<Learner::PackedSfenValue> packedSfenValues(n);
             bool reopenedFileOnce = false;
             for (;;)
@@ -172,9 +155,6 @@ namespace training_data {
         bool m_eof;
         bool m_cyclic;
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
-        concurrency::task<void> read_task;
-        std::vector<TrainingDataEntry> read_buffer;
-        bool first = true;
     };
 
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
