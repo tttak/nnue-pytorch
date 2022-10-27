@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import sys
 
 # 3 layer fully connected network
 L1 = 256
@@ -140,11 +141,14 @@ class NNUE(pl.LightningModule):
     latest_loss = sum(outputs) / len(outputs)
     if self.newbob_decay != 1.0:
       if latest_loss < self.best_loss:
-        self.print(f"loss: {latest_loss} < best ({self.best_loss}), accepted")
+        self.print(f"{latest_loss=} < {self.best_loss=}, accepted, {self.newbob_scale=}")
+        sys.stdout.flush()
         self.best_loss = latest_loss
       else:
-        self.print(f"loss: {latest_loss} >= best ({self.best_loss}), rejected");
         self.newbob_scale *= self.newbob_decay
+        self.print(f"{latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
+        sys.stdout.flush()
+    # self.log('newbob_scale', self.newbob_scale)
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
@@ -171,6 +175,7 @@ class NNUE(pl.LightningModule):
       warmup_scale = 1.0
     for pg in optimizer.param_groups:
       pg["lr"] = self.lr * warmup_scale * self.newbob_scale
+      self.log("lr", pg["lr"])
 
   def configure_optimizers(self):
     return torch.optim.SGD(self.parameters(), lr=self.lr)
