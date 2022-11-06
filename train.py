@@ -47,9 +47,7 @@ def main():
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--label-smoothing-eps", default=0.0, type=float, dest='label_smoothing_eps', help="Label smoothing eps.")
   parser.add_argument("--num-batches-warmup", default=10000, type=int, dest='num_batches_warmup', help="Number of batches for warm-up.")
-  parser.add_argument("--newbob-decay", default=0.5, type=float, dest='newbob_decay', help="Newbob decay.")
-  parser.add_argument("--epoch-size", default=1000000, type=int, dest='epoch_size', help="epoch size.")
-  parser.add_argument("--num-epochs-to-adjust-lr", default=500, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
+  parser.add_argument("--epoch-size", default=100000000, type=int, dest='epoch_size', help="epoch size.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -61,7 +59,7 @@ def main():
   feature_set = features.get_feature_set_from_name(args.features)
 
   if args.resume_from_model is None:
-    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma, lr=args.lr, label_smoothing_eps=args.label_smoothing_eps, num_batches_warmup=args.num_batches_warmup, newbob_decay=args.newbob_decay, num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr)
+    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma, lr=args.lr, label_smoothing_eps=args.label_smoothing_eps, num_batches_warmup=args.num_batches_warmup)
   else:
     nnue = torch.load(args.resume_from_model)
     nnue.set_feature_set(feature_set)
@@ -100,7 +98,7 @@ def main():
   checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
-  main_device = trainer.root_device if trainer.root_gpu is None else 'cuda:' + str(trainer.root_gpu)
+  main_device = trainer.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
 
   if args.py_data:
     print('Using python data loader')
