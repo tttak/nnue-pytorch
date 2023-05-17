@@ -25,6 +25,16 @@ def data_loader_cc(train_filename, val_filename, feature_set, num_workers, batch
   val = DataLoader(nnue_dataset.FixedNumBatchesDataset(val_infinite, (val_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
   return train, val
 
+def str2bool(v):
+  if isinstance(v, bool):
+      return v
+  if v.lower() in ('yes', 'true', 't', 'y', '1'):
+      return True
+  elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+      return False
+  else:
+      raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def data_loader_py(train_filename, val_filename, feature_set, batch_size, main_device):
   train = DataLoader(nnue_bin_dataset.NNUEBinData(train_filename, feature_set), batch_size=batch_size, shuffle=True, num_workers=4)
   val = DataLoader(nnue_bin_dataset.NNUEBinData(val_filename, feature_set), batch_size=32)
@@ -47,6 +57,8 @@ def main():
   parser.add_argument("--random-fen-skipping", default=0, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--label-smoothing-eps", type=float, dest='label_smoothing_eps', help="Label smoothing eps.")
+  parser.add_argument("--network-save-period", type=int, default=20, dest='network_save_period', help="Number of epochs between network snapshots. None to disable.")
+  parser.add_argument("--save-last-network", type=str2bool, default=True, dest='save_last_network', help="Whether to always save the last produced network.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -94,10 +106,10 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True)
-  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=args.save_last_network, every_n_epochs=args.network_save_period, save_top_k=-1)
+  trainer = pl.Trainer.from_argparse_args(args, accelerator='gpu', devices=1, callbacks=[checkpoint_callback], logger=tb_logger)
 
-  main_device = trainer.root_device if trainer.root_gpu is None else 'cuda:' + str(trainer.root_gpu)
+  main_device = trainer.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
 
   if args.py_data:
     print('Using python data loader')
