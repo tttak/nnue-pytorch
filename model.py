@@ -159,3 +159,9 @@ class NNUE(pl.LightningModule):
           for p in i.parameters():
             if p.requires_grad:
               yield p
+
+  def training_epoch_end(self, train_step_outputs):
+    self.print(f'training_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
+  
+  def validation_epoch_end(self, val_step_outputs):
+    self.print(f'validation_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
