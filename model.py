@@ -157,6 +157,15 @@ class NNUE(pl.LightningModule):
         self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
 
+        # 最後に保存したチェックポイントのパスを取得
+        model_checkpoint = self.trainer.checkpoint_callback
+        monitor_candidates = model_checkpoint._monitor_candidates(self.trainer)
+        last_checkpoint_path = model_checkpoint.format_checkpoint_name(monitor_candidates, model_checkpoint.CHECKPOINT_NAME_LAST)
+        
+        # チェックポイントをロード
+        checkpoint = torch.load(last_checkpoint_path)
+        model_checkpoint.load_state_dict(checkpoint['state_dict'])
+
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
 
