@@ -143,8 +143,13 @@ class NNUE(pl.LightningModule):
     ]
     # increasing the eps leads to less saturated nets with a few dead neurons
     optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True)
-    return [optimizer], [scheduler]
+    return {
+        "optimizer": optimizer,
+        "lr_scheduler": {
+            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True),
+            "monitor": "val_loss",
+        },
+    }
 
   def get_layers(self, filt):
     """
