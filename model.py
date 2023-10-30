@@ -146,7 +146,7 @@ class NNUE(pl.LightningModule):
     return {
         "optimizer": optimizer,
         "lr_scheduler": {
-            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True),
+            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, verbose=True),
             "monitor": "val_loss",
         },
     }
