@@ -6,8 +6,8 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 
 # 3 layer fully connected network
-L1 = 256
-L2 = 32
+L1 = 1024
+L2 = 16
 L3 = 32
 
 class NNUE(pl.LightningModule):
