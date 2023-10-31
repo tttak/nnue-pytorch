@@ -66,6 +66,8 @@ def main():
     raise Exception('{0} does not exist'.format(args.train))
   if not os.path.exists(args.val):
     raise Exception('{0} does not exist'.format(args.val))
+  
+  torch.set_float32_matmul_precision('medium')
 
   feature_set = features.get_feature_set_from_name(args.features)
 
