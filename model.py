@@ -4,6 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import timm.scheduler.step_lr
 
 # 3 layer fully connected network
 L1 = 1024
@@ -19,7 +20,7 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0, lr=8.75e-4, label_smoothing_eps=0.0):
+  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -27,6 +28,7 @@ class NNUE(pl.LightningModule):
     self.l2 = nn.Linear(L2, L3)
     self.output = nn.Linear(L3, 1)
     self.lambda_ = lambda_
+    self.gamma = gamma
     self.lr = lr
     self.label_smoothing_eps = label_smoothing_eps
 
@@ -142,14 +144,9 @@ class NNUE(pl.LightningModule):
       {'params': self.get_layers(lambda x: self.output == x), 'lr': LR / 10},
     ]
     # increasing the eps leads to less saturated nets with a few dead neurons
-    optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
-    return {
-        "optimizer": optimizer,
-        "lr_scheduler": {
-            "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, verbose=True),
-            "monitor": "val_loss",
-        },
-    }
+    optimizer = torch.optim.SGD(train_params, lr=LR)
+    scheduler = timm.scheduler.step_lr.StepLRScheduler(optimizer, decay_t=1, decay_rate=self.gamma, warmup_t=10)
+    return [optimizer], [scheduler]
 
   def get_layers(self, filt):
     """
