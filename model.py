@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-import timm.scheduler.step_lr
+import sys
 
 # 3 layer fully connected network
 L1 = 1024
@@ -20,7 +20,7 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0):
+  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, num_batches_warmup=10000):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -31,6 +31,8 @@ class NNUE(pl.LightningModule):
     self.gamma = gamma
     self.lr = lr
     self.label_smoothing_eps = label_smoothing_eps
+    self.num_batches_warmup = num_batches_warmup
+    self.step_lr_scale = 1.0
 
     self._zero_virtual_feature_weights()
 
@@ -131,22 +133,40 @@ class NNUE(pl.LightningModule):
     return self.step_(batch, batch_idx, 'train_loss')
 
   def validation_step(self, batch, batch_idx):
-    self.step_(batch, batch_idx, 'val_loss')
+    return self.step_(batch, batch_idx, 'val_loss')
+
+  def validation_epoch_end(self, outputs):
+    self.step_lr_scale *= self.gamma
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
 
+  # learning rate warm-up
+  def optimizer_step(
+      self,
+      epoch,
+      batch_idx,
+      optimizer,
+      optimizer_idx,
+      optimizer_closure,
+      on_tpu,
+      using_native_amp,
+      using_lbfgs,
+  ):
+    # update params
+    optimizer.step(closure=optimizer_closure)
+
+    # manually warm up lr without a scheduler
+    if self.trainer.global_step < self.num_batches_warmup:
+      warmup_scale = min(1.0, float(self.trainer.global_step + 1) / self.num_batches_warmup)
+    else:
+      warmup_scale = 1.0
+    for pg in optimizer.param_groups:
+      pg["lr"] = self.lr * warmup_scale * self.step_lr_scale
+      self.log("lr", pg["lr"])
+
   def configure_optimizers(self):
-    # Train with a lower LR on the output layer
-    LR = self.lr
-    train_params = [
-      {'params': self.get_layers(lambda x: self.output != x), 'lr': LR},
-      {'params': self.get_layers(lambda x: self.output == x), 'lr': LR / 10},
-    ]
-    # increasing the eps leads to less saturated nets with a few dead neurons
-    optimizer = torch.optim.SGD(train_params, lr=LR)
-    scheduler = timm.scheduler.step_lr.StepLRScheduler(optimizer, decay_t=1, decay_rate=self.gamma, warmup_t=10)
-    return [optimizer], [scheduler]
+    return torch.optim.SGD(self.parameters(), lr=self.lr)
 
   def get_layers(self, filt):
     """
@@ -159,9 +179,3 @@ class NNUE(pl.LightningModule):
           for p in i.parameters():
             if p.requires_grad:
               yield p
-
-  def training_epoch_end(self, train_step_outputs):
-    self.print(f'training_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
-  
-  def validation_epoch_end(self, val_step_outputs):
-    self.print(f'validation_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
