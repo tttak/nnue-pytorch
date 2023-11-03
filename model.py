@@ -135,9 +135,6 @@ class NNUE(pl.LightningModule):
   def validation_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'val_loss')
 
-  def validation_epoch_end(self, outputs):
-    self.step_lr_scale *= self.gamma
-
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
 
@@ -184,4 +181,5 @@ class NNUE(pl.LightningModule):
     self.print(f'training_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
   
   def validation_epoch_end(self, val_step_outputs):
+    self.step_lr_scale *= self.gamma
     self.print(f'validation_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
