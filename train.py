@@ -48,7 +48,7 @@ def main():
   parser.add_argument("--label-smoothing-eps", default=0.0, type=float, dest='label_smoothing_eps', help="Label smoothing eps.")
   parser.add_argument("--num-batches-warmup", default=10000, type=int, dest='num_batches_warmup', help="Number of batches for warm-up.")
   parser.add_argument("--epoch-size", default=100000000, type=int, dest='epoch_size', help="epoch size.")
-  parser.add_argument("--score-scaling", type=float, dest='score_scaling', help="score scaling")
+  parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="score scaling")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
