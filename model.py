@@ -20,7 +20,7 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, num_batches_warmup=100000000//16384, newbob_decay=0.5, num_epochs_to_adjust_lr=500):
+  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5, num_epochs_to_adjust_lr=500):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
