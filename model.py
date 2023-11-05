@@ -20,7 +20,7 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, num_batches_warmup=10000, score_scaling=361):
+  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, num_batches_warmup=100000000//16384, newbob_decay=0.5, num_epochs_to_adjust_lr=500):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -32,8 +32,12 @@ class NNUE(pl.LightningModule):
     self.lr = lr
     self.label_smoothing_eps = label_smoothing_eps
     self.num_batches_warmup = num_batches_warmup
-    self.step_lr_scale = 1.0
-    self.score_scaling = score_scaling
+    self.newbob_scale = 1.0
+    self.newbob_decay = newbob_decay
+    self.best_loss = 1e10
+    self.num_epochs_to_adjust_lr = num_epochs_to_adjust_lr
+    self.latest_loss_sum = 0.0
+    self.latest_loss_count = 0
 
     self._zero_virtual_feature_weights()
 
@@ -108,7 +112,7 @@ class NNUE(pl.LightningModule):
     # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
     # This needs to match the value used in the serializer
     nnue2score = 600
-    scaling = self.score_scaling
+    scaling = 361
 
     q = self(us, them, white, black) * nnue2score / scaling
     t = outcome * (1.0 - self.label_smoothing_eps * 2.0) + self.label_smoothing_eps
@@ -136,6 +140,23 @@ class NNUE(pl.LightningModule):
   def validation_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'val_loss')
 
+  def validation_epoch_end(self, outputs):
+    self.latest_loss_sum += sum(outputs) / len(outputs);
+    self.latest_loss_count += 1
+
+    if self.newbob_decay != 1.0 and self.current_epoch > 0 and self.current_epoch % self.num_epochs_to_adjust_lr == 0:
+      latest_loss = self.latest_loss_sum / self.latest_loss_count
+      self.latest_loss_sum = 0.0
+      self.latest_loss_count = 0
+      if latest_loss < self.best_loss:
+        self.print(f"{self.current_epoch=}, {latest_loss=} < {self.best_loss=}, accepted, {self.newbob_scale=}")
+        sys.stdout.flush()
+        self.best_loss = latest_loss
+      else:
+        self.newbob_scale *= self.newbob_decay
+        self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
+        sys.stdout.flush()
+
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
 
@@ -160,7 +181,7 @@ class NNUE(pl.LightningModule):
     else:
       warmup_scale = 1.0
     for pg in optimizer.param_groups:
-      pg["lr"] = self.lr * warmup_scale * self.step_lr_scale
+      pg["lr"] = self.lr * warmup_scale * self.newbob_scale
       self.log("lr", pg["lr"])
 
   def configure_optimizers(self):
@@ -177,10 +198,3 @@ class NNUE(pl.LightningModule):
           for p in i.parameters():
             if p.requires_grad:
               yield p
-
-  def training_epoch_end(self, train_step_outputs):
-    self.print(f'training_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
-  
-  def validation_epoch_end(self, val_step_outputs):
-    self.step_lr_scale *= self.gamma
-    self.print(f'validation_epoch_end(): self.current_epoch={self.current_epoch}', flush=True)
