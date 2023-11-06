@@ -49,7 +49,7 @@ def main():
   parser.add_argument("--num-batches-warmup", default=10000, type=int, dest='num_batches_warmup', help="Number of batches for warm-up.")
   parser.add_argument("--newbob-decay", default=0.5, type=float, dest='newbob_decay', help="Newbob decay.")
   parser.add_argument("--epoch-size", default=10000000, type=int, dest='epoch_size', help="epoch size.")
-  parser.add_argument("--num-epochs-to-adjust-lr", default=500, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
+  parser.add_argument("--num-epochs-to-adjust-lr", default=50, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
   parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
