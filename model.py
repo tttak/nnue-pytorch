@@ -150,12 +150,12 @@ class NNUE(pl.LightningModule):
       self.latest_loss_sum = 0.0
       self.latest_loss_count = 0
       if latest_loss < self.best_loss:
-        self.print(f"{self.current_epoch=}, {latest_loss.item()=} < {self.best_loss.item()=}, accepted, {self.newbob_scale=}")
+        self.print(f"{self.current_epoch=}, {latest_loss=} < {self.best_loss=}, accepted, {self.newbob_scale=}")
         sys.stdout.flush()
         self.best_loss = latest_loss
       else:
         self.newbob_scale *= self.newbob_decay
-        self.print(f"{self.current_epoch=}, {latest_loss.item()=} >= {self.best_loss.item()=}, rejected, {self.newbob_scale=}")
+        self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
 
   def test_step(self, batch, batch_idx):
