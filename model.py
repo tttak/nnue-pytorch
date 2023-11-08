@@ -19,7 +19,7 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, score_scaling=361):
+  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, score_scaling=361, eps=1e-7):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -31,6 +31,7 @@ class NNUE(pl.LightningModule):
     self.lr = lr
     self.label_smoothing_eps = label_smoothing_eps
     self.score_scaling = score_scaling
+    self.eps = eps
 
     self._zero_virtual_feature_weights()
 
@@ -147,7 +148,7 @@ class NNUE(pl.LightningModule):
       {'params': self.get_layers(lambda x: self.output == x), 'lr': LR / 10},
     ]
     # increasing the eps leads to less saturated nets with a few dead neurons
-    optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=1.0e-7)
+    optimizer = ranger.Ranger(train_params, betas=(.9, 0.999), eps=self.eps)
     # Drop learning rate after 75 epochs
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=self.gamma)
     return [optimizer], [scheduler]

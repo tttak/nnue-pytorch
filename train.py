@@ -48,6 +48,7 @@ def main():
   parser.add_argument("--label-smoothing-eps", default=0.0, type=float, dest='label_smoothing_eps', help="Label smoothing eps.")
   parser.add_argument("--epoch-size", default=100000000, type=int, dest='epoch_size', help="epoch size.")
   parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
+  parser.add_argument("--eps", default=1e-7, type=float, dest='eps', help="Ranger eps.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -59,7 +60,7 @@ def main():
   feature_set = features.get_feature_set_from_name(args.features)
 
   if args.resume_from_model is None:
-    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma, lr=args.lr, label_smoothing_eps=args.label_smoothing_eps, score_scaling=args.score_scaling)
+    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma, lr=args.lr, label_smoothing_eps=args.label_smoothing_eps, score_scaling=args.score_scaling, eps=args.eps)
   else:
     nnue = torch.load(args.resume_from_model)
     nnue.set_feature_set(feature_set)
