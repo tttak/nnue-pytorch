@@ -93,6 +93,7 @@ class NNUEWriter():
     ascii_hist('ft weight:', weight.numpy())
     # weights stored as [41024][256], so we need to transpose the pytorch [256][41024]
     self.buf.extend(weight.transpose(0, 1).flatten().numpy().tobytes())
+    print()
 
   def write_fc_layer(self, layer, is_output=False):
     # FC layers are stored as int8 weights, and int32 biases
@@ -127,6 +128,7 @@ class NNUEWriter():
       weight = new_w
     # Stored as [outputs][inputs], so we can flatten
     self.buf.extend(weight.flatten().numpy().tobytes())
+    print()
 
   def int32(self, v):
     self.buf.extend(struct.pack("<I", v))
