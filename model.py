@@ -140,7 +140,7 @@ class NNUE(pl.LightningModule):
 
   def validation_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'val_loss')
-
+  
   def validation_epoch_end(self, outputs):
     self.latest_loss_sum += sum(outputs) / len(outputs);
     self.latest_loss_count += 1
@@ -188,6 +188,30 @@ class NNUE(pl.LightningModule):
     for pg in optimizer.param_groups:
       pg["lr"] = self.lr * warmup_scale * self.newbob_scale
       self.log("lr", pg["lr"])
+
+    # clip parameters
+    first = True
+    for p in self.parameters():
+      if p.data.dim() != 2:
+        # Skip biasis.
+        continue
+
+      if first:
+        # Skip feature transform layer.
+        first = False
+        continue
+
+      # FC layers are stored as int8 weights, and int32 biases
+      kWeightScaleBits = 6
+      kActivationScale = 127.0
+      is_output = p.data.size()[0] == 1
+      if not is_output:
+        kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
+      else:
+        kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
+      kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+      kMaxWeight = 127.0 / kWeightScale # roughly 2.0
+      p.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
     return torch.optim.SGD(self.parameters(), lr=self.lr)
