@@ -186,7 +186,7 @@ class NNUE(pl.LightningModule):
         self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
     
-    if self.newbob_scale < 1e-8:
+    if self.newbob_scale < 1e-5:
       self.trainer.should_stop = True
       self.print(f"{self.current_epoch=}, early stopping")
 
