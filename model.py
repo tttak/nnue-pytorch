@@ -162,6 +162,25 @@ class NNUE(pl.LightningModule):
       self.trainer.should_stop = True
       self.print(f"{self.current_epoch=}, early stopping")
 
+    for child in self.children():
+      if not isinstance(child, nn.Linear):
+        continue
+
+      # FC layers are stored as int8 weights, and int32 biases
+      kWeightScaleBits = 6
+      kActivationScale = 127.0
+      if child == self.input:
+        kWeightScale = 127.0
+        kBiasScale = 127.0
+      elif child != self.output:
+        kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
+        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+      else:
+        kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
+        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+      child.bias.mul_(kBiasScale).round_().div_(kBiasScale)
+      child.weight.mul_(kWeightScale).round_().div_(kWeightScale)
+
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
 
@@ -190,28 +209,23 @@ class NNUE(pl.LightningModule):
       self.log("lr", pg["lr"])
 
     # clip parameters
-    first = True
-    for p in self.parameters():
-      if p.data.dim() != 2:
-        # Skip biasis.
+    for child in self.children():
+      if not isinstance(child, nn.Linear):
         continue
 
-      if first:
-        # Skip feature transform layer.
-        first = False
+      if child == self.input:
         continue
 
       # FC layers are stored as int8 weights, and int32 biases
       kWeightScaleBits = 6
       kActivationScale = 127.0
-      is_output = p.data.size()[0] == 1
-      if not is_output:
+      if child != self.output:
         kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
       else:
         kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
       kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
       kMaxWeight = 127.0 / kWeightScale # roughly 2.0
-      p.data.clamp_(-kMaxWeight, kMaxWeight)
+      child.weight.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
     return torch.optim.SGD(self.parameters(), lr=self.lr)
