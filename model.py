@@ -5,6 +5,7 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import sys
+import math
 
 # 3 layer fully connected network
 L1 = 1024
@@ -41,6 +42,33 @@ class NNUE(pl.LightningModule):
     self.score_scaling = score_scaling
 
     self._zero_virtual_feature_weights()
+    self.apply(self._init_weights)
+
+  def _init_weights(self, module):
+    if not isinstance(module, nn.Linear):
+      return
+
+    if module == self.input:
+      kMaxActiveDimensions = 38
+      kSigma = 0.1 / math.sqrt(kMaxActiveDimensions);
+      module.weight.data.normal_(mean=0.0, std=kSigma)
+      module.bias.data.fill_(0.5)
+    elif module != self.output:
+      # 入力の分布が各ユニット平均0.5、等分散であることを仮定し、
+      # 出力の分布が各ユニット平均0.5、入力と同じ等分散になるように初期化する
+      size = module.weight.size()
+      kOutputDimensions = size[0] 
+      kInputDimensions = size[1]
+      kSigma = 1.0 / math.sqrt(kInputDimensions)
+      module.weight.data.normal_(mean=0.0, std=kSigma)
+      for output_dimension_index in range(kOutputDimensions):
+        row = module.weight[output_dimension_index]
+        sum = row.sum()
+        module.bias.data[output_dimension_index] = 0.5 - 0.5 * sum
+    else:
+      # 出力層は0で初期化する
+      module.weight.data.fill_(0.0)
+      module.bias.data.fill_(0.0)
 
   '''
   We zero all virtual feature weights because during serialization to .nnue
@@ -180,6 +208,7 @@ class NNUE(pl.LightningModule):
         kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
       child.bias.mul_(kBiasScale).round_().div_(kBiasScale)
       child.weight.mul_(kWeightScale).round_().div_(kWeightScale)
+      pass
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
