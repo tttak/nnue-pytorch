@@ -254,7 +254,7 @@ class NNUE(pl.LightningModule):
         kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
       kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
       kMaxWeight = 127.0 / kWeightScale # roughly 2.0
-      child.weight.clamp_(-kMaxWeight, kMaxWeight)
+      child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
     return torch.optim.SGD(self.parameters(), lr=self.lr)
