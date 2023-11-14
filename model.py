@@ -50,7 +50,7 @@ class NNUE(pl.LightningModule):
 
     if module == self.input:
       kMaxActiveDimensions = 38
-      kSigma = 0.1 / math.sqrt(kMaxActiveDimensions);
+      kSigma = 0.2 / math.sqrt(kMaxActiveDimensions);
       module.weight.data.normal_(mean=0.0, std=kSigma)
       module.bias.data.fill_(0.5)
     elif module != self.output:
