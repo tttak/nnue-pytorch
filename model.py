@@ -190,25 +190,24 @@ class NNUE(pl.LightningModule):
       self.trainer.should_stop = True
       self.print(f"{self.current_epoch=}, early stopping")
 
-    # for child in self.children():
-    #   if not isinstance(child, nn.Linear):
-    #     continue
+    for child in self.children():
+      if not isinstance(child, nn.Linear):
+        continue
 
-    #   # FC layers are stored as int8 weights, and int32 biases
-    #   kWeightScaleBits = 6
-    #   kActivationScale = 127.0
-    #   if child == self.input:
-    #     kWeightScale = 127.0
-    #     kBiasScale = 127.0
-    #   elif child != self.output:
-    #     kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
-    #     kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
-    #   else:
-    #     kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
-    #     kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
-    #   child.bias.mul_(kBiasScale).round_().div_(kBiasScale)
-    #   child.weight.mul_(kWeightScale).round_().div_(kWeightScale)
-    #   pass
+      # FC layers are stored as int8 weights, and int32 biases
+      kWeightScaleBits = 6
+      kActivationScale = 127.0
+      if child == self.input:
+        kWeightScale = 127.0
+        kBiasScale = 127.0
+      elif child != self.output:
+        kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
+        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+      else:
+        kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
+        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+      child.bias.mul_(kBiasScale).round_().div_(kBiasScale)
+      child.weight.mul_(kWeightScale).round_().div_(kWeightScale)
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
