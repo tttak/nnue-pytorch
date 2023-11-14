@@ -42,33 +42,33 @@ class NNUE(pl.LightningModule):
     self.score_scaling = score_scaling
 
     self._zero_virtual_feature_weights()
-    self.apply(self._init_weights)
+    # self.apply(self._init_weights)
 
-  def _init_weights(self, module):
-    if not isinstance(module, nn.Linear):
-      return
+  # def _init_weights(self, module):
+  #   if not isinstance(module, nn.Linear):
+  #     return
 
-    if module == self.input:
-      kMaxActiveDimensions = 38
-      kSigma = 0.1 / math.sqrt(kMaxActiveDimensions);
-      module.weight.data.normal_(mean=0.0, std=kSigma)
-      module.bias.data.fill_(0.5)
-    elif module != self.output:
-      # 入力の分布が各ユニット平均0.5、等分散であることを仮定し、
-      # 出力の分布が各ユニット平均0.5、入力と同じ等分散になるように初期化する
-      size = module.weight.size()
-      kOutputDimensions = size[0] 
-      kInputDimensions = size[1]
-      kSigma = 1.0 / math.sqrt(kInputDimensions)
-      module.weight.data.normal_(mean=0.0, std=kSigma)
-      for output_dimension_index in range(kOutputDimensions):
-        row = module.weight[output_dimension_index]
-        sum = row.sum()
-        module.bias.data[output_dimension_index] = 0.5 - 0.5 * sum
-    else:
-      # 出力層は0で初期化する
-      module.weight.data.fill_(0.0)
-      module.bias.data.fill_(0.0)
+  #   if module == self.input:
+  #     kMaxActiveDimensions = 38
+  #     kSigma = 0.1 / math.sqrt(kMaxActiveDimensions);
+  #     module.weight.data.normal_(mean=0.0, std=kSigma)
+  #     module.bias.data.fill_(0.5)
+  #   elif module != self.output:
+  #     # 入力の分布が各ユニット平均0.5、等分散であることを仮定し、
+  #     # 出力の分布が各ユニット平均0.5、入力と同じ等分散になるように初期化する
+  #     size = module.weight.size()
+  #     kOutputDimensions = size[0] 
+  #     kInputDimensions = size[1]
+  #     kSigma = 1.0 / math.sqrt(kInputDimensions)
+  #     module.weight.data.normal_(mean=0.0, std=kSigma)
+  #     for output_dimension_index in range(kOutputDimensions):
+  #       row = module.weight[output_dimension_index]
+  #       sum = row.sum()
+  #       module.bias.data[output_dimension_index] = 0.5 - 0.5 * sum
+  #   else:
+  #     # 出力層は0で初期化する
+  #     module.weight.data.fill_(0.0)
+  #     module.bias.data.fill_(0.0)
 
   '''
   We zero all virtual feature weights because during serialization to .nnue
