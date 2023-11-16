@@ -40,6 +40,10 @@ class NNUE(pl.LightningModule):
     self.latest_loss_sum = 0.0
     self.latest_loss_count = 0
     self.score_scaling = score_scaling
+    self.quantitative_phase = False
+    # Warmupを開始するステップ数
+    # Quantitative Phaseの最初もWarmupをするため、保存しておく。
+    self.warmup_start_global_step = 0
 
     self._zero_virtual_feature_weights()
     self.apply(self._init_weights)
@@ -187,27 +191,35 @@ class NNUE(pl.LightningModule):
         sys.stdout.flush()
     
     if self.newbob_scale < 1e-5:
-      self.trainer.should_stop = True
-      self.print(f"{self.current_epoch=}, early stopping")
-
-    for child in self.children():
-      if not isinstance(child, nn.Linear):
-        continue
-
-      # FC layers are stored as int8 weights, and int32 biases
-      kWeightScaleBits = 6
-      kActivationScale = 127.0
-      if child == self.input:
-        kWeightScale = 127.0
-        kBiasScale = 127.0
-      elif child != self.output:
-        kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
-        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+      if not self.quantitative_phase:
+        self.quantitative_phase = True
+        self.warmup_start_global_step = self.trainer.global_step
+        self.newbob_scale = 1.0
+        self.print(f"{self.current_epoch=}, early stopping")
+        pass
       else:
-        kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
-        kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
-      child.bias.mul_(kBiasScale).round_().div_(kBiasScale)
-      child.weight.mul_(kWeightScale).round_().div_(kWeightScale)
+        self.trainer.should_stop = True
+        self.print(f"{self.current_epoch=}, early stopping")
+
+    if self.quantitative_phase:
+      for child in self.children():
+        if not isinstance(child, nn.Linear):
+          continue
+
+        # FC layers are stored as int8 weights, and int32 biases
+        kWeightScaleBits = 6
+        kActivationScale = 127.0
+        if child == self.input:
+          kWeightScale = 127.0
+          kBiasScale = 127.0
+        elif child != self.output:
+          kBiasScale = (1 << kWeightScaleBits) * kActivationScale # = 8128
+          kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+        else:
+          kBiasScale = 9600.0 # kPonanzaConstant * FV_SCALE = 600 * 16 = 9600
+          kWeightScale = kBiasScale / kActivationScale # = 64.0 for normal layers
+        child.bias.mul_(kBiasScale).round_().div_(kBiasScale)
+        child.weight.mul_(kWeightScale).round_().div_(kWeightScale)
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
@@ -228,8 +240,8 @@ class NNUE(pl.LightningModule):
     optimizer.step(closure=optimizer_closure)
 
     # manually warm up lr without a scheduler
-    if self.trainer.global_step < self.num_batches_warmup:
-      warmup_scale = min(1.0, float(self.trainer.global_step + 1) / self.num_batches_warmup)
+    if self.trainer.global_step - self.warmup_start_global_step < self.num_batches_warmup:
+      warmup_scale = min(1.0, float(self.trainer.global_step - self.warmup_start_global_step + 1) / self.num_batches_warmup)
     else:
       warmup_scale = 1.0
     for pg in optimizer.param_groups:
