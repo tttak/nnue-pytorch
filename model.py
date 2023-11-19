@@ -21,7 +21,11 @@ class NNUE(pl.LightningModule):
 
   It is not ideal for training a Pytorch quantized model directly.
   """
-  def __init__(self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4, label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5, num_epochs_to_adjust_lr=500, score_scaling=361):
+  def __init__(
+      self, feature_set, lambda_=1.0, gamma=0.992, lr=8.75e-4,
+      label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5,
+      num_epochs_to_adjust_lr=500, score_scaling=361, min_lr=1e-5,
+      quantization_lr=1e-1):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -44,6 +48,8 @@ class NNUE(pl.LightningModule):
     # Warmupを開始するステップ数
     # Quantitative Phaseの最初もWarmupをするため、保存しておく。
     self.warmup_start_global_step = 0
+    self.min_lr = min_lr
+    self.quantization_lr = quantization_lr
 
     self._zero_virtual_feature_weights()
     self.apply(self._init_weights)
@@ -190,11 +196,12 @@ class NNUE(pl.LightningModule):
         self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
     
-    if self.newbob_scale < 1e-5:
+    if self.newbob_scale < self.min_lr:
       if not self.quantitative_phase:
         self.quantitative_phase = True
         self.warmup_start_global_step = self.trainer.global_step
-        self.newbob_scale = 1.0
+        self.newbob_scale = self.quantization_lr
+        self.best_loss = 1e10
         self.print(f"{self.current_epoch=}, early stopping")
         pass
       else:

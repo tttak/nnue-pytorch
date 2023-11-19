@@ -51,6 +51,8 @@ def main():
   parser.add_argument("--epoch-size", default=10000000, type=int, dest='epoch_size', help="epoch size.")
   parser.add_argument("--num-epochs-to-adjust-lr", default=50, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
   parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
+  parser.add_argument("--min-lr", default=1e-5, type=float, dest='min_lr', help="Minimum learning rate to stop the training.")
+  parser.add_argument("--quantization-lr", default=1e-1, type=float, dest='quantization_lr', help="Initial learning rate in the quantization phase.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -62,7 +64,14 @@ def main():
   feature_set = features.get_feature_set_from_name(args.features)
 
   if args.resume_from_model is None:
-    nnue = M.NNUE(feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma, lr=args.lr, label_smoothing_eps=args.label_smoothing_eps, num_batches_warmup=args.num_batches_warmup, newbob_decay=args.newbob_decay, num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr, score_scaling=args.score_scaling)
+    nnue = M.NNUE(
+      feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma,
+      lr=args.lr, label_smoothing_eps=args.label_smoothing_eps,
+      num_batches_warmup=args.num_batches_warmup,
+      newbob_decay=args.newbob_decay,
+      num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr,
+      score_scaling=args.score_scaling,
+      min_lr=args.min_lr, quantization_lr=args.quantization_lr)
   else:
     nnue = torch.load(args.resume_from_model)
     nnue.set_feature_set(feature_set)
