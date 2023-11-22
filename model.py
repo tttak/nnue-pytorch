@@ -55,27 +55,18 @@ class NNUE(pl.LightningModule):
     if not isinstance(module, nn.Linear):
       return
 
+    # ネットワークパラメーターをXavierの手法で初期化する。
     if module == self.input:
+      # 入力はkMaxActiveDimensions次元が1で、残りが0のため、
+      # std=1.0 / math.sqrt(kMaxActiveDimensions)で初期化する
       kMaxActiveDimensions = 38
-      kSigma = 0.1 / math.sqrt(kMaxActiveDimensions);
-      module.weight.data.normal_(mean=0.0, std=kSigma)
-      module.bias.data.fill_(0.5)
-    elif module != self.output:
-      # 入力の分布が各ユニット平均0.5、等分散であることを仮定し、
-      # 出力の分布が各ユニット平均0.5、入力と同じ等分散になるように初期化する
+      kSigma = 1.0 / math.sqrt(kMaxActiveDimensions)
+    else:
       size = module.weight.size()
-      kOutputDimensions = size[0] 
       kInputDimensions = size[1]
       kSigma = 1.0 / math.sqrt(kInputDimensions)
-      module.weight.data.normal_(mean=0.0, std=kSigma)
-      for output_dimension_index in range(kOutputDimensions):
-        row = module.weight[output_dimension_index]
-        sum = row.sum()
-        module.bias.data[output_dimension_index] = 0.5 - 0.5 * sum
-    else:
-      # 出力層は0で初期化する
-      module.weight.data.fill_(0.0)
-      module.bias.data.fill_(0.0)
+    module.weight.data.normal_(mean=0.0, std=kSigma)
+    module.bias.data.fill_(0.0)
 
   '''
   We zero all virtual feature weights because during serialization to .nnue
