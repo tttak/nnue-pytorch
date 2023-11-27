@@ -185,9 +185,6 @@ class NNUE(pl.LightningModule):
       using_native_amp,
       using_lbfgs,
   ):
-    # update params
-    optimizer.step(closure=optimizer_closure)
-
     # manually warm up lr without a scheduler
     if self.trainer.global_step - self.warmup_start_global_step < self.num_batches_warmup:
       warmup_scale = min(1.0, float(self.trainer.global_step - self.warmup_start_global_step + 1) / self.num_batches_warmup)
@@ -196,6 +193,9 @@ class NNUE(pl.LightningModule):
     for pg in optimizer.param_groups:
       pg["lr"] = self.lr * warmup_scale * self.newbob_scale
       self.log("lr", pg["lr"])
+
+    # update params
+    optimizer.step(closure=optimizer_closure)
 
     # clip parameters
     for child in self.children():
