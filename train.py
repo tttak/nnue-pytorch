@@ -36,7 +36,6 @@ def main():
   parser = pl.Trainer.add_argparse_args(parser)
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
-  parser.add_argument("--gamma", default=0.992, type=float, dest='gamma', help="Multiplicative factor applied to the learning rate after every epoch.")
   parser.add_argument("--lr", default=8.75e-4, type=float, dest='lr', help="Initial learning rate.")
   parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
@@ -47,9 +46,7 @@ def main():
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument("--label-smoothing-eps", default=0.0, type=float, dest='label_smoothing_eps', help="Label smoothing eps.")
   parser.add_argument("--num-batches-warmup", default=10000, type=int, dest='num_batches_warmup', help="Number of batches for warm-up.")
-  parser.add_argument("--newbob-decay", default=0.5, type=float, dest='newbob_decay', help="Newbob decay.")
   parser.add_argument("--epoch-size", default=10000000, type=int, dest='epoch_size', help="epoch size.")
-  parser.add_argument("--num-epochs-to-adjust-lr", default=50, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
   parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
   parser.add_argument("--min-lr", default=1e-5, type=float, dest='min_lr', help="Minimum learning rate to stop the training.")
   features.add_argparse_args(parser)
@@ -64,11 +61,9 @@ def main():
 
   if args.resume_from_model is None:
     nnue = M.NNUE(
-      feature_set=feature_set, lambda_=args.lambda_, gamma=args.gamma,
+      feature_set=feature_set, lambda_=args.lambda_,
       lr=args.lr, label_smoothing_eps=args.label_smoothing_eps,
       num_batches_warmup=args.num_batches_warmup,
-      newbob_decay=args.newbob_decay,
-      num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr,
       score_scaling=args.score_scaling,
       min_lr=args.min_lr)
   else:
