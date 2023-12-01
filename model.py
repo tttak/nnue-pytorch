@@ -143,8 +143,8 @@ class NNUE(pl.LightningModule):
   def validation_epoch_end(self, outputs):
     # 学習率が十分に小さくなったら学習を止める。
     if self.trainer.global_step - self.warmup_start_global_step >= self.num_batches_warmup:
-      for parameters in self.parameters():
-        if parameters["lr"] < self.min_lr:
+      for param_group in self.optimizer.param_groups:
+        if param_group["lr"] < self.min_lr:
           self.trainer.should_stop = True
           self.print(f"{self.current_epoch=}, early stopping")
           break
@@ -195,10 +195,10 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, verbose=True)
+    self.optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor=0.5, verbose=True)
     return {
-        "optimizer": optimizer,
+        "optimizer": self.optimizer,
         "lr_scheduler": {
             "scheduler": scheduler,
             "monitor": "val_loss",
