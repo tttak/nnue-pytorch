@@ -24,7 +24,8 @@ class NNUE(pl.LightningModule):
   def __init__(
       self, feature_set, lambda_=1.0, lr=8.75e-4,
       label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5,
-      num_epochs_to_adjust_lr=500, score_scaling=361, min_lr=1e-5):
+      num_epochs_to_adjust_lr=500, min_lr=1e-5, in_scaling=340,
+      out_scaling=380):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -41,10 +42,11 @@ class NNUE(pl.LightningModule):
     self.num_epochs_to_adjust_lr = num_epochs_to_adjust_lr
     self.latest_loss_sum = 0.0
     self.latest_loss_count = 0
-    self.score_scaling = score_scaling
     # Warmupを開始するステップ数
     self.warmup_start_global_step = 0
     self.min_lr = min_lr
+    self.in_scaling = in_scaling
+    self.out_scaling = out_scaling
 
     self._zero_virtual_feature_weights()
 
@@ -119,11 +121,10 @@ class NNUE(pl.LightningModule):
     # 600 is the kPonanzaConstant scaling factor needed to convert the training net output to a score.
     # This needs to match the value used in the serializer
     nnue2score = 600
-    scaling = self.score_scaling
 
-    q = self(us, them, white, black) * nnue2score / scaling
+    q = self(us, them, white, black) * nnue2score / self.in_scaling
     t = outcome * (1.0 - self.label_smoothing_eps * 2.0) + self.label_smoothing_eps
-    p = (score / scaling).sigmoid()
+    p = (score / self.out_scaling).sigmoid()
 
     epsilon = 1e-12
     teacher_entropy = -(p * (p + epsilon).log() + (1.0 - p) * (1.0 - p + epsilon).log())
