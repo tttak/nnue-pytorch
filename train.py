@@ -49,9 +49,8 @@ def main():
   parser.add_argument("--newbob-decay", default=0.5, type=float, dest='newbob_decay', help="Newbob decay.")
   parser.add_argument("--epoch-size", default=10000000, type=int, dest='epoch_size', help="epoch size.")
   parser.add_argument("--num-epochs-to-adjust-lr", default=50, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
+  parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
   parser.add_argument("--min-lr", default=1e-5, type=float, dest='min_lr', help="Minimum learning rate to stop the training.")
-  parser.add_argument("--in-scaling", default=340, type=float, dest='in_scaling', help="Score scaling for net.")
-  parser.add_argument("--out-scaling", default=380, type=float, dest='out_scaling', help="Score scaling for training data.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -69,8 +68,8 @@ def main():
       num_batches_warmup=args.num_batches_warmup,
       newbob_decay=args.newbob_decay,
       num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr,
-      min_lr=args.min_lr, in_scaling=args.in_scaling,
-      out_scaling=args.out_scaling)
+      score_scaling=args.score_scaling,
+      min_lr=args.min_lr)
   else:
     nnue = torch.load(args.resume_from_model)
     nnue.set_feature_set(feature_set)
