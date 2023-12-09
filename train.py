@@ -104,8 +104,7 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True)
-  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+  trainer = pl.Trainer.from_argparse_args(args, logger=tb_logger)
 
   main_device = 'cuda:0'
 
@@ -117,6 +116,10 @@ def main():
     train, val = data_loader_cc(args.train, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size)
 
   trainer.fit(nnue, train, val)
+
+  ckpt_file_path = os.path.join(tb_logger.log_dir, 'final.ckpt')
+  trainer.save_checkpoint(ckpt_file_path)
+
 
 if __name__ == '__main__':
   main()
