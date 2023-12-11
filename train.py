@@ -104,7 +104,7 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  trainer = pl.Trainer.from_argparse_args(args, logger=tb_logger)
+  trainer = pl.Trainer.from_argparse_args(args, logger=tb_logger, enable_checkpointing=False)
 
   main_device = 'cuda:0'
 
