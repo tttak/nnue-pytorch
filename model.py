@@ -148,7 +148,7 @@ class NNUE(pl.LightningModule):
     return self.step_(batch, batch_idx, 'val_loss')
   
   def validation_epoch_end(self, outputs):
-    self.latest_loss_sum += sum(outputs) / len(outputs);
+    self.latest_loss_sum += float(sum(outputs)) / len(outputs);
     self.latest_loss_count += 1
 
     if self.newbob_decay != 1.0 and self.current_epoch > 0 and self.current_epoch % self.num_epochs_to_adjust_lr == 0:
