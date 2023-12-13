@@ -92,8 +92,9 @@ class NNUEWriter():
     bins = min(256, data.numel())
     frequency, value = data.to(torch.float).histogram(bins=bins)
     value += (value[0] + value[1]) * 0.5
+    width = value[1] - value[0]
     value = value[:-1]
-    ax.bar(value, frequency)
+    ax.bar(value, frequency, width=width)
     ax.set_title(title)
     fig.savefig(os.path.join(self.output_directory_path, file_name))
     print(f'Saved a histogram to {file_name}')
