@@ -159,30 +159,14 @@ class NNUE(pl.LightningModule):
         self.print(f"{self.current_epoch=}, {latest_loss=} < {self.best_loss=}, accepted, {self.newbob_scale=}")
         sys.stdout.flush()
         self.best_loss = latest_loss
-        self._backup_network_parameters()
       else:
         self.newbob_scale *= self.newbob_decay
         self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
-        self._restore_network_parameters()
     
     if self.newbob_scale < self.min_lr:
       self.trainer.should_stop = True
       self.print(f"{self.current_epoch=}, early stopping")
-  
-  def _backup_network_parameters(self):
-    for child in self.children():
-      if not isinstance(child, nn.Linear):
-        continue
-      child.weight.backup_data = child.weight.data.clone()
-      child.bias.backup_data = child.bias.data.clone()
-
-  def _restore_network_parameters(self):
-    for child in self.children():
-      if not isinstance(child, nn.Linear):
-        continue
-      child.weight.data.copy_(child.weight.backup_data)
-      child.bias.data.copy_(child.bias.backup_data)
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
