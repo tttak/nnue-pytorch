@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import sys
 import math
-import torch_optimizer
 
 # 3 layer fully connected network
 L1 = 1024
@@ -216,7 +215,7 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    return torch_optimizer.Lamb(self.parameters(), lr=self.lr)
+    return torch.optim.SGD(self.parameters(), lr=self.lr)
 
   def get_layers(self, filt):
     """
