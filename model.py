@@ -22,9 +22,9 @@ class NNUE(pl.LightningModule):
   It is not ideal for training a Pytorch quantized model directly.
   """
   def __init__(
-      self, feature_set, lambda_=1.0, lr=8.75e-4,
+      self, feature_set, lambda_=[1.0], lr=[1.0],
       label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5,
-      num_epochs_to_adjust_lr=500, score_scaling=361, min_lr=1e-5):
+      num_epochs_to_adjust_lr=500, score_scaling=361, min_newbob_scale=1e-5):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -44,7 +44,8 @@ class NNUE(pl.LightningModule):
     self.score_scaling = score_scaling
     # Warmupを開始するステップ数
     self.warmup_start_global_step = 0
-    self.min_lr = min_lr
+    self.min_newbob_scale = min_newbob_scale
+    self.parameter_index = 0
 
     self._zero_virtual_feature_weights()
 
@@ -130,8 +131,9 @@ class NNUE(pl.LightningModule):
     outcome_entropy = -(t * (t + epsilon).log() + (1.0 - t) * (1.0 - t + epsilon).log())
     teacher_loss = -(p * F.logsigmoid(q) + (1.0 - p) * F.logsigmoid(-q))
     outcome_loss = -(t * F.logsigmoid(q) + (1.0 - t) * F.logsigmoid(-q))
-    result  = self.lambda_ * teacher_loss    + (1.0 - self.lambda_) * outcome_loss
-    entropy = self.lambda_ * teacher_entropy + (1.0 - self.lambda_) * outcome_entropy
+    lambda_ = self.lambda_[self.parameter_index]
+    result  = lambda_ * teacher_loss    + (1.0 - lambda_) * outcome_loss
+    entropy = lambda_ * teacher_entropy + (1.0 - lambda_) * outcome_entropy
     loss = result.mean() - entropy.mean()
     self.log(loss_type, loss)
     return loss
@@ -164,9 +166,14 @@ class NNUE(pl.LightningModule):
         self.print(f"{self.current_epoch=}, {latest_loss=} >= {self.best_loss=}, rejected, {self.newbob_scale=}")
         sys.stdout.flush()
     
-    if self.newbob_scale < self.min_lr:
-      self.trainer.should_stop = True
-      self.print(f"{self.current_epoch=}, early stopping")
+    if self.newbob_scale < self.min_newbob_scale:
+      self.parameter_index += 1
+      if self.parameter_index < len(self.lr):
+        self.best_loss = 1e10
+        self.newbob_scale = 1.0
+      else:
+        self.trainer.should_stop = True
+        self.print(f"{self.current_epoch=}, early stopping")
 
   def test_step(self, batch, batch_idx):
     self.step_(batch, batch_idx, 'test_loss')
@@ -189,7 +196,7 @@ class NNUE(pl.LightningModule):
     else:
       warmup_scale = 1.0
     for pg in optimizer.param_groups:
-      pg["lr"] = self.lr * warmup_scale * self.newbob_scale
+      pg["lr"] = self.lr[self.parameter_index] * warmup_scale * self.newbob_scale
       self.log("lr", pg["lr"])
 
     # update params
@@ -215,7 +222,7 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    return torch.optim.SGD(self.parameters(), lr=self.lr)
+    return torch.optim.SGD(self.parameters(), lr=self.lr[0])
 
   def get_layers(self, filt):
     """

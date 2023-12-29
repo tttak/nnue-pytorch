@@ -35,8 +35,8 @@ def main():
   parser.add_argument("val", help="Validation data (.bin or .binpack)")
   parser = pl.Trainer.add_argparse_args(parser)
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
-  parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
-  parser.add_argument("--lr", default=8.75e-4, type=float, dest='lr', help="Initial learning rate.")
+  parser.add_argument("--lambda", default=[1.0], nargs='+', type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
+  parser.add_argument("--lr", default=[1.0], nargs='+', type=float, dest='lr', help="Initial learning rate.")
   parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
@@ -50,7 +50,7 @@ def main():
   parser.add_argument("--epoch-size", default=10000000, type=int, dest='epoch_size', help="epoch size.")
   parser.add_argument("--num-epochs-to-adjust-lr", default=50, type=int, dest='num_epochs_to_adjust_lr', help="Number of epochs to adjust learning rate.")
   parser.add_argument("--score-scaling", default=361, type=float, dest='score_scaling', help="Score scaling.")
-  parser.add_argument("--min-lr", default=1e-5, type=float, dest='min_lr', help="Minimum learning rate to stop the training.")
+  parser.add_argument("--min-newbob-scale", default=1e-5, type=float, dest='min_newbob_scale', help="Minimum learning rate to stop the training.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
@@ -69,7 +69,7 @@ def main():
       newbob_decay=args.newbob_decay,
       num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr,
       score_scaling=args.score_scaling,
-      min_lr=args.min_lr)
+      min_newbob_scale=args.min_newbob_scale)
   else:
     nnue = torch.load(args.resume_from_model)
     nnue.set_feature_set(feature_set)
