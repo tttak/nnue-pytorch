@@ -99,6 +99,10 @@ class NNUEWriter():
     fig.savefig(os.path.join(self.output_directory_path, file_name))
     print(f'Saved a histogram to {file_name}')
 
+    mean = data.to(torch.float).mean().item()
+    std = data.to(torch.float).std().item()
+    print(f'{mean=} {std=}')
+
   def write_feature_transformer(self, model):
     # int16 bias = round(x * 127)
     # int16 weight = round(x * 127)
