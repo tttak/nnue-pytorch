@@ -1,15 +1,20 @@
 import torch
 from torch.optim.optimizer import Optimizer, required
 
+# Yonghongwei/Gradient-Centralization: A New Optimization Technique for Deep Neural Networks https://github.com/Yonghongwei/Gradient-Centralization
 
-def centralized_gradient(x, use_gc=True, gc_conv_only=False):
+def normalize_gradient(x, use_gc=True, gc_conv_only=False):
     if use_gc:
         if gc_conv_only:
             if len(list(x.size())) > 3:
                 x.add_(-x.mean(dim=tuple(range(1, len(list(x.size())))), keepdim=True))
+                std = x.std(dim=tuple(range(1, len(list(x.size())))), keepdim=True)
+                x.div_(std + 1e-8)
         else:
             if len(list(x.size())) > 1:
                 x.add_(-x.mean(dim=tuple(range(1, len(list(x.size())))), keepdim=True))
+                std = x.std(dim=tuple(range(1, len(list(x.size())))), keepdim=True)
+                x.div_(std + 1e-8)
     return x
 
 
@@ -126,7 +131,7 @@ class SGDWithGradientCentralization(Optimizer):
                     d_p = d_p.add(p, alpha=weight_decay)
 
                 # GC operation
-                d_p = centralized_gradient(
+                d_p = normalize_gradient(
                     d_p, use_gc=group["use_gc"], gc_conv_only=group["gc_conv_only"]
                 )
 
