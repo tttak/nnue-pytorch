@@ -109,7 +109,7 @@ class NNUEWriter():
     layer = model.input
     bias = layer.bias.data
     bias = bias.mul(127).round().to(torch.int16)
-    # ascii_hist('ft bias:', bias.numpy())
+    ascii_hist('ft bias:', bias.numpy())
     self.save_histogram(f'{self.figure_index:02}_feature_transformer_bias.png', bias, 'bias', 'frequency', 'feature transformer bias')
     self.figure_index += 1
     self.buf.extend(bias.flatten().numpy().tobytes())
@@ -117,7 +117,7 @@ class NNUEWriter():
     print(datetime.datetime.now())
     weight = self.coalesce_ft_weights(model, layer)
     weight = weight.mul(127).round().to(torch.int16)
-    # ascii_hist('ft weight:', weight.numpy())
+    ascii_hist('ft weight:', weight.numpy())
     self.save_histogram(f'{self.figure_index:02}_feature_transformer_weight.png', weight, 'weight', 'frequency', 'feature transformer weight')
     self.figure_index += 1
     # weights stored as [41024][256], so we need to transpose the pytorch [256][41024]
@@ -140,7 +140,7 @@ class NNUEWriter():
     # int8 weight = round(x * kWeightScale)
     bias = layer.bias.data
     bias = bias.mul(kBiasScale).round().to(torch.int32)
-    # ascii_hist('fc bias:', bias.numpy())
+    ascii_hist('fc bias:', bias.numpy())
     self.save_histogram(f'{self.figure_index:02}_fully_connected_layer_bias.png', bias, 'bias', 'frequency', 'fully connected layer bias')
     self.figure_index += 1
     self.buf.extend(bias.flatten().numpy().tobytes())
@@ -150,7 +150,7 @@ class NNUEWriter():
     clipped_max = torch.max(torch.abs(weight.clamp(-kMaxWeight, kMaxWeight) - weight))
     print("layer has {}/{} clipped weights. Exceeding by {} the maximum {}.".format(clipped, total_elements, clipped_max, kMaxWeight))
     weight = weight.clamp(-kMaxWeight, kMaxWeight).mul(kWeightScale).round().to(torch.int8)
-    # ascii_hist('fc weight:', weight.numpy())
+    ascii_hist('fc weight:', weight.numpy())
     self.save_histogram(f'{self.figure_index:02}_fully_connected_layer_weight.png', weight, 'weight', 'frequency', 'fully connected layer weight')
     self.figure_index += 1
     # FC inputs are padded to 32 elements for simd.
