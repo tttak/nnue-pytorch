@@ -91,7 +91,7 @@ class NNUEWriter():
     ax.set_ylabel(ylabel)
     bins = min(256, data.numel())
     frequency, value = data.to(torch.float).histogram(bins=bins)
-    value += (value[0] + value[1]) * 0.5
+    value += (value[1] - value[0]) * 0.5
     width = value[1] - value[0]
     value = value[:-1]
     ax.bar(value, frequency, width=width)
