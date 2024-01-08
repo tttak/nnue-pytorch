@@ -6,7 +6,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import sys
 import math
-import sgd_with_gradient_centralization
 
 # 3 layer fully connected network
 L1 = 1024
@@ -223,7 +222,7 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    return sgd_with_gradient_centralization.SGDWithGradientCentralization(self.parameters(), lr=self.lr[0], use_gc=True)
+    return torch.optim.SGD(self.parameters(), lr=self.lr[0])
 
   def get_layers(self, filt):
     """
