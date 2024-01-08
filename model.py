@@ -24,7 +24,8 @@ class NNUE(pl.LightningModule):
   def __init__(
       self, feature_set, lambda_=[1.0], lr=[1.0],
       label_smoothing_eps=0.0, num_batches_warmup=10000, newbob_decay=0.5,
-      num_epochs_to_adjust_lr=500, score_scaling=361, min_newbob_scale=1e-5):
+      num_epochs_to_adjust_lr=500, score_scaling=361, min_newbob_scale=1e-5,
+      momentum=0.0):
     super(NNUE, self).__init__()
     self.input = nn.Linear(feature_set.num_features, L1)
     self.feature_set = feature_set
@@ -46,6 +47,7 @@ class NNUE(pl.LightningModule):
     self.warmup_start_global_step = 0
     self.min_newbob_scale = min_newbob_scale
     self.parameter_index = 0
+    self.momentum = momentum
 
     self._zero_virtual_feature_weights()
 
@@ -222,7 +224,7 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    return torch.optim.SGD(self.parameters(), lr=self.lr[0])
+    return torch.optim.SGD(self.parameters(), lr=self.lr[0], momentum=self.momentum)
 
   def get_layers(self, filt):
     """
