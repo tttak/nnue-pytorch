@@ -110,35 +110,38 @@ namespace training_data {
         {
             std::vector<Learner::PackedSfenValue> packedSfenValues(n);
             bool reopenedFileOnce = false;
-            for (;;)
+
+            // Stockfishとは違い、この関数の中でスレッドを同期する。
             {
-                if (m_stream.read(reinterpret_cast<char*>(&packedSfenValues[0]), sizeof(Learner::PackedSfenValue) * n))
+                std::lock_guard<std::mutex> lock(m_file_mutex);
+                while (!m_stream.read(reinterpret_cast<char*>(&packedSfenValues[0]), sizeof(Learner::PackedSfenValue) * n))
                 {
-                    vec.resize(n);
-                    concurrency::parallel_for(size_t(0), n, [&vec, &packedSfenValues](size_t i)
-                        {
-                            vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues[i]);
-                        });
-                    return;
-                }
-                else
-                {
-                    if (m_cyclic)
+                    // 学習データをファイルから読めなかった。
+                    if (!m_cyclic)
                     {
-                        if (reopenedFileOnce)
-                            return;
-
-                        m_stream = std::fstream(m_filename, openmode);
-                        reopenedFileOnce = true;
-                        if (!m_stream)
-                            return;
-
-                        continue;
+                        // 学習データを最後まで読んだフラグを立てて終了する。
+                        m_eof = true;
+                        return;
                     }
 
-                    m_eof = true;
-                    return;
+                    // 学習データファイルを開きなおすことができなかったので終了する。
+                    if (reopenedFileOnce)
+                        return;
+
+                    // 学習データファイルを開きなおす。
+                    m_stream = std::fstream(m_filename, openmode);
+                    reopenedFileOnce = true;
+                    if (!m_stream) {
+                        // 学習データファイルを開きなおすことができなかったので終了する。
+                        return;
+                    }
                 }
+            }
+
+            // ここは複数のスレッドにより同時に実行される。
+            vec.resize(n);
+            for (int i = 0; i < n; ++i) {
+                vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues[i]);
             }
         }
 
@@ -155,6 +158,7 @@ namespace training_data {
         bool m_eof;
         bool m_cyclic;
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+        std::mutex m_file_mutex;
     };
 
     inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)

@@ -402,7 +402,8 @@ struct FeaturedBatchStream : Stream<StorageT>
                 entries.clear();
 
                 {
-                    std::unique_lock lock(m_stream_mutex);
+                    // Stockfish版と異なり、BaseType::m_stream->fill()の中で同期処理を行うようにする。
+                    //std::unique_lock lock(m_stream_mutex);
                     BaseType::m_stream->fill(entries, m_batch_size);
                     if (entries.empty())
                     {
@@ -427,10 +428,12 @@ struct FeaturedBatchStream : Stream<StorageT>
             m_batches_any.notify_one();
         };
 
-        const int num_feature_threads = std::max(
-            1,
-            concurrency - std::max(1, concurrency / num_feature_threads_per_reading_thread)
-        );
+        // Stockfishでは、BasicSfenInputStreamの中でも並列化している。そのため、
+        // FeaturedBatchStreamには、concurrencyの約半分のスレッドのみ割り当てている。
+        // やねうら王版ではBaseType::m_stream->fill()を複数のスレッドで同時に呼び出し、
+        // BaseType::m_stream->fill()内部で適切に同期を取りながら並列化する。
+        // そのため、全てのスレッドをFeaturedBatchStreamに割り当てている。
+        const int num_feature_threads = concurrency;
 
         for (int i = 0; i < num_feature_threads; ++i)
         {
@@ -634,9 +637,9 @@ extern "C" {
 
 int main()
 {
-    auto stream = create_sparse_batch_stream("HalfKP^", 4, R"(C:\shogi\training_data\suisho5.shuffled.qsearch\shuffled.bin)", 8192, true, false, 0);
+    auto stream = create_sparse_batch_stream("HalfKP^", 24, R"(C:\shogi\validation_data\suisho5.shuffled.qsearch.valid.shuffled\shuffled.bin)", 8192, true, false, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < 1000; ++i)
+    for (int i = 0; i < 2000; ++i)
     {
         if (i % 100 == 0) std::cout << i << '\n';
         destroy_sparse_batch(stream->next());
