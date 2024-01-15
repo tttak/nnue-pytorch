@@ -224,7 +224,7 @@ class NNUE(pl.LightningModule):
       child.weight.data.clamp_(-kMaxWeight, kMaxWeight)
 
   def configure_optimizers(self):
-    return torch.optim.SGD(self.parameters(), lr=self.lr[0], momentum=self.momentum)
+    return torch.optim.Adam(self.parameters(), lr=self.lr[0])
 
   def get_layers(self, filt):
     """
