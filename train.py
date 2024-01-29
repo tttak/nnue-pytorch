@@ -78,6 +78,13 @@ def main():
     # we can set the following here just like that because when resuming
     # from .pt the optimizer is only created after the training is started
     nnue.lr = args.lr
+    nnue.label_smoothing_eps=args.label_smoothing_eps
+    nnue.num_batches_warmup=args.num_batches_warmup
+    nnue.newbob_decay=args.newbob_decay
+    nnue.num_epochs_to_adjust_lr=args.num_epochs_to_adjust_lr
+    nnue.score_scaling=args.score_scaling
+    nnue.min_newbob_scale=args.min_newbob_scale
+    nnue.momentum=args.momentum
 
   print("Feature set: {}".format(feature_set.name))
   print("Num real features: {}".format(feature_set.num_real_features))
