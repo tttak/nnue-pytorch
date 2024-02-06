@@ -8113,13 +8113,45 @@ namespace binpack
         }
     };
 
+    // 入玉時に与えるボーナス点を計算する。
+    Value CalculateEnteringKingBonus(const Position& pos, Color color) {
+        // 敵陣
+        Bitboard ef = enemy_field(color);
+
+        // (b)宣言側の玉が敵陣三段目以内に入っている。
+        if (!(ef & pos.king_square(color)))
+            return VALUE_ZERO;
+
+        // (d)宣言側の敵陣三段目以内の駒は、玉を除いて10枚以上存在する。
+        int p1 = (pos.pieces(color) & ef).pop_count();
+
+        // 敵陣にいる大駒の数
+        int p2 = ((pos.pieces(color, BISHOP_HORSE, ROOK_DRAGON)) & ef).pop_count();
+
+        // 小駒1点、大駒5点、玉除く
+        // ＝　敵陣の自駒 + 敵陣の自駒の大駒×4 - 玉
+
+        // (c)
+        // ・先手の場合28点以上の持点がある。
+        // ・後手の場合27点以上の持点がある。
+        Hand h = pos.hand[color];
+        int score = p1 + p2 * 4 - 1
+            + hand_count(h, PAWN) + hand_count(h, LANCE) + hand_count(h, KNIGHT) + hand_count(h, SILVER)
+            + hand_count(h, GOLD) + (hand_count(h, BISHOP) + hand_count(h, ROOK)) * 5;
+        return static_cast<Value>(p1 + score);
+    }
+
+    constexpr const int EnteringKingBonusFactor = 10;
+
     [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv)
     {
         TrainingDataEntry ret;
 
         ret.pos->set_from_packed_sfen(psv.sfen, &ret.stateInfo, Threads.main());
         ret.move = ret.pos->to_move(psv.move);
-        ret.score = psv.score;
+        ret.score = psv.score
+            + CalculateEnteringKingBonus(*ret.pos, ret.pos->side_to_move()) * EnteringKingBonusFactor
+            - CalculateEnteringKingBonus(*ret.pos, ~ret.pos->side_to_move()) * EnteringKingBonusFactor;
         ret.ply = psv.gamePly;
         ret.result = psv.game_result;
 
