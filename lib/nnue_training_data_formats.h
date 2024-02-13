@@ -8113,27 +8113,27 @@ namespace binpack
         }
     };
 
-    // “ü‹Ê‚É—^‚¦‚éƒ{[ƒiƒX“_‚ğŒvZ‚·‚éB
+    // ï¿½ï¿½ï¿½Êï¿½ï¿½É—^ï¿½ï¿½ï¿½ï¿½{ï¿½[ï¿½iï¿½Xï¿½_ï¿½ï¿½ï¿½vï¿½Zï¿½ï¿½ï¿½ï¿½B
     Value CalculateEnteringKingBonus(const Position& pos, Color color) {
-        // “Gw
+        // ï¿½Gï¿½w
         Bitboard ef = enemy_field(color);
 
-        // (b)éŒ¾‘¤‚Ì‹Ê‚ª“GwO’i–ÚˆÈ“à‚É“ü‚Á‚Ä‚¢‚éB
+        // (b)ï¿½éŒ¾ï¿½ï¿½ï¿½Ì‹Ê‚ï¿½ï¿½Gï¿½wï¿½Oï¿½iï¿½ÚˆÈ“ï¿½ï¿½É“ï¿½ï¿½ï¿½ï¿½Ä‚ï¿½ï¿½ï¿½B
         if (!(ef & pos.king_square(color)))
             return VALUE_ZERO;
 
-        // (d)éŒ¾‘¤‚Ì“GwO’i–ÚˆÈ“à‚Ì‹î‚ÍA‹Ê‚ğœ‚¢‚Ä10–‡ˆÈã‘¶İ‚·‚éB
+        // (d)ï¿½éŒ¾ï¿½ï¿½ï¿½Ì“Gï¿½wï¿½Oï¿½iï¿½ÚˆÈ“ï¿½ï¿½Ì‹ï¿½ÍAï¿½Ê‚ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½10ï¿½ï¿½ï¿½Èã‘¶ï¿½İ‚ï¿½ï¿½ï¿½B
         int p1 = (pos.pieces(color) & ef).pop_count();
 
-        // “Gw‚É‚¢‚é‘å‹î‚Ì”
+        // ï¿½Gï¿½wï¿½É‚ï¿½ï¿½ï¿½ï¿½ï¿½Ìï¿½
         int p2 = ((pos.pieces(color, BISHOP_HORSE, ROOK_DRAGON)) & ef).pop_count();
 
-        // ¬‹î1“_A‘å‹î5“_A‹Êœ‚­
-        // @“Gw‚Ì©‹î + “Gw‚Ì©‹î‚Ì‘å‹î~4 - ‹Ê
+        // ï¿½ï¿½ï¿½ï¿½1ï¿½_ï¿½Aï¿½ï¿½ï¿½5ï¿½_ï¿½Aï¿½Êï¿½ï¿½ï¿½
+        // ï¿½ï¿½ï¿½@ï¿½Gï¿½wï¿½Ìï¿½ï¿½ï¿½ + ï¿½Gï¿½wï¿½Ìï¿½ï¿½ï¿½Ì‘ï¿½ï¿½~4 - ï¿½ï¿½
 
         // (c)
-        // Eæè‚Ìê‡28“_ˆÈã‚Ì“_‚ª‚ ‚éB
-        // EŒãè‚Ìê‡27“_ˆÈã‚Ì“_‚ª‚ ‚éB
+        // ï¿½Eï¿½ï¿½ï¿½Ìê‡28ï¿½_ï¿½Èï¿½Ìï¿½ï¿½_ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½B
+        // ï¿½Eï¿½ï¿½ï¿½Ìê‡27ï¿½_ï¿½Èï¿½Ìï¿½ï¿½_ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½B
         Hand h = pos.hand[color];
         int score = p1 + p2 * 4 - 1
             + hand_count(h, PAWN) + hand_count(h, LANCE) + hand_count(h, KNIGHT) + hand_count(h, SILVER)
@@ -8141,7 +8141,7 @@ namespace binpack
         return static_cast<Value>(p1 + score);
     }
 
-    constexpr const int EnteringKingBonusFactor = 10;
+    constexpr const int EnteringKingBonusFactor = 20;
 
     [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv)
     {
