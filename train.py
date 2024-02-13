@@ -63,7 +63,7 @@ def main():
 
   feature_set = features.get_feature_set_from_name(args.features)
 
-  if args.resume_from_model is None:
+  if not args.resume_from_model:
     nnue = M.NNUE(
       feature_set=feature_set, lambda_=args.lambda_,
       lr=args.lr, label_smoothing_eps=args.label_smoothing_eps,
