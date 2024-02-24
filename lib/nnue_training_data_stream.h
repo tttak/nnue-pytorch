@@ -9,6 +9,8 @@
 #include <string>
 #include <memory>
 
+#include <ppl.h>
+
 namespace training_data {
 
     using namespace binpack;
