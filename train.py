@@ -6,6 +6,8 @@ import pytorch_lightning as pl
 import features
 import os
 import torch
+import pytorch_lightning.callbacks
+import typing
 from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
@@ -29,6 +31,24 @@ def data_loader_py(train_filename, val_filename, feature_set, batch_size, main_d
   val = DataLoader(nnue_bin_dataset.NNUEBinData(val_filename, feature_set), batch_size=32)
   return train, val
 
+
+class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
+  def __init__(
+      self,
+      every_n_epochs: int,
+      log_dir: str,
+  ):
+    self.every_n_epochs = every_n_epochs
+    self.log_dir = log_dir
+  
+  def on_validation_end(self, trainer: 'pl.Trainer', pl_module: 'pl.LightningModule') -> None:
+    if trainer.current_epoch == 0 or trainer.current_epoch % self.every_n_epochs != 0:
+      return
+    
+    ckpt_file_path = os.path.join(self.log_dir, f'{trainer.current_epoch}.ckpt')
+    trainer.save_checkpoint(ckpt_file_path)
+
+
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
   parser.add_argument("train", help="Training data (.bin or .binpack)")
@@ -44,7 +64,7 @@ def main():
   parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping', help="If enabled positions that are bad training targets will be skipped during loading. Default: False")
   parser.add_argument("--random-fen-skipping", default=0, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
-  parser.add_argument("--network-save-period", type=int, default=20, dest='network_save_period', help="Number of epochs between network snapshots. None to disable.")
+  parser.add_argument("--network-save-period", type=int, default=1000000000, dest='network_save_period', help="Number of epochs between network snapshots. None to disable.")
   parser.add_argument("--label-smoothing-eps", default=0.0, type=float, dest='label_smoothing_eps', help="Label smoothing eps.")
   parser.add_argument("--num-batches-warmup", default=10000, type=int, dest='num_batches_warmup', help="Number of batches for warm-up.")
   parser.add_argument("--newbob-decay", default=0.5, type=float, dest='newbob_decay', help="Newbob decay.")
@@ -113,7 +133,7 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  checkpoint_callback = pl.callbacks.ModelCheckpoint(every_n_epochs=args.network_save_period, save_top_k=-1)
+  checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
   main_device = 'cuda:0'
