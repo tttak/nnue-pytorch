@@ -93,7 +93,7 @@ def main():
       score_scaling=args.score_scaling,
       min_newbob_scale=args.min_newbob_scale, momentum=args.momentum)
   else:
-    nnue = torch.load(args.resume_from_model)
+    nnue = M.NNUE.load_from_checkpoint(args.resume_from_model, feature_set=feature_set)
     nnue.set_feature_set(feature_set)
     nnue.lambda_ = args.lambda_
     # we can set the following here just like that because when resuming
