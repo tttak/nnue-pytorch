@@ -71,8 +71,8 @@ class NNUEWriter():
     self.int32(VERSION) # version
     self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
     description = b"Features=HalfKP(Friend)[125388->1024x2],"
-    description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-8]"
-    description += b"(ClippedReLU[8](AffineTransform[8<-2048](InputSlice[2048(0:2048)])))))"
+    description += b"Network=AffineTransform[1<-32](ClippedReLU[32](AffineTransform[32<-16]"
+    description += b"(ClippedReLU[16](AffineTransform[16<-2048](InputSlice[2048(0:2048)])))))"
     self.int32(len(description)) # Network definition
     self.buf.extend(description)
 
