@@ -11,6 +11,7 @@ import math
 L1 = 256
 L2 = 256
 L3 = 256
+L4 = 256
 
 class NNUE(pl.LightningModule):
   """
@@ -31,7 +32,8 @@ class NNUE(pl.LightningModule):
     self.feature_set = feature_set
     self.l1 = nn.Linear(2 * L1, L2)
     self.l2 = nn.Linear(L2, L3)
-    self.output = nn.Linear(L3, 1)
+    self.l3 = nn.Linear(L3, L4)
+    self.output = nn.Linear(L4, 1)
     self.lambda_ = lambda_
     self.lr = lr
     self.label_smoothing_eps = label_smoothing_eps

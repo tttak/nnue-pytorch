@@ -46,6 +46,7 @@ class NNUEWriter():
     self.int32(fc_hash) # FC layers hash
     self.write_fc_layer(model.l1)
     self.write_fc_layer(model.l2)
+    self.write_fc_layer(model.l3)
     self.write_fc_layer(model.output, is_output=True)
 
   @staticmethod
@@ -71,8 +72,14 @@ class NNUEWriter():
     self.int32(VERSION) # version
     self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
     description = b"Features=HalfKP(Friend)[125388->256x2],"
-    description += b"Network=AffineTransform[1<-256](ClippedReLU[256](AffineTransform[256<-256]"
-    description += b"(ClippedReLU[256](AffineTransform[256<-512](InputSlice[512(0:512)])))))"
+    description += b"Network=AffineTransform[1<-256]"
+    description += b"(ClippedReLU[256](AffineTransform[256<-256]"
+    description += b"(ClippedReLU[256](AffineTransform[256<-256]"
+    description += b"(ClippedReLU[256](AffineTransform[256<-512]"
+    description += b"(InputSlice[512(0:512)])"
+    description += b"))"
+    description += b"))"
+    description += b"))"
     self.int32(len(description)) # Network definition
     self.buf.extend(description)
 
