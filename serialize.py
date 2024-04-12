@@ -56,7 +56,7 @@ class NNUEWriter():
     prev_hash ^= (M.L1 * 2)
 
     # Fully connected layers
-    layers = [model.l1, model.l2, model.output]
+    layers = [model.l1, model.l2, model.l3, model.output]
     for layer in layers:
       layer_hash = 0xCC03DAE4
       layer_hash += layer.out_features
