@@ -147,6 +147,7 @@ def main():
 
   trainer.fit(nnue, train, val)
 
+  print(f'tb_logger.log_dir={tb_logger.log_dir}')
   ckpt_file_path = os.path.join(tb_logger.log_dir, 'final.ckpt')
   trainer.save_checkpoint(ckpt_file_path)
 
