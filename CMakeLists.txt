@@ -51,6 +51,7 @@ add_library(training_data_loader SHARED
   YaneuraOu/source/eval/nnue/evaluate_nnue_learner.cpp
   YaneuraOu/source/eval/nnue/features/half_kp.cpp
   YaneuraOu/source/eval/nnue/features/half_kpe9.cpp
+  YaneuraOu/source/eval/nnue/features/king_safety_distinguishgolds.cpp
   YaneuraOu/source/eval/nnue/features/half_kp_vm.cpp
   YaneuraOu/source/eval/nnue/features/half_relative_kp.cpp
   YaneuraOu/source/eval/nnue/features/k.cpp

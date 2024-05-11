@@ -279,6 +279,12 @@ struct HalfKPE9 {
         PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
         auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
 
+#if 0
+        sync_cout << "pos=" << sync_endl << pos << sync_endl;
+        sync_cout << "color=" << color << sync_endl;
+        sync_cout << "sq_target_k=" << sq_target_k << sync_endl;
+#endif
+
         // We order the features so that the resulting sparse
         // tensor is coalesced.
         int features_unordered[38];
@@ -289,6 +295,13 @@ struct HalfKPE9 {
             int effect2 = GetEffectCount(pos, sq_p, color, ~color);
             features_unordered[i] = static_cast<int>(Eval::fe_end) * static_cast<int>(sq_target_k) + p
                                   + static_cast<int>(Eval::fe_end) * static_cast<int>(SQ_NB) * (effect1 * 3 + effect2);
+
+#if 0
+            sync_cout << "p=" << p << ", sq_p=" << sq_p << ", effect1=" << effect1 << ", effect2=" << effect2
+                      << ", features_unordered[" << (int)i << "]=" << features_unordered[i]
+                      << sync_endl;
+#endif
+
         }
         std::sort(features_unordered, features_unordered + PIECE_NUMBER_KING);
         for (int k = 0; k < PIECE_NUMBER_KING; ++k)
@@ -299,6 +312,137 @@ struct HalfKPE9 {
             values[counter] = 1.0f;
             counter += 1;
         }
+        return INPUTS;
+    }
+};
+
+struct HalfKP_KSDG {
+    static constexpr int INPUTS = 177876 + 12672;
+    static constexpr int MAX_ACTIVE_FEATURES = 38 + 24;
+
+    // 壁のPiece値を定義
+    static constexpr Piece PIECE_WALL = PIECE_NB;
+    static constexpr Piece PIECE_WALL_NB = static_cast<Piece>(PIECE_WALL + 1);
+
+    static Piece Inv(Piece pc) {
+        if (pc == NO_PIECE) {
+            return NO_PIECE;
+        }
+        else if (pc == PIECE_WALL) {
+            return PIECE_WALL;
+        }
+        else {
+            return make_piece(~color_of(pc), type_of(pc));
+        }
+    }
+
+    static Effect24::Direct Inv(Effect24::Direct dir) {
+        return Effect24::DIRECT_NB - static_cast<Effect24::Direct>(1) - dir;
+    }
+
+    static int MakeIndex(Color perspective, Effect24::Direct dir, Piece pc, int effect1, int effect2) {
+        if (perspective == WHITE) {
+            pc = Inv(pc);
+            dir = Inv(dir);
+        }
+
+        return ((static_cast<int>(dir)
+            * static_cast<int>(PIECE_WALL_NB) + static_cast<int>(pc))
+            * 4 + effect1)
+            * 4 + effect2;
+    }
+
+    static int GetEffectCount(const Position& pos, Square sq, Color perspective) {
+        if (sq == SQ_NB) {
+            return 0;
+        }
+        else {
+            return std::min(int(pos.board_effect[perspective].effect(sq)), 3);
+        }
+    }
+
+    static int fill_features_sparse(int i, const TrainingDataEntry& e, int* features, float* values, int& counter, Color color)
+    {
+        int features_unordered[MAX_ACTIVE_FEATURES];
+        int features_index = 0;
+        auto& pos = *e.pos;
+
+        // ----- KingSafety_DistinguishGolds
+
+        // color側の玉のマス（先手目線）
+        SquareWithWall sqww_king = to_sqww(pos.king_square(color));
+
+#if 0
+        sync_cout << "pos=" << sync_endl << pos << sync_endl;
+        sync_cout << "color=" << color << sync_endl;
+        sync_cout << "sqww_king=" << sqww_king << sync_endl;
+#endif
+
+        // 24近傍をループ
+        for (Effect24::Direct dir : Effect24::Direct()) {
+            SquareWithWall sqww = sqww_king + DirectToDeltaWW(dir);
+            int index_caluculated = 0;
+
+            // 盤内の場合
+            if (is_ok(sqww)) {
+                Square sq = sqww_to_sq(sqww);
+                index_caluculated = MakeIndex(color, dir, pos.piece_on(sq)
+                        , GetEffectCount(pos, sq,  color)
+                        , GetEffectCount(pos, sq, ~color)
+                    );
+
+#if 0
+                sync_cout << (int)dir
+                    << ":" << sq
+                    << "," << pos.piece_on(sq)
+                    << "," << GetEffectCount(pos, sq,  color)
+                    << "," << GetEffectCount(pos, sq, ~color)
+                    << sync_endl;
+#endif
+
+            }
+
+            // 盤外の場合
+            else {
+                index_caluculated = MakeIndex(color, dir, PIECE_WALL, 0, 0);
+
+#if 0
+                sync_cout << (int)dir << ":bangai" << sync_endl;
+#endif
+            }
+
+            features_unordered[features_index] = index_caluculated;
+            features_index++;
+        }
+
+        // ----- HalfKP
+        Eval::BonaPiece* pieces = nullptr;
+        if (color == Color::BLACK) {
+            pieces = pos.eval_list()->piece_list_fb();
+        }
+        else {
+            pieces = pos.eval_list()->piece_list_fw();
+        }
+        PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
+        auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
+
+        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
+            auto p = pieces[i];
+            features_unordered[features_index] = 12672 + static_cast<int>(Eval::fe_end) * static_cast<int>(sq_target_k) + p;
+            features_index++;
+        }
+
+        // -----
+        std::sort(features_unordered, features_unordered + MAX_ACTIVE_FEATURES);
+        for (int k = 0; k < MAX_ACTIVE_FEATURES; ++k)
+        {
+            int idx = counter * 2;
+            features[idx] = i;
+            features[idx + 1] = features_unordered[k];
+            values[counter] = 1.0f;
+            counter += 1;
+        }
+
         return INPUTS;
     }
 };
@@ -628,6 +772,10 @@ extern "C" {
         {
             return new SparseBatch(FeatureSet<HalfKPE9>{}, entries);
         }
+        else if (feature_set == "HalfKP_KSDG")
+        {
+            return new SparseBatch(FeatureSet<HalfKP_KSDG>{}, entries);
+        }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -680,6 +828,10 @@ extern "C" {
         else if (feature_set == "HalfKPE9")
         {
             return new FeaturedBatchStream<FeatureSet<HalfKPE9>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        }
+        else if (feature_set == "HalfKP_KSDG")
+        {
+            return new FeaturedBatchStream<FeatureSet<HalfKP_KSDG>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
         }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
