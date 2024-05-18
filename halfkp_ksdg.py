@@ -17,7 +17,7 @@ def halfkp_idx(is_white_pov: bool, king_sq: int, sq: int, p: chess.Piece):
 
 class Features(FeatureBlock):
   def __init__(self):
-    super(Features, self).__init__('HalfKP_KSDG', 0x5d69d5b8, OrderedDict([('HalfKP_KSDG', 177876 + 12672)]))
+    super(Features, self).__init__('HalfKP_KSDG', 0x5d69d5b8 ^ (0x596B2374 << 1) ^ (0x596B2374 >> 31), OrderedDict([('HalfKP_KSDG', 177876 + 12672)]))
 
   def get_active_features(self, board: chess.Board):
     def piece_features(turn):
@@ -31,7 +31,7 @@ class Features(FeatureBlock):
 
 class FactorizedFeatures(FeatureBlock):
   def __init__(self):
-    super(FactorizedFeatures, self).__init__('HalfKP_KSDG^', 0x5d69d5b8, OrderedDict([('HalfKP_KSDG', 177876 + 12672), ('HalfK', NUM_SQ), ('P', NUM_PLANES )]))
+    super(FactorizedFeatures, self).__init__('HalfKP_KSDG^', 0x5d69d5b8 ^ (0x596B2374 << 1) ^ (0x596B2374 >> 31), OrderedDict([('HalfKP_KSDG', 177876 + 12672), ('HalfK', NUM_SQ), ('P', NUM_PLANES )]))
     self.base = Features()
 
   def get_active_features(self, board: chess.Board):
