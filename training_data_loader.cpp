@@ -447,6 +447,61 @@ struct HalfKP_KSDG {
     }
 };
 
+struct HalfKP_KK {
+    static constexpr int INPUTS = 125388 + 6561;
+    static constexpr int MAX_ACTIVE_FEATURES = 38 + 1;
+
+    static int MakeIndex(Color perspective, Square ksq1, Square ksq2) {
+        if (perspective == WHITE) {
+            ksq1 = Inv(ksq1);
+            ksq2 = Inv(ksq2);
+        }
+
+        return static_cast<int>(ksq1) * static_cast<int>(SQ_NB) + ksq2;
+    }
+
+    static int fill_features_sparse(int i, const TrainingDataEntry& e, int* features, float* values, int& counter, Color color)
+    {
+        int features_unordered[MAX_ACTIVE_FEATURES];
+        int features_index = 0;
+        auto& pos = *e.pos;
+
+        // ----- KK
+        features_unordered[features_index] = MakeIndex(color, pos.king_square(color), pos.king_square(~color));
+        features_index++;
+
+        // ----- HalfKP
+        Eval::BonaPiece* pieces = nullptr;
+        if (color == Color::BLACK) {
+            pieces = pos.eval_list()->piece_list_fb();
+        }
+        else {
+            pieces = pos.eval_list()->piece_list_fw();
+        }
+        PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
+        auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
+
+        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
+            auto p = pieces[i];
+            features_unordered[features_index] = 6561 + static_cast<int>(Eval::fe_end) * static_cast<int>(sq_target_k) + p;
+            features_index++;
+        }
+
+        // -----
+        std::sort(features_unordered, features_unordered + MAX_ACTIVE_FEATURES);
+        for (int k = 0; k < MAX_ACTIVE_FEATURES; ++k)
+        {
+            int idx = counter * 2;
+            features[idx] = i;
+            features[idx + 1] = features_unordered[k];
+            values[counter] = 1.0f;
+            counter += 1;
+        }
+
+        return INPUTS;
+    }
+};
+
 template <typename T, typename... Ts>
 struct FeatureSet
 {
@@ -776,6 +831,10 @@ extern "C" {
         {
             return new SparseBatch(FeatureSet<HalfKP_KSDG>{}, entries);
         }
+        else if (feature_set == "HalfKP_KK")
+        {
+            return new SparseBatch(FeatureSet<HalfKP_KK>{}, entries);
+        }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -832,6 +891,10 @@ extern "C" {
         else if (feature_set == "HalfKP_KSDG")
         {
             return new FeaturedBatchStream<FeatureSet<HalfKP_KSDG>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        }
+        else if (feature_set == "HalfKP_KK")
+        {
+            return new FeaturedBatchStream<FeatureSet<HalfKP_KK>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
         }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;

@@ -27,9 +27,12 @@
 // halfKPE9型
 //#include "architectures/halfkpe9_256x2-32-32.h"
 
-// HalfKP_KSDG型
+// HalfKP-KSDG型
 //#include "architectures/halfkp-kingsafety_distinguishgolds_256x2-32-32.h"
-#include "architectures/halfkp-kingsafety_distinguishgolds_512x2-8-96.h"
+//#include "architectures/halfkp-kingsafety_distinguishgolds_512x2-8-96.h"
+
+// HalfKP-KK型
+#include "architectures/halfkp-kk_512x2-8-96.h"
 
 #elif defined(EVAL_NNUE_HALFKP_VM_256X2_32_32)
 
