@@ -14,8 +14,9 @@ import halfka
 import halfkpe9
 import halfkp_ksdg
 import halfkp_kk
+import halfkpe4
 
-_feature_modules = [halfkp, halfka, halfkpe9, halfkp_ksdg, halfkp_kk]
+_feature_modules = [halfkp, halfka, halfkpe9, halfkp_ksdg, halfkp_kk, halfkpe4]
 
 _feature_blocks_by_name = dict()
 
