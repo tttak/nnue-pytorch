@@ -35,7 +35,8 @@
 //#include "architectures/halfkp-kk_512x2-8-96.h"
 
 // HalfKPE4型
-#include "architectures/halfkpe4_256x2-32-32.h"
+//#include "architectures/halfkpe4_256x2-32-32.h"
+#include "architectures/halfkpe4_512x2-8-96.h"
 
 #elif defined(EVAL_NNUE_HALFKP_VM_256X2_32_32)
 
