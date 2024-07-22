@@ -580,6 +580,183 @@ struct HalfKPE4 {
     }
 };
 
+struct HalfKPE4_KSDG {
+    static constexpr int INPUTS = 177876 * 4 + 12672;
+    static constexpr int MAX_ACTIVE_FEATURES = 38 + 24;
+
+    // ----- KingSafety_DistinguishGolds
+
+    // 壁のPiece値を定義
+    static constexpr Piece PIECE_WALL = PIECE_NB;
+    static constexpr Piece PIECE_WALL_NB = static_cast<Piece>(PIECE_WALL + 1);
+
+    static Piece Inv(Piece pc) {
+        if (pc == NO_PIECE) {
+            return NO_PIECE;
+        }
+        else if (pc == PIECE_WALL) {
+            return PIECE_WALL;
+        }
+        else {
+            return make_piece(~color_of(pc), type_of(pc));
+        }
+    }
+
+    static Effect24::Direct Inv(Effect24::Direct dir) {
+        return Effect24::DIRECT_NB - static_cast<Effect24::Direct>(1) - dir;
+    }
+
+    static int MakeIndex_KSDG(Color perspective, Effect24::Direct dir, Piece pc, int effect1, int effect2) {
+        if (perspective == WHITE) {
+            pc = Inv(pc);
+            dir = Inv(dir);
+        }
+
+        return ((static_cast<int>(dir)
+            * static_cast<int>(PIECE_WALL_NB) + static_cast<int>(pc))
+            * 4 + effect1)
+            * 4 + effect2;
+    }
+
+    static int GetEffectCount_KSDG(const Position& pos, Square sq, Color perspective) {
+        if (sq == SQ_NB) {
+            return 0;
+        }
+        else {
+            return std::min(int(pos.board_effect[perspective].effect(sq)), 3);
+        }
+    }
+
+    // ----- HalfKPE4
+
+    constexpr static Square Inv(Square sq) { return (Square)((SQ_NB - 1) - sq); }
+
+    static Square GetSquareFromBonaPiece(Eval::BonaPiece p) {
+        if (p < Eval::fe_hand_end) {
+            return SQ_NB;
+        }
+        else {
+            return static_cast<Square>((p - Eval::fe_hand_end) % SQ_NB);
+        }
+    }
+
+    static int GetEffectCount_HKPE4(const Position& pos, Square sq_p, Color perspective_org, Color perspective) {
+        if (sq_p == SQ_NB) {
+            return 0;
+        }
+        else {
+            if (perspective_org == WHITE) {
+                sq_p = Inv(sq_p);
+            }
+            return std::min(int(pos.board_effect[perspective].effect(sq_p)), 1);
+        }
+    }
+
+    // -----
+
+    static int fill_features_sparse(int i, const TrainingDataEntry& e, int* features, float* values, int& counter, Color color)
+    {
+        int features_unordered[MAX_ACTIVE_FEATURES];
+        int features_index = 0;
+        auto& pos = *e.pos;
+
+        // ----- KingSafety_DistinguishGolds
+
+        // color側の玉のマス（先手目線）
+        SquareWithWall sqww_king = to_sqww(pos.king_square(color));
+
+#if 0
+        sync_cout << "pos=" << sync_endl << pos << sync_endl;
+        sync_cout << "color=" << color << sync_endl;
+        sync_cout << "sqww_king=" << sqww_king << sync_endl;
+#endif
+
+        // 24近傍をループ
+        for (Effect24::Direct dir : Effect24::Direct()) {
+            SquareWithWall sqww = sqww_king + DirectToDeltaWW(dir);
+            int index_caluculated = 0;
+
+            // 盤内の場合
+            if (is_ok(sqww)) {
+                Square sq = sqww_to_sq(sqww);
+                index_caluculated = MakeIndex_KSDG(color, dir, pos.piece_on(sq)
+                        , GetEffectCount_KSDG(pos, sq,  color)
+                        , GetEffectCount_KSDG(pos, sq, ~color)
+                    );
+
+#if 0
+                sync_cout << (int)dir
+                    << ":" << sq
+                    << "," << pos.piece_on(sq)
+                    << "," << GetEffectCount_KSDG(pos, sq,  color)
+                    << "," << GetEffectCount_KSDG(pos, sq, ~color)
+                    << sync_endl;
+#endif
+
+            }
+
+            // 盤外の場合
+            else {
+                index_caluculated = MakeIndex_KSDG(color, dir, PIECE_WALL, 0, 0);
+
+#if 0
+                sync_cout << (int)dir << ":bangai" << sync_endl;
+#endif
+            }
+
+            features_unordered[features_index] = index_caluculated;
+            features_index++;
+        }
+
+        // ----- HalfKPE4
+        Eval::BonaPiece* pieces = nullptr;
+        if (color == Color::BLACK) {
+            pieces = pos.eval_list()->piece_list_fb();
+        }
+        else {
+            pieces = pos.eval_list()->piece_list_fw();
+        }
+        PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
+        auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
+
+#if 0
+        sync_cout << "pos=" << sync_endl << pos << sync_endl;
+        sync_cout << "color=" << color << sync_endl;
+        sync_cout << "sq_target_k=" << sq_target_k << sync_endl;
+#endif
+
+        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
+            auto p = pieces[i];
+            Square sq_p = GetSquareFromBonaPiece(p);
+            int effect1 = GetEffectCount_HKPE4(pos, sq_p, color,  color);
+            int effect2 = GetEffectCount_HKPE4(pos, sq_p, color, ~color);
+            features_unordered[features_index] = 12672
+                                               + static_cast<int>(Eval::fe_end) * static_cast<int>(sq_target_k) + p
+                                               + static_cast<int>(Eval::fe_end) * static_cast<int>(SQ_NB) * (effect1 * 2 + effect2);
+#if 0
+            sync_cout << "p=" << p << ", sq_p=" << sq_p << ", effect1=" << effect1 << ", effect2=" << effect2
+                      << ", features_unordered[" << features_index << "]=" << features_unordered[features_index]
+                      << sync_endl;
+#endif
+
+            features_index++;
+        }
+
+        // -----
+        std::sort(features_unordered, features_unordered + MAX_ACTIVE_FEATURES);
+        for (int k = 0; k < MAX_ACTIVE_FEATURES; ++k)
+        {
+            int idx = counter * 2;
+            features[idx] = i;
+            features[idx + 1] = features_unordered[k];
+            values[counter] = 1.0f;
+            counter += 1;
+        }
+
+        return INPUTS;
+    }
+};
+
 template <typename T, typename... Ts>
 struct FeatureSet
 {
@@ -917,6 +1094,10 @@ extern "C" {
         {
             return new SparseBatch(FeatureSet<HalfKPE4>{}, entries);
         }
+        else if (feature_set == "HalfKPE4_KSDG")
+        {
+            return new SparseBatch(FeatureSet<HalfKPE4_KSDG>{}, entries);
+        }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -981,6 +1162,10 @@ extern "C" {
         else if (feature_set == "HalfKPE4")
         {
             return new FeaturedBatchStream<FeatureSet<HalfKPE4>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+        }
+        else if (feature_set == "HalfKPE4_KSDG")
+        {
+            return new FeaturedBatchStream<FeatureSet<HalfKPE4_KSDG>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
         }
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;

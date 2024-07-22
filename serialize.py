@@ -70,7 +70,7 @@ class NNUEWriter():
   def write_header(self, model, fc_hash):
     self.int32(VERSION) # version
     self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
-    description = b"Features=HalfKPE4(Friend)[501552->512x2],"
+    description = b"Features=HalfKPE4(Friend)+KingSafety_DistinguishGolds(Friend)[724176->512x2],"
     description += b"Network=AffineTransform[1<-96](ClippedReLU[96](AffineTransform[96<-8]"
     description += b"(ClippedReLU[8](AffineTransform[8<-1024](InputSlice[1024(0:1024)])))))"
     self.int32(len(description)) # Network definition
