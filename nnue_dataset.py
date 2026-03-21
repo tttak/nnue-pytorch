@@ -28,6 +28,7 @@ class SparseBatch(ctypes.Structure):
         ('white_values', ctypes.POINTER(ctypes.c_float)),
         ('black_values', ctypes.POINTER(ctypes.c_float)),
         ('layer_stack_indices', ctypes.POINTER(ctypes.c_int)),
+        ('material', ctypes.POINTER(ctypes.c_float)),
     ]
 
     def get_tensors(self, device):
@@ -40,7 +41,9 @@ class SparseBatch(ctypes.Structure):
         outcome = torch.from_numpy(np.ctypeslib.as_array(self.outcome, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
         score = torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
         layer_stack_indices = torch.from_numpy(np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
-        return us, them, white_indices, white_values, black_indices, black_values, outcome, score, psqt_indices, layer_stack_indices
+        material = torch.from_numpy(np.ctypeslib.as_array(self.material, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
+        return us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material
+
 
 SparseBatchPtr = ctypes.POINTER(SparseBatch)
 
@@ -52,7 +55,13 @@ class TrainingDataProvider:
         destroy_stream,
         fetch_next,
         destroy_part,
-        filename,
+        filename1,
+        filename2,
+        filename3,
+        train1_rate,
+        train2_rate,
+        skiprate,
+        mirror,
         cyclic,
         num_workers,
         batch_size=None,
@@ -65,7 +74,13 @@ class TrainingDataProvider:
         self.destroy_stream = destroy_stream
         self.fetch_next = fetch_next
         self.destroy_part = destroy_part
-        self.filename = filename.encode('utf-8')
+        self.filename1 = filename1.encode('utf-8')
+        self.filename2 = filename2.encode('utf-8')
+        self.filename3 = filename3.encode('utf-8')
+        self.train1_rate = train1_rate
+        self.train2_rate = train2_rate
+        self.skiprate = skiprate
+        self.mirror = mirror
         self.cyclic = cyclic
         self.num_workers = num_workers
         self.batch_size = batch_size
@@ -74,9 +89,9 @@ class TrainingDataProvider:
         self.device = device
 
         if batch_size:
-            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename, batch_size, cyclic, filtered, random_fen_skipping)
+            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename1, self.filename2, self.filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, filtered, random_fen_skipping)
         else:
-            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename, cyclic, filtered, random_fen_skipping)
+            self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename1, self.filename2, self.filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, filtered, random_fen_skipping)
 
     def __iter__(self):
         return self
@@ -96,7 +111,7 @@ class TrainingDataProvider:
 
 create_sparse_batch_stream = dll.create_sparse_batch_stream
 create_sparse_batch_stream.restype = ctypes.c_void_p
-create_sparse_batch_stream.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+create_sparse_batch_stream.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 destroy_sparse_batch_stream = dll.destroy_sparse_batch_stream
 destroy_sparse_batch_stream.argtypes = [ctypes.c_void_p]
 
@@ -125,14 +140,20 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results):
     return b
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
             destroy_sparse_batch_stream,
             fetch_next_sparse_batch,
             destroy_sparse_batch,
-            filename,
+            filename1,
+            filename2,
+            filename3,
+            train1_rate,
+            train2_rate,
+            skiprate,
+            mirror,
             cyclic,
             num_workers,
             batch_size,
@@ -141,10 +162,16 @@ class SparseBatchProvider(TrainingDataProvider):
             device)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
+  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu'):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
-    self.filename = filename
+    self.filename1 = filename1
+    self.filename2 = filename2
+    self.filename3 = filename3
+    self.train1_rate = train1_rate
+    self.train2_rate = train2_rate
+    self.skiprate = skiprate
+    self.mirror = mirror
     self.batch_size = batch_size
     self.cyclic = cyclic
     self.num_workers = num_workers
@@ -153,7 +180,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.device = device
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device)
+    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):

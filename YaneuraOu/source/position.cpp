@@ -2630,6 +2630,28 @@ void Position::UnitTest(Test::UnitTester& tester)
 
 }
 
+	// 学習局面の簡易スキップ用1
+	bool Position::effectSkip1() {
+		//return effectSkip2(BLACK) || effectSkip2(WHITE);
+
+		// 手番側が相手側の駒（歩と香と桂を除く）をただで取れる局面の場合、trueを返す
+		return effectSkip2(~sideToMove);
+	}
+
+	// 学習局面の簡易スキップ用2
+	bool Position::effectSkip2(Color color) {
+		Bitboard bb = pieces(color) & (pieces(KING) | pieces(ROOK, DRAGON, BISHOP, HORSE) | pieces(GOLD) | pieces(SILVER, PRO_SILVER) | pieces(PRO_PAWN , PRO_LANCE , PRO_KNIGHT));
+
+		while (bb) {
+			Square sq = bb.pop();
+			if (int(board_effect[~color].effect(sq)) > 0 && int(board_effect[color].effect(sq)) == 0) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 
 // ----------------------------------
 //         明示的な実体化

@@ -526,12 +526,25 @@ public:
 
 #endif
 
+#if 0
 	int stack_index() const {
 		constexpr int kIndexTable[] = {2, 2, 2, 1, 1, 1, 0, 0, 0};
 		auto fKing = sideToMove == BLACK ? rank_of(king_square(sideToMove)) : rank_of(Inv(king_square(sideToMove)));
 		auto eKing = sideToMove == BLACK ? rank_of(Inv(king_square(~sideToMove))) : rank_of(king_square(~sideToMove));
 		return kIndexTable[eKing] * 3 + kIndexTable[fKing];
 	}
+#else
+	int stack_index() const {
+		constexpr int index[24] = {0, 1, 2, 3, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 10, 11};
+		//return index[std::min((std::abs(st->materialValue) + 99) / 100, 23)];
+		return index[std::min((std::abs(Eval::material(*this)) + 99) / 100, 23)];
+	}
+#endif
+
+	// 学習局面の簡易スキップ用
+	bool effectSkip1();
+	bool effectSkip2(Color color);
+
 
 	// --- Accessing hash keys
 

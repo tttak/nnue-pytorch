@@ -31,6 +31,7 @@ THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include "../YaneuraOu/source/thread.h"
 #include "../YaneuraOu/source/position.h"
 #include "../YaneuraOu/source/learn/learn.h"
+//#include "../YaneuraOu/source/bitboard.h"
 
 //#include <cstdio>
 //#include <cassert>
@@ -8097,6 +8098,9 @@ namespace binpack
         std::uint16_t ply;
         std::int16_t result;
 
+        bool skip;
+        std::int16_t material;
+
         [[nodiscard]] bool isValid() const
         {
             return pos->pseudo_legal(move) && pos->legal(move);
@@ -8113,15 +8117,35 @@ namespace binpack
         }
     };
 
-    [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv)
+    [[nodiscard]] inline TrainingDataEntry packedSfenValueToTrainingDataEntry(const Learner::PackedSfenValue& psv, const bool mirror = false)
     {
         TrainingDataEntry ret;
 
-        ret.pos->set_from_packed_sfen(psv.sfen, &ret.stateInfo, Threads.main());
+        ret.pos->set_from_packed_sfen(psv.sfen, &ret.stateInfo, Threads.main(), mirror);
         ret.move = ret.pos->to_move(psv.move);
         ret.score = psv.score;
         ret.ply = psv.gamePly;
         ret.result = psv.game_result;
+
+        ret.skip = ret.pos->in_check()
+                   || (ret.move != 0 && (ret.pos->capture(ret.move) || is_promote(ret.move)))
+                   || ret.pos->effectSkip1();
+
+        ret.material = Eval::material(*ret.pos) * (ret.pos->side_to_move() == BLACK ? 1 : -1);
+
+        {
+            static std::uint64_t cntAll = 0;
+            static std::uint64_t cntSkip = 0;
+
+            cntAll++;
+            if (ret.skip) {
+                cntSkip++;
+            }
+
+            if (cntAll % 1000000000 == 0) {
+                sync_cout << "cntAll=" << cntAll << ", cntSkip=" << cntSkip << ", SkipRate=" << (double(cntSkip) / double(cntAll) * 100.0) << "%" << sync_endl;
+            }
+        }
 
         return ret;
     }

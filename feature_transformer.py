@@ -256,7 +256,10 @@ void feature_transformer_slice_backward(
     for (uint32_t k = 0; k < {max_active_features}; ++k)
     {{
         const int32_t feature_index = feature_index_row[k];
+
         const float   feature_value = feature_value_row[k];
+        //const float   feature_value = feature_value_row[k] * (feature_index < 12672 ? 0.2f : 1.0f);
+
         if (feature_index != -1)
         {{
             float* const weight_grad_slice = weight_grad + feature_index * {output_size} + slice_offset;
@@ -503,17 +506,37 @@ class FeatureTransformerSlice(nn.Module):
         return FeatureTransformerSliceFunction.apply(feature_indices, feature_values, self.weight, self.bias)
 
 class DoubleFeatureTransformerSlice(nn.Module):
-    def __init__(self, num_inputs, num_outputs):
+    # factor_dimを追加
+    def __init__(self, num_inputs, num_outputs, factor_dim):
         super(DoubleFeatureTransformerSlice, self).__init__()
         self.num_inputs = num_inputs
         self.num_outputs = num_outputs
+        self.factor_dim = factor_dim
 
         sigma = math.sqrt(1/num_inputs)
         self.weight = nn.Parameter(torch.rand(num_inputs, num_outputs, dtype=torch.float32) * (2 * sigma) - sigma)
         self.bias = nn.Parameter(torch.rand(num_outputs, dtype=torch.float32) * (2 * sigma) - sigma)
 
+        # self.vを追加
+        self.v = nn.Parameter((torch.rand(num_inputs, factor_dim, dtype=torch.float32) * (2 * sigma) - sigma) * 0.1)
+
     def forward(self, feature_indices_0, feature_values_0, feature_indices_1, feature_values_1):
-        return DoubleFeatureTransformerSliceFunction.apply(feature_indices_0, feature_values_0, feature_indices_1, feature_values_1, self.weight, self.bias)
+        # 1. 既存の高速な線形パス
+        t_self, t_opp = DoubleFeatureTransformerSliceFunction.apply(
+            feature_indices_0, feature_values_0, 
+            feature_indices_1, feature_values_1, 
+            self.weight, self.bias
+        )
+
+        # 2. FM要素の抽出 (単なる埋め込み参照のみを行い、そのまま返す)
+        # クランプしてインデックス外れを防止
+        idx0 = torch.clamp(feature_indices_0, 0, self.num_inputs - 1)
+        idx1 = torch.clamp(feature_indices_1, 0, self.num_inputs - 1)
+        
+        v_feat0 = self.v[idx0]
+        v_feat1 = self.v[idx1]
+
+        return t_self, t_opp, v_feat0, v_feat1
 
 if __name__ == '__main__':
     import time

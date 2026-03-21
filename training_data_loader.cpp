@@ -59,106 +59,98 @@ static Square orient(Color color, Square sq)
 //    }
 //}
 
-struct HalfKP {
-    static constexpr int NUM_SQ = 81;
-    static constexpr int NUM_PLANES = 1548; // == fe_end
-    static constexpr int INPUTS = NUM_PLANES * NUM_SQ;
 
-    static constexpr int MAX_ACTIVE_FEATURES = 38;
+struct HalfKA_KSDG3 {
+    static constexpr int INPUTS = 190998 + 12672;
+
+    static constexpr int MAX_ACTIVE_FEATURES = 40 + 24;
+    //static constexpr int MAX_ACTIVE_FEATURES = 39 + 24;
+
+
+    // ----- KingSafety_DistinguishGolds
+
+    // 壁のPiece値を定義
+    static constexpr Piece PIECE_WALL = PIECE_NB;
+    static constexpr Piece PIECE_WALL_NB = static_cast<Piece>(PIECE_WALL + 1);
+
+    static Piece Inv(Piece pc) {
+        if (pc == NO_PIECE) {
+            return NO_PIECE;
+        }
+        else if (pc == PIECE_WALL) {
+            return PIECE_WALL;
+        }
+        else {
+            return make_piece(~color_of(pc), type_of(pc));
+        }
+    }
+
+    static Effect24::Direct Inv(Effect24::Direct dir) {
+        return Effect24::DIRECT_NB - static_cast<Effect24::Direct>(1) - dir;
+    }
+
+    static int MakeIndex(Color perspective, Effect24::Direct dir, Piece pc, int effect1, int effect2) {
+        if (perspective == WHITE) {
+            pc = Inv(pc);
+            dir = Inv(dir);
+        }
+
+        return ((static_cast<int>(dir)
+            * static_cast<int>(PIECE_WALL_NB) + static_cast<int>(pc))
+            * 4 + effect1)
+            * 4 + effect2;
+    }
+
+    static int GetEffectCount(const Position& pos, Square sq, Color perspective) {
+        if (sq == SQ_NB) {
+            return 0;
+        }
+        else {
+            return std::min(int(pos.board_effect[perspective].effect(sq)), 3);
+        }
+    }
+
+    // -----
 
     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
     {
+        int features_unordered[MAX_ACTIVE_FEATURES];
+        int features_index = 0;
         auto& pos = *e.pos;
-        Eval::BonaPiece* pieces = nullptr;
-        if (color == Color::BLACK) {
-            pieces = pos.eval_list()->piece_list_fb();
-        }
-        else {
-            pieces = pos.eval_list()->piece_list_fw();
-        }
-        PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
-        auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
 
-        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
-            auto p = pieces[i];
-            values[i] = 1.0f;
-            features[i] = static_cast<int>(Eval::fe_end) * static_cast<int>(sq_target_k) + p;
-        }
-        return { PIECE_NUMBER_KING, INPUTS };
-    }
-};
+        // ----- KingSafety_DistinguishGolds
 
-int make_relkp_index(Square sq_k, int p) {
-    if (p < Eval::fe_hand_end) {
-        return p;
-    }
-    constexpr int W = 9 * 2 - 1;
-    constexpr int H = 9 * 2 - 1;
-    const int piece_index = (p - Eval::fe_hand_end) / SQ_NB;
-    const Square sq_p = static_cast<Square>((p - Eval::fe_hand_end) % SQ_NB);
-    const int relative_file = file_of(sq_p) - file_of(sq_k) + (W / 2);
-    const int relative_rank = rank_of(sq_p) - rank_of(sq_k) + (H / 2);
-    return H * W * piece_index + H * relative_file + relative_rank + Eval::fe_hand_end;
-}
-struct HalfKPFactorized {
-    // Factorized features
-    static constexpr int K_INPUTS = HalfKP::NUM_SQ;
-    static constexpr int PIECE_INPUTS = HalfKP::NUM_PLANES;
-    static constexpr int NUN_PIECE_KINDS = (Eval::fe_end - Eval::fe_hand_end) / 81;
-    static constexpr int REL_INPUTS = NUN_PIECE_KINDS * 17 * 17 + Eval::fe_hand_end;
-    static constexpr int INPUTS = HalfKP::INPUTS + K_INPUTS + PIECE_INPUTS + REL_INPUTS;
+        // color側の玉のマス（先手目線）
+        SquareWithWall sqww_king = to_sqww(pos.king_square(color));
 
-    static constexpr int MAX_K_FEATURES = 1;
-    static constexpr int MAX_PIECE_FEATURES = 38;
-    static constexpr int MAX_ACTIVE_FEATURES = HalfKP::MAX_ACTIVE_FEATURES + MAX_K_FEATURES + MAX_PIECE_FEATURES + MAX_PIECE_FEATURES;
+        // 24近傍をループ
+        for (Effect24::Direct dir : Effect24::Direct()) {
+            SquareWithWall sqww = sqww_king + DirectToDeltaWW(dir);
+            int index_caluculated = -1;
 
-    static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-    {
-        auto [start_j, offset] = HalfKP::fill_features_sparse(e, features, values, color);
-        auto j = start_j;
-        auto& pos = *e.pos;
-        Eval::BonaPiece* pieces = nullptr;
-        if (color == Color::BLACK) {
-            pieces = pos.eval_list()->piece_list_fb();
-        }
-        else {
-            pieces = pos.eval_list()->piece_list_fw();
-        }
-        PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
-        auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
-        {
-            features[j] = offset + static_cast<int>(sq_target_k);
-            values[j] = static_cast<float>(start_j);
-            ++j;
-        }
-        offset += K_INPUTS;
-        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
-            auto p = pieces[i];
-            values[j] = 1.0f;
-            features[j] = offset + p;
-            ++j;
-        }
-        offset += PIECE_INPUTS;
-        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_KING; ++i) {
-            auto p = pieces[i];
-            values[j] = 1.0f;
-            features[j] = offset + make_relkp_index(sq_target_k, p);
-            ++j;
-        }
-        return { j, INPUTS };
-    }
-};
+            // 盤内の場合
+            if (is_ok(sqww)) {
+                Square sq = sqww_to_sq(sqww);
+                index_caluculated = MakeIndex(color, dir, pos.piece_on(sq)
+                        , GetEffectCount(pos, sq,  color)
+                        , GetEffectCount(pos, sq, ~color)
+                    );
+            }
 
-struct HalfKA {
-    static constexpr int NUM_SQ = 81;
-    static constexpr int NUM_PLANES = 1548 + 81 * 2;
-    static constexpr int INPUTS = NUM_PLANES * NUM_SQ;
+            // 盤外の場合
+            else {
+                // KSDG3の場合、何もしない
+                //index_caluculated = MakeIndex(color, dir, PIECE_WALL, 0, 0);
+            }
 
-    static constexpr int MAX_ACTIVE_FEATURES = 40;
+            if(index_caluculated != -1) {
+                features_unordered[features_index] = index_caluculated;
+                features_index++;
+            }
+        }
 
-     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
-     {
-        auto& pos = *e.pos;
+
+        // ----- HalfKA
         Eval::BonaPiece* pieces = nullptr;
         if (color == Color::BLACK) {
             pieces = pos.eval_list()->piece_list_fb();
@@ -170,27 +162,55 @@ struct HalfKA {
         auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
 
         for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
+            // 40→39
+            if (i == target) {
+                continue;
+            }
+
             auto p = pieces[i];
-            values[i] = 1.0f;
-            features[i] = static_cast<int>(Eval::fe_end) * static_cast<int>(sq_target_k) + p;
+            features_unordered[features_index] = 12672 + static_cast<int>(Eval::fe_end2) * static_cast<int>(sq_target_k) + p;
+            features_index++;
         }
-        return { PIECE_NUMBER_NB, INPUTS };
+
+
+        // -----
+        //std::sort(features_unordered, features_unordered + MAX_ACTIVE_FEATURES);
+        for (int k = 0; k < features_index; ++k)
+        {
+            values[k] = 1.0f;
+            features[k] = features_unordered[k];
+        }
+
+        return { features_index, INPUTS };
     }
 };
 
-struct HalfKAFactorized {
-    // Factorized features
-    static constexpr int PIECE_INPUTS = HalfKA::NUM_PLANES ;
-    static constexpr int NUN_PIECE_KINDS = (Eval::fe_end2 - Eval::fe_hand_end) / 81;
-    static constexpr int REL_INPUTS = NUN_PIECE_KINDS * 17 * 17 + Eval::fe_hand_end;
-    static constexpr int INPUTS = HalfKA::INPUTS + PIECE_INPUTS + REL_INPUTS;
+struct HalfKA_KSDG3_Factorized {
+    // RelKA
+    static constexpr int NUN_PIECE_KINDS = (Eval::fe_end2 - Eval::fe_hand_end) / 81; // 28
+    static constexpr int REL_INPUTS = NUN_PIECE_KINDS * 17 * 17 + Eval::fe_hand_end; // 8182
 
-    static constexpr int MAX_PIECE_FEATURES = 40;
-    static constexpr int MAX_ACTIVE_FEATURES = HalfKA::MAX_ACTIVE_FEATURES + MAX_PIECE_FEATURES + MAX_PIECE_FEATURES;
+    // HalfKA_KSDG3_Factorized = HalfKA_KSDG3 + A_GOLDS + HalfRelKAGOLDS + KSDGE00_GOLDS
+    static constexpr int INPUTS = (190998 + 12672) + 2358 + REL_INPUTS + 12672;
+    static constexpr int MAX_ACTIVE_FEATURES = (40 + 24) + 40 + 40 + 24;
+
+    static int make_relka_index(Square sq_k, int p) {
+        if (p < Eval::fe_hand_end) {
+            return p;
+        }
+        constexpr int W = 9 * 2 - 1;
+        constexpr int H = 9 * 2 - 1;
+        const int piece_index = (p - Eval::fe_hand_end) / SQ_NB;
+        const Square sq_p = static_cast<Square>((p - Eval::fe_hand_end) % SQ_NB);
+        const int relative_file = file_of(sq_p) - file_of(sq_k) + (W / 2);
+        const int relative_rank = rank_of(sq_p) - rank_of(sq_k) + (H / 2);
+        return H * W * piece_index + H * relative_file + relative_rank + Eval::fe_hand_end;
+    }
 
     static std::pair<int, int> fill_features_sparse(const TrainingDataEntry& e, int* features, float* values, Color color)
     {
-        auto [start_j, offset] = HalfKA::fill_features_sparse(e, features, values, color);
+        auto [start_j, offset] = HalfKA_KSDG3::fill_features_sparse(e, features, values, color);
+
         auto j = start_j;
         auto& pos = *e.pos;
         Eval::BonaPiece* pieces = nullptr;
@@ -201,23 +221,97 @@ struct HalfKAFactorized {
         }
         PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
         auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
-        offset += PIECE_INPUTS;
+
+
+        // ----- A_GOLDS
+        // ・KAをAで次元下げ
+        // ・「と金～成銀」を金と同一視する
         for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
+            // 40→39
+            if (i == target) {
+                continue;
+            }
+
             auto p = pieces[i];
+
+            if (Eval::fe_old_end <= p && p < Eval::fe_new_end) {
+                p = static_cast<Eval::BonaPiece>((p - Eval::fe_old_end) % 162 + Eval::f_gold);
+            }
+
             values[j] = 1.0f;
             features[j] = offset + p;
             ++j;
-            
         }
+        offset += 2358;
+
+
+        // ----- HalfRelKAGOLDS
+        // ・KAを「KとA（盤内の駒のみ）の相対位置」で次元下げ
+        // ・Aで「と金～成銀」を金と同一視する
         for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
+            // 40→39
+            if (i == target) {
+                continue;
+            }
+
             auto p = pieces[i];
+
+            if (Eval::fe_old_end <= p && p < Eval::fe_new_end) {
+                p = static_cast<Eval::BonaPiece>((p - Eval::fe_old_end) % 162 + Eval::f_gold);
+            }
+
             values[j] = 1.0f;
-            features[j] = rel_offset + make_relkp_index(sq_target_k, p);
+            features[j] = offset + make_relka_index(sq_target_k, p);
             ++j;
         }
-        return { j, INPUTS };
+        offset += 8182;
+
+
+        // ----- KSDGE00_GOLDS
+        // ・KSDG3を「利き数の相違は無視」で次元下げ
+        // ・「と金～成銀」を金と同一視する
+
+        // color側の玉のマス（先手目線）
+        SquareWithWall sqww_king = to_sqww(pos.king_square(color));
+
+        // 24近傍をループ
+        for (Effect24::Direct dir : Effect24::Direct()) {
+            SquareWithWall sqww = sqww_king + DirectToDeltaWW(dir);
+            int index_caluculated = -1;
+
+            // 盤内の場合
+            if (is_ok(sqww)) {
+                Square sq = sqww_to_sq(sqww);
+
+                Piece pc = pos.piece_on(sq);
+                PieceType pt = type_of(pc);
+                Color c = color_of(pc);
+
+                if (pt == PRO_PAWN || pt == PRO_LANCE || pt == PRO_KNIGHT || pt == PRO_SILVER) {
+                    pc = make_piece(c, GOLD);
+                }
+
+                index_caluculated = HalfKA_KSDG3::MakeIndex(color, dir, pc, 0, 0);
+            }
+
+            // 盤外の場合
+            else {
+                // KSDG3の場合、何もしない
+                //index_caluculated = HalfKA_KSDG::MakeIndex(color, dir, HalfKA_KSDG::PIECE_WALL, 0, 0);
+            }
+
+            if(index_caluculated != -1) {
+                values[j] = 1.0f;
+                features[j] = offset + index_caluculated;
+                ++j;
+            }
+        }
+        offset += 12672;
+
+        return { j, offset };
     }
 };
+
 
 template <typename T, typename... Ts>
 struct FeatureSet
@@ -250,6 +344,7 @@ struct SparseBatch
         white_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
         black_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
         layer_stack_indices = new int[size];
+        material = new float[size];
 
         num_active_white_features = 0;
         num_active_black_features = 0;
@@ -284,6 +379,7 @@ struct SparseBatch
     float* white_values;
     float* black_values;
     int* layer_stack_indices;
+    float* material;
 
     ~SparseBatch()
     {
@@ -295,6 +391,7 @@ struct SparseBatch
         delete[] white_values;
         delete[] black_values;
         delete[] layer_stack_indices;
+        delete[] material;
     }
 
 private:
@@ -306,6 +403,7 @@ private:
         outcome[i] = (e.result + 1.0f) / 2.0f;
         score[i] = e.score;
         layer_stack_indices[i] = e.pos->stack_index();
+        material[i] = e.material;
         fill_features(FeatureSet<Ts...>{}, i, e);
     }
 
@@ -313,11 +411,13 @@ private:
     void fill_features(FeatureSet<Ts...>, int i, const TrainingDataEntry& e)
     {
         const int offset = i * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES;
+
+        // Color::BLACKとColor::WHITEを逆にした
         num_active_white_features +=
-            FeatureSet<Ts...>::fill_features_sparse(e, white + offset, white_values + offset, Color::White)
+            FeatureSet<Ts...>::fill_features_sparse(e, white + offset, white_values + offset, Color::BLACK)
             .first;
         num_active_black_features +=
-            FeatureSet<Ts...>::fill_features_sparse(e, black + offset, black_values + offset, Color::Black)
+            FeatureSet<Ts...>::fill_features_sparse(e, black + offset, black_values + offset, Color::WHITE)
             .first;
     }
 };
@@ -332,8 +432,8 @@ struct Stream : AnyStream
 {
     using StorageType = StorageT;
 
-    Stream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename, cyclic, skipPredicate))
+    Stream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, skipPredicate))
     {
     }
 
@@ -348,8 +448,8 @@ struct AsyncStream : Stream<StorageT>
 {
     using BaseType = Stream<StorageT>;
 
-    AsyncStream(int concurrency, const char* filename, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        BaseType(1, filename, cyclic, skipPredicate)
+    AsyncStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+        BaseType(1, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, skipPredicate)
     {
     }
 
@@ -375,13 +475,19 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
         BaseType(
             std::max(
                 1,
                 concurrency / num_feature_threads_per_reading_thread
             ),
-            filename,
+            filename1,
+            filename2,
+            filename3,
+            train1_rate,
+            train2_rate,
+            skiprate,
+            mirror,
             cyclic,
             skipPredicate
         ),
@@ -504,12 +610,12 @@ static void EnsureInitialize()
 
     USI::init(Options);
     Bitboards::init();
-    //Position::init();
-    //Search::init();
+    Position::init();
+    Search::init();
 
     Threads.set(1);
 
-    //Eval::init();
+    Eval::init();
 
     is_ready();
 }
@@ -541,27 +647,21 @@ extern "C" {
         }
 
         std::string_view feature_set(feature_set_c);
-        if (feature_set == "HalfKP")
+
+        if (feature_set == "HalfKA_KSDG3")
         {
-            return new SparseBatch(FeatureSet<HalfKP>{}, entries);
+            return new SparseBatch(FeatureSet<HalfKA_KSDG3>{}, entries);
         }
-        else if (feature_set == "HalfKP^")
+        else if (feature_set == "HalfKA_KSDG3^")
         {
-            return new SparseBatch(FeatureSet<HalfKPFactorized>{}, entries);
+            return new SparseBatch(FeatureSet<HalfKA_KSDG3_Factorized>{}, entries);
         }
-        else if (feature_set == "HalfKA")
-        {
-             return new SparseBatch(FeatureSet<HalfKA>{}, entries);
-        }
-        else if (feature_set == "HalfKA^")
-        {
-             return new SparseBatch(FeatureSet<HalfKAFactorized>{}, entries);
-        }
+
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
 
-    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename, int batch_size, int cyclic, int filtered, int random_fen_skipping)
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream(const char* feature_set_c, int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, int cyclic, int filtered, int random_fen_skipping)
     {
         EnsureInitialize();
 
@@ -590,22 +690,16 @@ extern "C" {
         }
 
         std::string_view feature_set(feature_set_c);
-        if (feature_set == "HalfKP")
+
+        if (feature_set == "HalfKA_KSDG3")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKP>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3>, SparseBatch>(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, skipPredicate);
         }
-        else if (feature_set == "HalfKP^")
+        else if (feature_set == "HalfKA_KSDG3^")
         {
-            return new FeaturedBatchStream<FeatureSet<HalfKPFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, skipPredicate);
         }
-        else if (feature_set == "HalfKA")
-        {
-             return new FeaturedBatchStream<FeatureSet<HalfKA>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
-        else if (feature_set == "HalfKA^")
-        {
-            return new FeaturedBatchStream<FeatureSet<HalfKAFactorized>, SparseBatch>(concurrency, filename, batch_size, cyclic, skipPredicate);
-        }
+
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -632,7 +726,7 @@ extern "C" {
 
 int main()
 {
-    auto stream = create_sparse_batch_stream("HalfKP^", 4, R"(C:\shogi\training_data\suisho5.shuffled.qsearch\shuffled.bin)", 8192, true, false, 0);
+    auto stream = create_sparse_batch_stream("HalfKP^", 4, R"(C:\shogi\training_data\suisho5.shuffled.qsearch\shuffled.bin)", R"(C:\shogi\training_data\suisho5.shuffled.qsearch\shuffled.bin)", R"(C:\shogi\training_data\suisho5.shuffled.qsearch\shuffled.bin)", 0.33, 0.33, 1.5, 0.1, 8192, true, false, 0);
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < 1000; ++i)
     {

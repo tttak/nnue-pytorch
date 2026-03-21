@@ -10,13 +10,15 @@ from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
-def data_loader_cc(train_filename, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size):
+import pytorch_lightning.callbacks
+
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
-  train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename, batch_size, num_workers=num_workers,
+  train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename1, train_filename2, train_filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, num_workers=num_workers,
                                                    filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device)
-  val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, batch_size, filtered=filtered,
+  val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
                                                    random_fen_skipping=random_fen_skipping, device=main_device)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
@@ -29,9 +31,26 @@ def data_loader_py(train_filename, val_filename, feature_set, batch_size, main_d
   val = DataLoader(nnue_bin_dataset.NNUEBinData(val_filename, feature_set), batch_size=32)
   return train, val
 
+class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
+  def __init__(
+      self,
+      every_n_epochs: int,
+      log_dir: str,
+  ):
+    self.every_n_epochs = every_n_epochs
+    self.log_dir = log_dir
+
+  def on_validation_end(self, trainer: 'pl.Trainer', pl_module: 'pl.LightningModule') -> None:
+    if self.every_n_epochs != 1 and (trainer.current_epoch == 0 or trainer.current_epoch % self.every_n_epochs != 0):
+      return
+    ckpt_file_path = os.path.join(self.log_dir, f'{trainer.current_epoch}.ckpt')
+    trainer.save_checkpoint(ckpt_file_path)
+
 def main():
   parser = argparse.ArgumentParser(description="Trains the network.")
-  parser.add_argument("train", help="Training data (.bin or .binpack)")
+  parser.add_argument("train1", help="Training data (.bin or .binpack)")
+  parser.add_argument("train2", help="Training data (.bin or .binpack)")
+  parser.add_argument("train3", help="Training data (.bin or .binpack)")
   parser.add_argument("val", help="Validation data (.bin or .binpack)")
   parser = pl.Trainer.add_argparse_args(parser)
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
@@ -51,14 +70,36 @@ def main():
   parser.add_argument("--in-scaling", default=240, type=int, dest='in_scaling', help="in-scaling.")
   parser.add_argument("--out-scaling", default=280, type=int, dest='out_scaling', help="out-scaling.")
   parser.add_argument("--offset", default=270, type=int, dest='offset', help="offset.")
+  parser.add_argument("--offset1", default=270, type=int, dest='offset1', help="offset1.")
+  parser.add_argument("--offset2", default=270, type=int, dest='offset2', help="offset2.")
   parser.add_argument("--adjust-loss", default=0.1, type=float, dest='adjust_loss', help="adjust loss.")
+  parser.add_argument("--train1-rate", default=0.33, type=float, dest='train1_rate', help="train1-rate")
+  parser.add_argument("--train2-rate", default=0.33, type=float, dest='train2_rate', help="train2-rate")
+  parser.add_argument("--skiprate", default=1.5, type=float, dest='skiprate', help="skiprate")
+  parser.add_argument("--mirror", default=0.00, type=float, dest='mirror', help="mirror")
+  parser.add_argument("--network-save-period", type=int, default=1000000000, dest='network_save_period', help="Number of epochs between network snapshots. None to disable.")
+
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
-  if not os.path.exists(args.train):
-    raise Exception('{0} does not exist'.format(args.train))
+  if not os.path.exists(args.train1):
+    raise Exception('{0} does not exist'.format(args.train1))
+  if not os.path.exists(args.train2):
+    raise Exception('{0} does not exist'.format(args.train2))
+  if not os.path.exists(args.train3):
+    raise Exception('{0} does not exist'.format(args.train3))
   if not os.path.exists(args.val):
     raise Exception('{0} does not exist'.format(args.val))
+
+  if not (0.0 < args.train1_rate < 1.0):
+    raise ValueError(f"--train1-rate must be strictly between 0.0 and 1.0 (got {args.train1_rate})")
+  if not (0.0 < args.train2_rate < 1.0):
+    raise ValueError(f"--train2-rate must be strictly between 0.0 and 1.0 (got {args.train2_rate})")
+  rates_sum = args.train1_rate + args.train2_rate
+  if rates_sum >= 1.0:
+    raise ValueError(f"The sum of train1-rate and train2-rate ({rates_sum}) must be less than 1.0")
+  if args.skiprate < 1.0:
+    raise ValueError(f"--skiprate must be 1.0 or greater (got {args.skiprate})")
 
   feature_set = features.get_feature_set_from_name(args.features)
 
@@ -77,13 +118,121 @@ def main():
       in_scaling=args.in_scaling,
       out_scaling=args.out_scaling,
       offset=args.offset,
+      offset1=args.offset1,
+      offset2=args.offset2,
       adjust_loss=args.adjust_loss)
   else:
-    nnue = torch.load(args.resume_from_model)
+
+    # 「.pt」の場合
+    if args.resume_from_model.endswith(".pt"):
+
+      # 1. まず、現在の設定でモデルの「器（インスタンス）」を作る
+      nnue = M.NNUE(feature_set=feature_set,
+                    start_lambda=start_lambda,
+                    max_epoch=max_epoch,
+                    end_lambda=end_lambda,
+                    gamma=args.gamma,
+                    lr=args.lr,
+                    epoch_size=args.epoch_size,
+                    batch_size=args.batch_size,
+                    in_scaling=args.in_scaling,
+                    out_scaling=args.out_scaling,
+                    offset=args.offset,
+                    offset1=args.offset1,
+                    offset2=args.offset2,
+                    adjust_loss=args.adjust_loss)
+
+      # 2. CPU 上で重みファイルをロード
+      checkpoint = torch.load(args.resume_from_model, map_location='cpu')
+      model_dict = nnue.state_dict()
+
+      # checkpoint が NNUE オブジェクトそのものだった場合
+      if hasattr(checkpoint, 'state_dict'):
+          # オブジェクトから辞書形式を取り出す
+          checkpoint_dict = checkpoint.state_dict()
+      else:
+          # すでに辞書形式（state_dict）だった場合
+          checkpoint_dict = checkpoint
+
+      # 3. checkpoint_dict を使って、形状が一致するものだけを抽出
+      pretrained_dict = {
+          k: v for k, v in checkpoint_dict.items() 
+          if k in model_dict and v.shape == model_dict[k].shape
+      }
+
+      # 形状が合わないもの（Factorized化で入力数が増えた場合など）をログに出す
+      for k in checkpoint_dict.keys():
+          if k in model_dict and checkpoint_dict[k].shape != model_dict[k].shape:
+              print(f"Skipping parameter {k} due to shape mismatch: {checkpoint_dict[k].shape} vs {model_dict[k].shape}")
+          elif k not in model_dict:
+              print(f"Parameter {k} not found in current model")
+
+          if k in model_dict:
+              if checkpoint_dict[k].shape == model_dict[k].shape:
+                  model_dict[k].copy_(checkpoint_dict[k])
+
+              elif k in ["input.weight", "input.v", "layer_stacks.phase_proj.weight", "layer_stacks.phase_proj.bias"]:
+                  print(f"形状が異なりますが、重なっている部分だけコピーします: {k}")
+
+                  old_shape = checkpoint_dict[k].shape
+                  new_shape = model_dict[k].shape
+                  print(f"Partial copy for {k}: {old_shape} -> {new_shape}")
+
+                  # 1次元（Biasなど）か 2次元（Weightなど）かで処理を分ける
+                  if len(new_shape) == 1:
+                      # 共通する要素数分だけコピー
+                      min_size = min(old_shape[0], new_shape[0])
+                      model_dict[k][:min_size].copy_(checkpoint_dict[k][:min_size])
+                  else:
+                      # 2次元の場合（[出力, 入力]）
+                      # 出力側(0次元目)と入力側(1次元目)の両方で共通する範囲を特定
+                      min_dim0 = min(old_shape[0], new_shape[0])
+                      min_dim1 = min(old_shape[1], new_shape[1])
+                      model_dict[k][:min_dim0, :min_dim1].copy_(checkpoint_dict[k][:min_dim0, :min_dim1])
+
+                  print(f"Completed partial copy for {k}")
+
+      # 4. 現在のモデルの state_dict を更新してロード
+      model_dict.update(pretrained_dict)
+      nnue.load_state_dict(model_dict, strict=False)
+
+    # 「.ckpt」の場合
+    else:
+      nnue = M.NNUE.load_from_checkpoint(args.resume_from_model, feature_set=feature_set, strict=False)
+
+      """
+      # 1. まず、新しい構造のモデルを普通に作る
+      nnue = M.NNUE(feature_set=feature_set)
+      
+      # 2. チェックポイントを「ただの辞書」として読み込む
+      checkpoint = torch.load(args.resume_from_model, map_location='cpu')
+      state_dict = checkpoint["state_dict"]
+      
+      # 3. サイズが合わないパラメータを除外した新しい state_dict を作る
+      new_state_dict = {}
+      for k, v in state_dict.items():
+          # モデル側の現在のパラメータ形状を取得
+          if k in nnue.state_dict():
+              target_shape = nnue.state_dict()[k].shape
+              if v.shape == target_shape:
+                  new_state_dict[k] = v
+              else:
+                  print(f"[Skip] {k}: shape mismatch (ckp: {v.shape} vs model: {target_shape})")
+          else:
+              print(f"[Skip] {k}: not in model")
+      
+      # 4. フィルタリングした重みを適用する
+      nnue.load_state_dict(new_state_dict, strict=False)
+
+      print("Load successful!")
+      """
+
     nnue.set_feature_set(feature_set)
     nnue.in_scaling = args.in_scaling
     nnue.out_scaling = args.out_scaling
     nnue.offset = args.offset
+    nnue.offset1 = args.offset1
+    nnue.offset2 = args.offset2
     nnue.adjust_loss = args.adjust_loss
     nnue.start_lambda = start_lambda
     nnue.end_lambda = end_lambda
@@ -98,7 +247,7 @@ def main():
   print("Num virtual features: {}".format(feature_set.num_virtual_features))
   print("Num features: {}".format(feature_set.num_features))
 
-  print("Training with {} validating with {}".format(args.train, args.val))
+  print("Training with {} and {} and {} validating with {}".format(args.train1, args.train2, args.train3, args.val))
 
   pl.seed_everything(args.seed)
   print("Seed {}".format(args.seed))
@@ -119,19 +268,24 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
-  checkpoint_callback = pl.callbacks.ModelCheckpoint(save_last=True)
+  checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
   main_device = trainer.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
 
   if args.py_data:
     print('Using python data loader')
-    train, val = data_loader_py(args.train, args.val, feature_set, batch_size, main_device)
+    train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror)
 
+  torch.set_float32_matmul_precision('high')
   trainer.fit(nnue, train, val)
+
+  print(f'tb_logger.log_dir={tb_logger.log_dir}')
+  ckpt_file_path = os.path.join(tb_logger.log_dir, 'final.ckpt')
+  trainer.save_checkpoint(ckpt_file_path)
 
 if __name__ == '__main__':
   main()
