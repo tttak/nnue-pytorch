@@ -179,18 +179,18 @@ namespace training_data {
 
             concurrency::parallel_for(size_t(0), n1, [&work_vec, &packedSfenValues1, &prng, &mirror](size_t i)
             {
-                const bool mirror = prng.rand(1000000) < mirror * 1000000.0f;
-                work_vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues1[i], mirror);
+                const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
+                work_vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues1[i], mir);
             });
             concurrency::parallel_for(size_t(0), n2, [&work_vec, &packedSfenValues2, &n1, &prng, &mirror](size_t i)
             {
-                const bool mirror = prng.rand(1000000) < mirror * 1000000.0f;
-                work_vec[n1+i] = packedSfenValueToTrainingDataEntry(packedSfenValues2[i], mirror);
+                const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
+                work_vec[n1+i] = packedSfenValueToTrainingDataEntry(packedSfenValues2[i], mir);
             });
             concurrency::parallel_for(size_t(0), n3, [&work_vec, &packedSfenValues3, &n1, &n2, &prng, &mirror](size_t i)
             {
-                const bool mirror = prng.rand(1000000) < mirror * 1000000.0f;
-                work_vec[n1+n2+i] = packedSfenValueToTrainingDataEntry(packedSfenValues3[i], mirror);
+                const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
+                work_vec[n1+n2+i] = packedSfenValueToTrainingDataEntry(packedSfenValues3[i], mir);
             });
 
             int j = n - remain1;
