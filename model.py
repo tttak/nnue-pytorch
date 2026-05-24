@@ -393,6 +393,11 @@ class NNUE(pl.LightningModule):
       {'params' : [self.layer_stacks.l1.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight, 'virtual_params' : self.layer_stacks.l1_fact.weight },
       {'params' : [self.layer_stacks.fm_diff.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.fm_abs.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
+      {'params' : [self.layer_stacks.cross_proj.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
+      {'params' : [self.layer_stacks.q_proj.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
+      {'params' : [self.layer_stacks.k_proj.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
+      {'params' : [self.layer_stacks.v_proj.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
+      {'params' : [self.layer_stacks.phase_proj.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.l2.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.output.weight], 'min_weight' : -max_out_weight, 'max_weight' : max_out_weight },
     ]
