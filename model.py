@@ -776,7 +776,40 @@ class NNUE(pl.LightningModule):
 
       # 特徴量分割点 (現在の構成に合わせて調整してください)
       S0, S1, S2 = 0, 12672, 203670
+
+
+      # --- [ADD] L1_Main と L1_Fact の合成重み・勾配の計算 ---
+      l1_main_w = self.layer_stacks.l1.weight.detach().cpu()
+      l1_fact_w = self.layer_stacks.l1_fact.weight.detach().cpu()
       
+      l1_main_g = self.layer_stacks.l1.weight.grad.detach().cpu() if self.layer_stacks.l1.weight.grad is not None else None
+      l1_fact_g = self.layer_stacks.l1_fact.weight.grad.detach().cpu() if self.layer_stacks.l1_fact.weight.grad is not None else None
+
+      # 先に安全にテンソルをCPUに取得する
+      l1_main_b = self.layer_stacks.l1.bias.detach().cpu() if self.layer_stacks.l1.bias is not None else None
+      l1_fact_b = self.layer_stacks.l1_fact.bias.detach().cpu() if self.layer_stacks.l1_fact.bias is not None else None
+      
+      # クリッピング時と同じルールで拡張して足し算（重み）
+      xs = l1_main_w.shape[0] // l1_fact_w.shape[0]
+      ys = l1_main_w.shape[1] // l1_fact_w.shape[1]
+      expanded_fact_w = l1_fact_w.repeat(xs, ys)
+      l1_combined_w = l1_main_w + expanded_fact_w
+
+      # 勾配も同様に合成
+      if l1_main_g is not None and l1_fact_g is not None:
+          l1_combined_g = l1_main_g + l1_fact_g.repeat(xs, ys)
+      else:
+          l1_combined_g = l1_main_g if l1_main_g is not None else None
+
+      # バイアスも加算（取得した変数を使ってリピート拡張）
+      if l1_main_b is not None and l1_fact_b is not None:
+          bias_xs = l1_main_b.shape[0] // l1_fact_b.shape[0]
+          expanded_fact_b = l1_fact_b.repeat(bias_xs)
+          l1_combined_b = l1_main_b + expanded_fact_b
+      else:
+          l1_combined_b = l1_main_b if l1_main_b is not None else l1_fact_b
+
+
       # --- Layer Parts List ---
       parts = [
           ("W_input (All)   ", w_input_c, g_input_c, b_input_c),
@@ -786,6 +819,10 @@ class NNUE(pl.LightningModule):
           ("Pair_W (Raw)      ", pw_w, pw_g, None),
           ("L1_Main (Linear)", self.layer_stacks.l1.weight.detach().cpu(), self.layer_stacks.l1.weight.grad.detach().cpu() if self.layer_stacks.l1.weight.grad is not None else None, self.layer_stacks.l1.bias.detach().cpu()),
           ("L1_Fact         ", self.layer_stacks.l1_fact.weight.detach().cpu(), self.layer_stacks.l1_fact.weight.grad.detach().cpu() if self.layer_stacks.l1_fact.weight.grad is not None else None, self.layer_stacks.l1_fact.bias.detach().cpu()),
+
+          # 【ADD】合成後のレイヤー統計
+          ("L1_Combined (Sum)", l1_combined_w, l1_combined_g, l1_combined_b),
+
           ("FM_Diff_Path    ", self.layer_stacks.fm_diff.weight.detach().cpu(), self.layer_stacks.fm_diff.weight.grad.detach().cpu() if self.layer_stacks.fm_diff.weight.grad is not None else None, self.layer_stacks.fm_diff.bias.detach().cpu()),
           ("FM_Abs_Path     ", self.layer_stacks.fm_abs.weight.detach().cpu(), self.layer_stacks.fm_abs.weight.grad.detach().cpu() if self.layer_stacks.fm_abs.weight.grad is not None else None, self.layer_stacks.fm_abs.bias.detach().cpu()),
           ("cross_proj ", self.layer_stacks.cross_proj.weight.detach().cpu(), self.layer_stacks.cross_proj.weight.grad.detach().cpu() if self.layer_stacks.cross_proj.weight.grad is not None else None, self.layer_stacks.cross_proj.bias.detach().cpu()),
@@ -1085,124 +1122,457 @@ class NNUE(pl.LightningModule):
 
 
   def step_(self, batch, batch_idx, loss_type):
-    # --- SECTION 1: データ展開とパラメータの準備 ---
-    self._clip_weights()
-    us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material = batch
+      # --- SECTION 1: データ展開とパラメータの準備 ---
+      self._clip_weights()
+      us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material, kif_group_id = batch
 
-    # 勝率モデル（Win Rate Model）用のスケーリングとオフセット
-    # convert the network and search scores to an estimate match result
-    # based on the win_rate_model, with scalings and offsets optimized
-    in_scaling = self.in_scaling
-    out_scaling = self.out_scaling
-    offset = self.offset
-    offset1 = self.offset1
-    offset2 = self.offset2
+      # --- SECTION 2: Lambda の決定 ---
+      actual_lambda = self._get_actual_lambda(loss_type)
 
+      # --- SECTION 3: ネットワーク出力の計算と勝率変換 ---
+      scorenet = self(us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices)
+      scorenet = scorenet * self.nnue2score
 
-    # --- SECTION 2: Lambda (教師あり学習 vs 自己対局結果) の決定 ---
-    # 検証時は固定値、学習時はエポックに応じて動的に変化させる
-    if loss_type == 'val_loss_lambda1.0':
-      actual_lambda = 1.0
-    elif loss_type == 'val_loss_lambda0.0':
-      actual_lambda = 0.0
-    elif loss_type == 'val_loss_lambda0.1':
-      actual_lambda = 0.1
-    elif loss_type == 'val_loss_lambda0.5':
-      actual_lambda = 0.5
-    elif loss_type == 'val_loss_lambda0.8':
-      actual_lambda = 0.8
-    else:
-      # 学習ステップ用：Epochの進行に合わせて徐々に教師データの比重を変える
-      actual_lambda = self.start_lambda + (self.end_lambda - self.start_lambda) * (self.current_epoch / self.max_epoch)
+      # シグモイド関数を用いて勝率(0.0~1.0)に変換
+      q  = ( scorenet - self.offset1) / self.in_scaling
+      qm = (-scorenet - self.offset2) / self.in_scaling
+      qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
 
+      # 教師スコア(Search Score)も勝率空間へ変換
+      p  = ( score - self.offset1) / self.out_scaling
+      pm = (-score - self.offset2) / self.out_scaling
+      pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
 
-    # --- SECTION 3: ネットワーク出力の計算と勝率変換 ---
-    # NNUE生出力を取得し、センチポーン単位(x600)へ
-    scorenet = self(us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices)
-    scorenet = scorenet * self.nnue2score
+      # ターゲット作成 (教師勝率 + 実際の対局結果)
+      pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
 
-    # シグモイド関数を用いて勝率(0.0~1.0)に変換
-    q  = ( scorenet - offset1) / in_scaling  # used to compute the chance of a win
-    qm = (-scorenet - offset2) / in_scaling  # used to compute the chance of a loss
-    qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())  # estimated match result (using win, loss and draw probs).
+      # --- SECTION 4: 各種損失の計算 ---
+      kif_group_id_flat = kif_group_id.view(-1)
 
-    # 教師スコア(Search Score)も同様に勝率空間へ変換
-    p  = ( score - offset1) / out_scaling
-    pm = (-score - offset2) / out_scaling
-    pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
+      # 1. Base Loss (ID: 1, 2 対象)
+      base_loss = self._compute_base_loss(pt, qf, pf, kif_group_id_flat)
 
+      # Pairwise / Listwise ソート用の共通データ準備 (ID: 3 対象)
+      pairwise_mask = (kif_group_id_flat == 3)
+      n_pairwise = pairwise_mask.sum().item()
 
-    # --- SECTION 4: ターゲット作成と損失計算 ---
-    # 教師スコアと実際の対局結果(outcome)を実際のLambdaでブレンド
-    t = outcome
-    pt = pf * actual_lambda + t * (1.0 - actual_lambda)
+      sorted_data = self._prepare_sorted_data(
+          pairwise_mask, n_pairwise, pt, qf, score, scorenet, layer_stack_indices, material
+      )
 
-    # 損失関数: 差の 2.5乗（外れ値への感度調整）
-    loss = torch.pow(torch.abs(pt - qf), 2.5)
+      # 2. Pairwise Loss (ID: 3 対象)
+      pairwise_loss, pair_metrics = self._compute_pairwise_loss(sorted_data, n_pairwise, pt.device)
 
-    # 予測が楽観的すぎる場合のペナルティ調整
-    loss = loss * ((qf > pt) * self.adjust_loss + 1)
+      # 3. Listwise Loss (ID: 3 対象)
+      listwise_loss, pt_range = self._compute_listwise_loss(sorted_data, n_pairwise, pt.device)
 
-    # 評価が拮抗している局面(pf=0.5付近)の重みを高める重要度サンプリング
-    weights = 1 + (2.0**1.2 - 1) * torch.pow((pf - 0.5) ** 2 * pf * (1 - pf), 0.8)
-    loss = (loss * weights).sum() / weights.sum()
+      # --- SECTION 5: 最終損失の結合 ---
+      pairwise_weight = 0.010
+      listwise_weight = 0.030
+      loss = base_loss + (pairwise_weight * pairwise_loss) + (listwise_weight * listwise_loss)
 
-    # 指標のログ出力
-    if loss_type == 'val_loss_actual_lambda':
-      self.log('actual_lambda', actual_lambda)
-    self.log(loss_type, loss)
+      # 4. Phase Gate (適応制御) 正則化ペナルティの加算
+      phase_penalty = self._compute_phase_penalty()
+      # 必要に応じて適用
+      loss = loss + 0.002 * phase_penalty
 
+      # --- SECTION 6: [検証用] バケット別損失の統計集計 ---
+      self._update_bucket_stats(pt, qf, layer_stack_indices, loss_type)
 
-    # --- SECTION 5: [検証用] バケット別損失の統計集計 ---
-    with torch.no_grad():
-        # サンプルごとの生損失を計算
-        loss_per_sample = torch.pow(torch.abs(pt - qf), 2.5).detach().squeeze()
+      # --- SECTION 7: ログ出力・デバッグ ---
+      self._log_debug_info(
+          loss_type, loss, base_loss, pairwise_loss, listwise_loss,
+          pt, qf, score, scorenet, layer_stack_indices, kif_group_id_flat, actual_lambda,
+          pair_metrics, pt_range
+      )
 
-        # 検証フェーズかつ主要指標計算時にのみ、バケット(Bucket)ごとの統計を更新
-        if not self.training and loss_type == 'val_loss_actual_lambda':
-            if not hasattr(self, 'bucket_stats'):
-                self.bucket_stats = {
-                    'loss_sum': torch.zeros(12, device=loss.device),
-                    'count': torch.zeros(12, device=loss.device)
-                }
+      return loss
 
-            indices = layer_stack_indices.squeeze()
+  # =========================================================================
+  #  Helper Methods
+  # =========================================================================
 
-            # 各サンプルの損失を該当するバケットIDに加算
-            self.bucket_stats['loss_sum'].index_add_(0, indices, loss_per_sample)
-            self.bucket_stats['count'].index_add_(0, indices, torch.ones_like(loss_per_sample))
+  def _get_actual_lambda(self, loss_type):
+      """Lambda の動的／固定設定を取得"""
+      lambda_dict = {
+          'val_loss_lambda1.0': 1.0,
+          'val_loss_lambda0.0': 0.0,
+          'val_loss_lambda0.1': 0.1,
+          'val_loss_lambda0.5': 0.5,
+          'val_loss_lambda0.8': 0.8,
+      }
+      if loss_type in lambda_dict:
+          return lambda_dict[loss_type]
+      return self.start_lambda + (self.end_lambda - self.start_lambda) * (self.current_epoch / self.max_epoch)
 
+  def _compute_base_loss(self, pt, qf, pf, kif_group_id_flat):
+      """ベースとなる点推定損失の計算 (kif_group_id == 1, 2)"""
+      loss_elements = torch.pow(torch.abs(pt - qf), 2.5)
+      loss_elements = loss_elements * ((qf > pt) * self.adjust_loss + 1)
 
-    # --- SECTION 6: Phase Gate (適応制御) への正則化ペナルティ ---
-    phase = self.layer_stacks.current_phase_for_loss
-    if phase is not None:
-        p_means = phase.mean(dim=0)
-        p_stds  = phase.std(dim=0)
+      weights = 1 + (2.0**1.2 - 1) * torch.pow((pf - 0.5) ** 2 * pf * (1 - pf), 0.8)
+      weights_flat = weights.view(-1)
 
-        # 1. 全体平均を 0.5 に近づける制約
-        overall_mean = p_means.mean() 
-        mean_penalty = (overall_mean - 0.5)**2
+      # Base Loss は 1 と 2 のみ
+      base_loss_mask = (kif_group_id_flat == 1) | (kif_group_id_flat == 2)
 
-        # 2. 境界値ペナルティ: 各チャンネルの平均が極端（0.05未満 or 0.95超）になるのを防ぐ
-        mean_bounds_penalty = torch.mean(
-             torch.clamp(p_means - 0.95, min=0)**2
-           + torch.clamp(0.05 - p_means, min=0)**2
-        )
+      if base_loss_mask.any():
+          return (loss_elements.view(-1)[base_loss_mask] * weights_flat[base_loss_mask]).sum() / weights_flat[base_loss_mask].sum()
+      return torch.tensor(0.0, device=pt.device)
 
-        # 3. 分散ペナルティ: 局面に応じて「開閉」の変化（多様性）を促す
-        std_penalty = torch.mean(torch.clamp(0.15 - p_stds, min=0)**2)
+  def _prepare_sorted_data(self, pairwise_mask, n_pairwise, pt, qf, score, scorenet, layer_stack_indices, material):
+      """Pairwise/Listwise計算用にデータを抽出し、ソートして返す (kif_group_id == 3 対象)"""
+      if n_pairwise <= 1:
+          return None
 
-        # 必要に応じてコメントアウトを外す
-        #phase_penalty = mean_penalty + mean_bounds_penalty + std_penalty
-        #loss = loss + 0.002 * phase_penalty
+      pt_p = pt.view(-1)[pairwise_mask]
+      qf_p = qf.view(-1)[pairwise_mask]
+      score_p = score.view(-1)[pairwise_mask]
+      scorenet_p = scorenet.view(-1)[pairwise_mask]
+      lsind_p = layer_stack_indices.view(-1)[pairwise_mask]
+      material_p = material.view(-1)[pairwise_mask]
 
+      if self.training and self.global_step % 500 == 0:
+          print(f"\n[DEBUG RANGE] Step: {self.global_step}")
+          print(f"  [material_p] Min: {material_p.min().item():.1f} | Max: {material_p.max().item():.1f} | Mean: {material_p.mean().item():.1f}")
+          print(f"  [pt_p]       Min: {pt_p.min().item():.4f} | Max: {pt_p.max().item():.4f}")
 
-    return loss
+      # ソートキーは「material, pt」
+      sort_key = material_p + pt_p
+      sorted_indices = torch.argsort(sort_key)
 
-    # MSE Loss function for debugging
-    # Scale score by 600.0 to match the expected NNUE scaling factor
-    # output = self(us, them, white, black) * 600.0
-    # loss = F.mse_loss(output, score)
+      return {
+          'pt': pt_p[sorted_indices],
+          'qf': qf_p[sorted_indices],
+          'score': score_p[sorted_indices],
+          'scorenet': scorenet_p[sorted_indices],
+          'lsind': lsind_p[sorted_indices],
+          'material': material_p[sorted_indices],
+      }
+
+  def _compute_pairwise_loss(self, sorted_data, n_pairwise, device):
+      """ミニバッチ内擬似ペアワイズ損失の計算"""
+      default_metrics = {
+          'total_valid_pairs': 0, 'all_pred_diffs': [], 'all_target_directions': [],
+          'all_value_gaps': [], 'all_num_equals': 0, 'all_valid_lsinds': [], 'all_diff_abs': [],
+          'max_possible_pairs': 0
+      }
+
+      window_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 
+                      21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
+
+      if sorted_data is None:
+          return torch.tensor(0.0, device=device), default_metrics
+
+      pt_s, qf_s = sorted_data['pt'], sorted_data['qf']
+      score_s, scorenet_s = sorted_data['score'], sorted_data['scorenet']
+      lsind_s, mat_s = sorted_data['lsind'], sorted_data['material']
+
+      total_pairwise_loss = torch.tensor(0.0, device=device)
+      total_valid_pairs = 0
+      all_pred_diffs, all_target_directions, all_value_gaps = [], [], []
+      all_valid_lsinds, all_diff_abs = [], []
+      all_num_equals = 0
+
+      for w in window_sizes:
+          if w >= n_pairwise:
+              continue
+
+          pt_A, pt_B = pt_s[:-w], pt_s[w:]
+          qf_A, qf_B = qf_s[:-w], qf_s[w:]
+          cp_true_A, cp_true_B = score_s[:-w], score_s[w:]
+          cp_pred_A, cp_pred_B = scorenet_s[:-w], scorenet_s[w:]
+          lsind_true_A = lsind_s[:-w]
+          material_A, material_B = mat_s[:-w], mat_s[w:]
+
+          diff_abs = (pt_A - pt_B).abs()
+
+          tol = torch.where(lsind_true_A < 4, 400, torch.where(lsind_true_A < 8, 200, 100))
+          valid_pair_mask = (diff_abs > 0.003) & (diff_abs <= 0.10) & ((material_A - material_B).abs() <= tol)
+
+          if valid_pair_mask.any():
+              target_direction = torch.sign(pt_A - pt_B)
+              num_equal = (target_direction[valid_pair_mask] == 0).sum().item()
+
+              pred_diff = qf_A - qf_B
+              pair_weight_curve = torch.sigmoid((diff_abs - 0.005) * 150) * torch.sigmoid((0.05 - diff_abs) * 120)
+              scale = 2.0 + 3.0 * torch.exp(-(diff_abs / 0.02)**2)
+
+              # 1. [方向の損失]
+              direction_loss = -F.logsigmoid(target_direction * pred_diff * scale)
+
+              # 2. [値の損失]
+              true_cp_compressed = torch.tanh((cp_true_A - cp_true_B) / 400.0)
+              pred_cp_compressed = torch.tanh((cp_pred_A - cp_pred_B) / 400.0)
+              value_loss_cp = F.smooth_l1_loss(pred_cp_compressed, true_cp_compressed, reduction="none", beta=0.1)
+
+              # 3. [ハイブリッド結合]
+              raw_pairwise = (direction_loss + 0.6 * value_loss_cp) * pair_weight_curve
+              equal_penalty = pred_diff.pow(2) * 1.0
+              pairwise_loss_all = torch.where(target_direction != 0, raw_pairwise, equal_penalty)
+
+              # 集計
+              total_pairwise_loss += pairwise_loss_all[valid_pair_mask].sum()
+              valid_cnt = valid_pair_mask.sum().item()
+              total_valid_pairs += valid_cnt
+
+              # 評価メトリクス用
+              all_pred_diffs.append(pred_diff[valid_pair_mask].detach())
+              all_target_directions.append(target_direction[valid_pair_mask].detach())
+              all_num_equals += num_equal
+              all_value_gaps.append(((cp_pred_A - cp_pred_B) - (cp_true_A - cp_true_B)).abs()[valid_pair_mask].detach())
+              all_valid_lsinds.append(lsind_true_A[valid_pair_mask].detach())
+              all_diff_abs.append(diff_abs[valid_pair_mask].detach())
+
+      pairwise_loss = (total_pairwise_loss / total_valid_pairs) if total_valid_pairs > 0 else torch.tensor(0.0, device=device)
+
+      metrics = {
+          'total_valid_pairs': total_valid_pairs,
+          'all_pred_diffs': all_pred_diffs,
+          'all_target_directions': all_target_directions,
+          'all_value_gaps': all_value_gaps,
+          'all_num_equals': all_num_equals,
+          'all_valid_lsinds': all_valid_lsinds,
+          'all_diff_abs': all_diff_abs,
+          'max_possible_pairs': sum([max(0, n_pairwise - w) for w in window_sizes])
+      }
+
+      return pairwise_loss, metrics
+
+  def _compute_listwise_loss(self, sorted_data, n_pairwise, device):
+      """マルチウィンドウ Listwise 損失の計算"""
+      if sorted_data is None:
+          return torch.tensor(0.0, device=device), None
+
+      list_size = 6
+      temperature = 0.15
+      stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8]
+
+      pt_s, qf_s = sorted_data['pt'], sorted_data['qf']
+      mat_s, lsind_s = sorted_data['material'], sorted_data['lsind']
+
+      total_listwise_loss = torch.tensor(0.0, device=device)
+      total_valid_groups = 0
+      all_listwise_ranges = []
+
+      for stride in stride_sizes:
+          block_size = list_size * stride
+          if block_size > n_pairwise:
+              continue
+
+          pt_blocks = pt_s.unfold(0, block_size, 1)
+          qf_blocks = qf_s.unfold(0, block_size, 1)
+          mat_blocks = mat_s.unfold(0, block_size, 1)
+          lsind_blocks = lsind_s.unfold(0, block_size, 1)
+
+          pt_lists = pt_blocks[:, ::stride]
+          qf_lists = qf_blocks[:, ::stride]
+          mat_lists = mat_blocks[:, ::stride]
+          lsind_lists = lsind_blocks[:, ::stride]
+
+          # フィルタリング判定
+          lsind_ref = lsind_lists[:, 0]
+          tol = torch.where(lsind_ref < 4, 400, torch.where(lsind_ref < 8, 200, 100))
+          material_mask = (mat_lists.max(dim=1).values - mat_lists.min(dim=1).values) <= tol
+
+          pt_range_current = pt_lists.max(dim=1).values - pt_lists.min(dim=1).values
+          range_mask = (pt_range_current > 0.003) & (pt_range_current <= 0.35)
+
+          valid_group_mask = material_mask & range_mask
+
+          if valid_group_mask.any():
+              pt_filtered = pt_lists[valid_group_mask]
+              qf_filtered = qf_lists[valid_group_mask]
+
+              all_listwise_ranges.append(pt_range_current[valid_group_mask].detach())
+
+              true_dist = torch.softmax(pt_filtered / temperature, dim=-1)
+              pred_log_dist = torch.log_softmax(qf_filtered / temperature, dim=-1)
+
+              total_listwise_loss += F.kl_div(pred_log_dist, true_dist, reduction="sum")
+              total_valid_groups += valid_group_mask.sum().item()
+
+      if total_valid_groups > 0:
+          listwise_loss = total_listwise_loss / total_valid_groups
+          pt_range = torch.cat(all_listwise_ranges, dim=0)
+          return listwise_loss, pt_range
+
+      return torch.tensor(0.0, device=device), None
+
+  def _compute_phase_penalty(self):
+      """Phase Gate (適応制御) への正則化ペナルティの計算"""
+      phase = getattr(self.layer_stacks, 'current_phase_for_loss', None)
+      if phase is None:
+          return 0.0
+
+      p_means = phase.mean(dim=0)
+      p_stds  = phase.std(dim=0)
+
+      # 1. 全体平均を 0.5 に近づける制約
+      overall_mean = p_means.mean() 
+      mean_penalty = (overall_mean - 0.5) ** 2
+
+      # 2. 境界値ペナルティ: 各チャンネルの平均が極端（0.05未満 or 0.95超）になるのを防ぐ
+      mean_bounds_penalty = torch.mean(
+          torch.clamp(p_means - 0.95, min=0) ** 2
+          + torch.clamp(0.05 - p_means, min=0) ** 2
+      )
+
+      # 3. 分散ペナルティ: 局面に応じて「開閉」の変化（多様性）を促す
+      std_penalty = torch.mean(torch.clamp(0.15 - p_stds, min=0) ** 2)
+
+      return mean_penalty + mean_bounds_penalty + std_penalty
+
+  def _update_bucket_stats(self, pt, qf, layer_stack_indices, loss_type):
+      """検証フェーズにおけるバケット(Bucket)別損失の統計更新"""
+      with torch.no_grad():
+          loss_per_sample = torch.pow(torch.abs(pt - qf), 2.5).detach().squeeze()
+
+          if not self.training and loss_type == 'val_loss_actual_lambda':
+              if not hasattr(self, 'bucket_stats'):
+                  self.bucket_stats = {
+                      'loss_sum': torch.zeros(12, device=pt.device),
+                      'count': torch.zeros(12, device=pt.device)
+                  }
+
+              indices = layer_stack_indices.squeeze()
+              self.bucket_stats['loss_sum'].index_add_(0, indices, loss_per_sample)
+              self.bucket_stats['count'].index_add_(0, indices, torch.ones_like(loss_per_sample))
+
+  def _log_debug_info(self, loss_type, loss, base_loss, pairwise_loss, listwise_loss,
+                      pt, qf, score, scorenet, layer_stack_indices, kif_group_id_flat, actual_lambda,
+                      pair_metrics, pt_range):
+      """コンソール出力および TensorBoard/Lightning ログ記録"""
+      mean_base = base_loss.item()
+      mean_pair = pairwise_loss.item()
+      mean_list = listwise_loss.item()
+      mean_total = loss.item()
+
+      if self.training:
+          self.log("train/base_loss", mean_base, prog_bar=False)
+          self.log("train/pairwise_loss", mean_pair, prog_bar=False)
+          self.log("train/listwise_loss", mean_list, prog_bar=False)
+
+      # 500ステップ毎のコンソール詳細出力
+      if self.training and (self.global_step % 500 == 0):
+          valid_count = pair_metrics['total_valid_pairs']
+          max_possible = pair_metrics['max_possible_pairs']
+
+          print(f"\n[DEBUG LOSS] Total: {mean_total:.6f} | Base: {mean_base:.6f} | Pairwise: {mean_pair:.6f} | Listwise: {mean_list:.6f} (Valid Pairs: {valid_count}/{max_possible})")
+          print(f"  [PT Distribution] Min: {pt.min().item():.4f} | Median: {pt.median().item():.4f} | Max: {pt.max().item():.4f} | Std: {pt.std().item():.4f}")
+
+          with torch.no_grad():
+              counts = torch.bincount(kif_group_id_flat, minlength=4)
+              print(f"  [Kif Group Counts] ID_1: {counts[1].item()} | ID_2: {counts[2].item()} | ID_3: {counts[3].item()} (Batch Total: {pt.size(0)})")
+
+          if valid_count > 0 and len(pair_metrics['all_pred_diffs']) > 0:
+              flat_pred_diff = torch.cat(pair_metrics['all_pred_diffs'], dim=0)
+              flat_targets = torch.cat(pair_metrics['all_target_directions'], dim=0)
+              flat_diff_abs = torch.cat(pair_metrics['all_diff_abs'], dim=0)
+
+              print(f"  equal={pair_metrics['all_num_equals'] / valid_count:.3%}")
+              pd_abs_mean = flat_pred_diff.abs().mean().item()
+              print(f"  pred_diff_abs_mean={pd_abs_mean:.6f}")
+
+              pair_acc = ((flat_targets * flat_pred_diff) > 0).float().mean()
+              print(f"  pair_acc={pair_acc.item():.4f}")
+
+              # 範囲別集計
+              bins = [(0.000, 0.002), (0.002, 0.005), (0.005, 0.010), (0.010, 0.020), (0.020, 0.030),
+                      (0.030, 0.050), (0.050, 0.070), (0.070, 0.100), (0.100, 0.150)]
+              
+              print(f"  [Pairwise Detail per Range]")
+              for start, end in bins:
+                  label = f"{start*100:.1f}%-{end*100:.1f}%"
+                  mask = (flat_diff_abs >= start) & (flat_diff_abs < end)
+                  count = mask.sum().item()
+
+                  if count > 0:
+                      sub_t = flat_targets[mask]
+                      sub_pd = flat_pred_diff[mask]
+                      acc = ((sub_t * sub_pd) > 0).float().mean().item()
+                      s_mean = (sub_t * sub_pd).mean().item()
+                      pd_abs_m = sub_pd.abs().mean().item()
+                      print(f"    {label:<11}: {count:>6}t | acc={acc:.4f} | signed_m={s_mean:+.5f} | pred_diff_abs_m={pd_abs_m:.6f}")
+
+                      if self.training:
+                          self.log(f"pair_acc_range/{label}", acc, prog_bar=False)
+                          self.log(f"pair_signed_mean_range/{label}", s_mean, prog_bar=False)
+                          self.log(f"pair_pred_diff_abs_range/{label}", pd_abs_m, prog_bar=False)
+                  else:
+                      print(f"    {label:<11}:      0t | acc=0.0000 | signed_m=+0.00000 | pred_diff_abs_m=0.000000")
+
+              signed_mean = (flat_targets * flat_pred_diff).mean().item()
+              print(f"  signed_mean={signed_mean:.5f}")
+
+              flat_gaps = torch.cat(pair_metrics['all_value_gaps'], dim=0)
+              value_gap_mean = flat_gaps.mean().item()
+              print(f"  value_diff_cp_mae={value_gap_mean:.3f} cp")
+
+              if len(pair_metrics['all_valid_lsinds']) > 0:
+                  with torch.no_grad():
+                      flat_lsinds = torch.cat(pair_metrics['all_valid_lsinds'], dim=0).long()
+                      lsind_counts = torch.bincount(flat_lsinds, minlength=12)
+                      counts_str = " | ".join([f"L{i}: {lsind_counts[i].item()}" for i in range(12)])
+                      print(f"  [Pairwise Valid Pairs per Layer] {counts_str}")
+
+              if self.training:
+                  self.log("train/pair_acc", pair_acc, prog_bar=False)
+                  self.log("train/pred_diff_abs_mean", pd_abs_mean, prog_bar=False)
+                  self.log("train/value_diff_mae", value_gap_mean, prog_bar=False)
+
+          if pt_range is not None and pt_range.numel() > 0:
+              print(
+                  f"[Listwise Range] (Total Active Groups: {pt_range.numel()})\n"
+                  f"  Mean: {pt_range.mean():.4f} | Std: {pt_range.std():.4f} | Median: {pt_range.median():.4f} | Min: {pt_range.min():.4f} | Max: {pt_range.max():.4f}\n"
+                  f"  [Histogram]\n"
+                  f"    0.00-0.01 : {torch.sum((pt_range >= 0.00) & (pt_range < 0.01)).item():5d}t\n"
+                  f"    0.01-0.02 : {torch.sum((pt_range >= 0.01) & (pt_range < 0.02)).item():5d}t\n"
+                  f"    0.02-0.05 : {torch.sum((pt_range >= 0.02) & (pt_range < 0.05)).item():5d}t\n"
+                  f"    0.05-0.10 : {torch.sum((pt_range >= 0.05) & (pt_range < 0.10)).item():5d}t\n"
+                  f"    0.10-0.20 : {torch.sum((pt_range >= 0.10) & (pt_range < 0.20)).item():5d}t\n"
+                  f"    0.20-0.30 : {torch.sum((pt_range >= 0.20) & (pt_range < 0.30)).item():5d}t\n"
+                  f"    >0.30     : {torch.sum(pt_range >= 0.30).item():5d}t"
+              )
+
+      # 100ステップ毎の TensorBoard ヒストグラム出力
+      if self.training and (self.global_step % 100 == 0) and hasattr(self, "logger") and self.logger is not None:
+          self.logger.experiment.add_histogram("Distribution/PT_Target", pt.view(-1), global_step=self.global_step)
+          self.logger.experiment.add_histogram("Distribution/QF_Prediction", qf.view(-1), global_step=self.global_step)
+          self.logger.experiment.add_histogram("Distribution/score_Target", score.view(-1), global_step=self.global_step)
+          self.logger.experiment.add_histogram("Distribution/scorenet", scorenet.view(-1), global_step=self.global_step)
+
+          score_flat = score.view(-1)
+          scorenet_flat = scorenet.view(-1)
+          for i in range(12):
+              layer_mask = (layer_stack_indices.view(-1) == i)
+              if layer_mask.any():
+                  self.logger.experiment.add_histogram(f"Distribution_Layer/L{i:02d}_score_Target", score_flat[layer_mask], global_step=self.global_step)
+                  self.logger.experiment.add_histogram(f"Distribution_Layer/L{i:02d}_scorenet", scorenet_flat[layer_mask], global_step=self.global_step)
+
+      # 検証時（Val）のログ出力
+      if loss_type == 'val_loss_actual_lambda' and self.global_step > 1:
+          self.log('actual_lambda', actual_lambda)
+          self.log("val_loss/base_loss", mean_base, prog_bar=False)
+          self.log("val_loss/pairwise_loss", mean_pair, prog_bar=False)
+          self.log("val_loss/listwise_loss", mean_list, prog_bar=False)
+
+          if pair_metrics['total_valid_pairs'] > 0 and len(pair_metrics['all_pred_diffs']) > 0:
+              flat_pd = torch.cat(pair_metrics['all_pred_diffs'], dim=0)
+              flat_t = torch.cat(pair_metrics['all_target_directions'], dim=0)
+              val_pair_acc = ((flat_t * flat_pd) > 0).float().mean()
+              val_value_gap_mean = torch.cat(pair_metrics['all_value_gaps'], dim=0).mean().item()
+
+              self.log("val_loss/pair_acc", val_pair_acc, prog_bar=False)
+              self.log("val_loss/value_diff_cp_mae", val_value_gap_mean, prog_bar=False)
+          else:
+              self.log("val_loss/pair_acc", 0.0, prog_bar=False)
+              self.log("val_loss/value_diff_cp_mae", 0.0, prog_bar=False)
+
+      self.log(loss_type, loss)
+
+  # =========================================================================
+
 
   def training_step(self, batch, batch_idx):
     return self.step_(batch, batch_idx, 'train_loss')

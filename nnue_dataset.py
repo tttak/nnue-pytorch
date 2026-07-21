@@ -29,6 +29,7 @@ class SparseBatch(ctypes.Structure):
         ('black_values', ctypes.POINTER(ctypes.c_float)),
         ('layer_stack_indices', ctypes.POINTER(ctypes.c_int)),
         ('material', ctypes.POINTER(ctypes.c_float)),
+        ('kif_group_id', ctypes.POINTER(ctypes.c_int)),
     ]
 
     def get_tensors(self, device):
@@ -42,7 +43,8 @@ class SparseBatch(ctypes.Structure):
         score = torch.from_numpy(np.ctypeslib.as_array(self.score, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
         layer_stack_indices = torch.from_numpy(np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
         material = torch.from_numpy(np.ctypeslib.as_array(self.material, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
-        return us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material
+        kif_group_id = torch.from_numpy(np.ctypeslib.as_array(self.kif_group_id, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
+        return us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material, kif_group_id
 
 
 SparseBatchPtr = ctypes.POINTER(SparseBatch)

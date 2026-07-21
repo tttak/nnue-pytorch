@@ -345,6 +345,7 @@ struct SparseBatch
         black_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
         layer_stack_indices = new int[size];
         material = new float[size];
+        kif_group_id = new int[size];
 
         num_active_white_features = 0;
         num_active_black_features = 0;
@@ -380,6 +381,7 @@ struct SparseBatch
     float* black_values;
     int* layer_stack_indices;
     float* material;
+    int* kif_group_id;
 
     ~SparseBatch()
     {
@@ -392,6 +394,7 @@ struct SparseBatch
         delete[] black_values;
         delete[] layer_stack_indices;
         delete[] material;
+        delete[] kif_group_id;
     }
 
 private:
@@ -404,6 +407,7 @@ private:
         score[i] = e.score;
         layer_stack_indices[i] = e.pos->stack_index();
         material[i] = e.material;
+        kif_group_id[i] = e.kif_group_id;
         fill_features(FeatureSet<Ts...>{}, i, e);
     }
 
