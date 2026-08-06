@@ -38,6 +38,9 @@ class LayerStacks(nn.Module):
     super(LayerStacks, self).__init__()
     self.count = count
 
+    # --- router層
+    self.router = nn.Linear(384, count)
+
     #--- l1, l1_fact
     L1_OUT_PER_BUCKET = 32 
     TOTAL_L1_OUT = L1_OUT_PER_BUCKET * count
@@ -62,7 +65,6 @@ class LayerStacks(nn.Module):
     self.cross_proj = nn.Linear(self.cross_dim * 2, 32 * count) 
 
     # --- Lightweight Cross-Attention Layers ---
-    # MainPath(31次元) から FMPath(32次元) への注目度を計算
     self.q_proj = nn.Linear(31, 32) # Query
     self.k_proj = nn.Linear(64, 32) # Key
     self.v_proj = nn.Linear(64, 32) # Value
@@ -76,15 +78,18 @@ class LayerStacks(nn.Module):
     #--- lossへの加算用
     self.current_phase_for_loss = None
 
-    #--- ログ出力用
+    #--- ログ・ルーティング用
+    self.last_router_logits = None
+    self.last_router_probs = None
+    self.last_routing_weights = None
+    self.last_routing_indices = None  # ルーターが実際に選んだインデックス
+
     self.last_gate_d = None
     self.last_gate_a = None
     self.last_att_score = None
     self.last_lca_temp = None
     self.last_phase = None
 
-    # Cached helper tensor for choosing outputs by bucket indices.
-    # Initialized lazily in forward.
     self.idx_offset = None
     self._init_layers()
 
@@ -102,202 +107,262 @@ class LayerStacks(nn.Module):
       nn.init.normal_(self.phase_proj.weight, std=0.01)
       nn.init.constant_(self.phase_proj.bias, 0.0)
 
+      nn.init.normal_(self.router.weight, std=0.01)
+      nn.init.constant_(self.router.bias, 0.0)
+
       for i in range(1, self.count):
-        # L1 Main (32次元)
         s1, e1 = i * 32, (i + 1) * 32
         self.l1.weight.data[s1:e1, :].copy_(self.l1.weight.data[0:32, :])
         self.l1.bias.data[s1:e1].copy_(self.l1.bias.data[0:32])
         
-        # FM Paths (64次元単位でコピー)
         sf, ef = i * 64, (i + 1) * 64
         self.fm_diff.weight.data[sf:ef, :].copy_(self.fm_diff.weight.data[0:64, :])
         self.fm_diff.bias.data[sf:ef].copy_(self.fm_diff.bias.data[0:64])
         self.fm_abs.weight.data[sf:ef, :].copy_(self.fm_abs.weight.data[0:64, :])
         self.fm_abs.bias.data[sf:ef].copy_(self.fm_abs.bias.data[0:64])
         
-        # cross_proj のコピー (32次元単位)
         self.cross_proj.weight.data[s1:e1, :].copy_(self.cross_proj.weight.data[0:32, :])
         self.cross_proj.bias.data[s1:e1].copy_(self.cross_proj.bias.data[0:32])
 
-        # blend のコピー
-        # すべてのバケットに bucket[0] のブレンド率を適用
         self.blend.data[i] = self.blend.data[0]
 
-        # L2/Output
         self.l2.weight.data[i*L3:(i+1)*L3, :].copy_(self.l2.weight.data[0:L3, :])
         self.l2.bias.data[i*L3:(i+1)*L3].copy_(self.l2.bias.data[0:L3])
         self.output.weight.data[i:i+1, :].copy_(self.output.weight.data[0:1, :])
         self.output.bias.data[i:i+1].copy_(self.output.bias.data[0:1])
 
-  def forward(self, l1_main, diff_in, abs_in, ls_indices):
 
-    # --- PHASE 0: 初期化とインデックス準備 ---
-    with torch.no_grad():
-      # バッチサイズやデバイス変更に追従してオフセットを再生成
-      if self.idx_offset is None or self.idx_offset.shape[0] != l1_main.shape[0] or self.idx_offset.device != ls_indices.device:
-          self.idx_offset = torch.arange(0, l1_main.shape[0]*self.count, self.count, device=ls_indices.device).long()
-      indices = ls_indices.flatten() + self.idx_offset
+  def forward(self, l1_main, diff_in, abs_in, ls_indices=None):
 
+        # --- PHASE 0: Router による動的バケット選択 (384 -> 12) ---
+        p_abs_base = torch.clamp(abs_in - 0.5, 0.0, 1.0) * 2.0   # [B, 128]
+        main_sub = l1_main[:, :128]                               # [B, 128]
 
-    # --- PHASE 1: PhaseGate (適応的重み付け) の計算 ---
-    # 1. 特徴入力の正規化
-    p_abs = torch.clamp(abs_in - 0.5, 0.0, 1.0) * 2.0
-    p_abs_modified = p_abs.clone()
+        router_input = torch.cat([p_abs_base, diff_in, main_sub], dim=1) # [B, 384]
+        #router_input = l1_main[:, :384]
 
-    # バケット情報(0-11)を最後の次元に埋め込み
-    bucket_info = ls_indices.float() / 11.0
-    p_abs_modified[:, 127] = bucket_info
+        router_logits = self.router(router_input)  # [B, count]
 
-    # 2. 特徴結合 (Abs + Diff + Mainの一部) からフェーズ判定
-    p_combined = torch.cat([p_abs_modified, diff_in], dim=1) 
-    main_sub = l1_main[:, :128]
-    p_extra_combined = torch.cat([p_combined, main_sub], dim=1)
+        # 1. 学習時（self.training == True）のみジッター（ノイズ）を追加
+        if self.training:
+            #jitter_std = 0.1
+            # Router Logits の広がりに応じて動的にジッターを決定
+            current_std = router_logits.std().detach().clamp(min=1e-3)
+            jitter_std = current_std * 0.01
 
-    # 3. 6系統のゲート(phase)を生成: [MainSqr, MainRaw, Diff, AbsR, AbsS, Cross]
-    phase_logit = (self.phase_proj(p_extra_combined) * 3.0) + 1.0
-    phase = 0.1 + 0.9 * torch.sigmoid(phase_logit)
+            noise = torch.randn_like(router_logits) * jitter_std
+            logits_for_routing = router_logits + noise
 
-    # [統計・ログ用] 勾配を切って各系統の活動状況を記録
-    p_detached = phase.detach()
-    phase_names = ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"]
-    channel_stats = []
-    for i in range(6):
-        p_ch = p_detached[:, i]
-        stats = {
-            'name': phase_names[i],
-            'mean': p_ch.mean().item(),
-            'std':  p_ch.std().item(),
-            'min':  p_ch.min().item(),
-            'max':  p_ch.max().item(),
-            'low': (p_ch < 0.2).float().mean().item() * 100,
-            'high':(p_ch > 0.8).float().mean().item() * 100
-        }
-        channel_stats.append(stats)
+            #-----
+            raw_indices = router_logits.argmax(dim=-1)
+            noisy_indices = logits_for_routing.argmax(dim=-1)
 
-    if self.training:
-        self.last_phase = phase.detach()
-        self.current_phase_for_loss = phase # detachせずに保持
+            # ノイズによって選択が変わった割合 (Flip Rate)
+            flip_rate = (raw_indices != noisy_indices).float().mean().item()
+            if torch.rand(1).item() < 0.001:
+                print(f"[Router Check] Logits Mean: {router_logits.mean().item():.4f}, Std: {router_logits.std().item():.4f}")
+                print(f"[Jitter Check] Flip Rate: {flip_rate:.1%}")
+            #-----
+
+        else:
+            logits_for_routing = router_logits
+
+        # 2. Straight-Through One-Hot による Hard Routing 化
+        probs = F.softmax(logits_for_routing, dim=-1)
+        router_indices = logits_for_routing.argmax(dim=-1)
+
+        hard_one_hot = F.one_hot(router_indices, num_classes=self.count).float()
+        routing_weights = (hard_one_hot - probs).detach() + probs
+
+        self.last_routing_indices = router_indices.detach()
 
 
-    # --- PHASE 2: FMPath (差分・絶対値特徴) の抽出 ---
-    # 1. 差分(Diff)と絶対値(Abs)の特徴変換
-    l1c_diff_raw = self.fm_diff(diff_in).reshape((-1, self.count, 64)).view(-1, 64)[indices]
-    l1c_abs_raw = self.fm_abs(abs_in).reshape((-1, self.count, 64)).view(-1, 64)[indices]
+        # 3. [統計・ログ用] 
+        self.last_router_logits = router_logits
+        self.last_router_probs = F.softmax(router_logits, dim=-1)
+        self.last_router_probs_log = self.last_router_probs.detach()
+        self.last_router_weights = routing_weights.detach()
 
-    # 2. GLU / RMSNorm による情報選別
-    gate_d, val_d = l1c_diff_raw.chunk(2, dim=-1)
-    gate_a, val_a = l1c_abs_raw.chunk(2, dim=-1)
-
-    rms_d = torch.rsqrt(val_d.pow(2).mean(dim=-1, keepdim=True) + 1e-8)
-    val_d_normed = val_d * rms_d
-    l1c_diff_gated = val_d_normed
-    l1c_abs_gated = val_a * torch.sigmoid(gate_a)
-
-    # 3. 非線形変換 (ClippedReLU / Square)
-    l1_diff_l2 = torch.clamp(l1c_diff_gated * 0.2 + 0.5, 0.0, 1.0)
-    l1_abs_raw = torch.clamp(l1c_abs_gated * 0.05 + 0.6, 0.0, 1.0)
-    l1_abs_sqr = l1_abs_raw.pow(2.0)
-
-    # 統計用に保存
-    if self.training:
-        self.last_gate_d = gate_d.detach().clone()
-        self.last_gate_a = gate_a.detach().clone()
+        # 4. PhaseGate 埋め込み用の bucket_info (0.0 ~ 1.0)
+        bucket_scale = torch.linspace(0.0, 1.0, self.count, device=l1_main.device)
+        bucket_info = (routing_weights * bucket_scale).sum(dim=-1, keepdim=True) # [B, 1]
 
 
-    # --- PHASE 3: MainPath & Attention 制御 ---
-    # 1. 盤面情報の取得と Factorized 特徴の加算
-    l1c_main = self.l1(l1_main).reshape((-1, self.count, 32)).view(-1, 32)[indices]
-    l1f_     = self.l1_fact(l1_main) 
-    l1_combined = l1c_main + l1f_ 
+        # --- PHASE 1: PhaseGate (適応的重み付け) の計算 ---
+        p_abs_modified = p_abs_base.clone()
+        p_abs_modified[:, 127:128] = bucket_info
 
-    # 2. DiffゲートによるMainPathの動的抑制
-    gate_d = gate_d - 0.3
-    l1_combined = l1_combined * (0.5 + 0.5 * torch.sigmoid(gate_d))
+        p_combined = torch.cat([p_abs_modified, diff_in], dim=1) 
+        p_extra_combined = torch.cat([p_combined, main_sub], dim=1)
 
-    # Main: 31次元(L2へ) + 1次元(Bypassへ)
-    l1_val, l1_main_bp = l1_combined.split([31, 1], dim=1)
+        phase_logit = (self.phase_proj(p_extra_combined) * 3.0) + 1.0
+        phase = 0.1 + 0.9 * torch.sigmoid(phase_logit) # [B, 6]
 
-    # L2入力用：ClippedReLU
-    l1_main_sqr = torch.clamp(l1_val, 0.0, 1.0).pow(2.0) * (127/128)
-    l1_main_raw = torch.clamp(l1_val, 0.0, 1.0)
+        p_detached = phase.detach()
+        phase_names = ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"]
+        channel_stats = []
+        for i in range(6):
+            p_ch = p_detached[:, i]
+            stats = {
+                'name': phase_names[i],
+                'mean': p_ch.mean().item(),
+                'std':  p_ch.std().item(),
+                'min':  p_ch.min().item(),
+                'max':  p_ch.max().item(),
+                'low': (p_ch < 0.2).float().mean().item() * 100,
+                'high':(p_ch > 0.8).float().mean().item() * 100
+            }
+            channel_stats.append(stats)
 
-    # 3. Lightweight Cross-Attention (LCA)
-    # MainPath(Q) が FMPath(K,V) から必要な情報を引き出す
-    q = self.q_proj(l1_main_raw)
-    fm_cat = torch.cat([l1_diff_l2, l1_abs_raw], dim=1)
-    k = self.k_proj(fm_cat)
-    v = self.v_proj(fm_cat)
-
-    # スコア計算 (Logit)
-    logit = (q * k).sum(dim=-1, keepdim=True) / 5.656
-
-    # Temperature の適用 (0.125以下にならないようガード)
-    safe_temp = torch.clamp(self.lca_temp, min=0.125)
-    att_score = torch.sigmoid(logit / safe_temp)
-
-    # FM成分に Attention 結果を反映
-    v_clamped = torch.clamp(v * 0.4 + 0.5, 0.0, 1.0)
-    l1_diff_l2 = l1_diff_l2 * (1 - att_score) + v_clamped * att_score
-
-    # 統計用に保存
-    if self.training:
-      self.last_att_score = att_score.detach()
-      self.last_lca_temp = safe_temp.detach() # ログ用
+        if self.training:
+            self.last_phase = phase.detach()
+            self.current_phase_for_loss = phase
 
 
-    # --- PHASE 4: CrossFeat ---
-    # Cross特徴 (Main × FM の積)
-    k = self.cross_dim  # 先頭 k 次元だけ使う
-    cross_diff = l1_main_sqr[:, :k] * l1_diff_l2[:, :k]
-    cross_abs  = l1_main_raw[:, :k] * l1_abs_raw[:, :k]
-    cross_cat = torch.cat([cross_diff, cross_abs], dim=1)  # [B, 2k]
+        # --- PHASE 2: FMPath (全12バケット完全並列抽出) ---
+        l1c_diff_all = self.fm_diff(diff_in).reshape(-1, self.count, 64) # [B, 12, 64]
+        l1c_abs_all  = self.fm_abs(abs_in).reshape(-1, self.count, 64)   # [B, 12, 64]
 
-    cross_feat = self.cross_proj(cross_cat).reshape((-1, self.count, 32)).view(-1, 32)[indices]
-    cross_feat = torch.clamp(cross_feat, 0.0, 1.0) 
+        gate_d_all, val_d_all = l1c_diff_all.chunk(2, dim=-1) # 各 [B, 12, 32]
+        gate_a_all, val_a_all = l1c_abs_all.chunk(2, dim=-1)  # 各 [B, 12, 32]
 
+        rms_d_all = torch.rsqrt(val_d_all.pow(2).mean(dim=-1, keepdim=True) + 1e-8) # [B, 12, 1]
+        val_d_normed_all = val_d_all * rms_d_all
+        l1c_diff_gated_all = val_d_normed_all
+        l1c_abs_gated_all  = val_a_all * torch.sigmoid(gate_a_all)
 
-    # --- PHASE 5: L2 Input 構築 ---
-    l2_main_sqr_weighted = l1_main_sqr * (0.5 + phase[:, 0:1] * 0.5) * 1.3
-    l2_main_raw_weighted = l1_main_raw * (0.5 + phase[:, 1:2] * 0.5) * 1.5
-    l2_diff_weighted     = l1_diff_l2  * (0.5 + phase[:, 2:3] * 0.5) * 1.0
-    l1_abs_raw_weighted  = l1_abs_raw  * (0.5 + phase[:, 3:4] * 0.5) * 0.7
-    l1_abs_sqr_weighted  = l1_abs_sqr  * (0.5 + phase[:, 4:5] * 0.5) * 0.88
-    l2_cross_weighted    = cross_feat  * (0.5 + phase[:, 5:6] * 0.5) * 1.5
-
-    l2_padding = torch.zeros((l1_main.shape[0], 2), device=l1_main.device)
-    l2_input = torch.cat([
-        l2_main_sqr_weighted, # [  0: 30]
-        l2_main_raw_weighted, # [ 31: 61]
-        l2_diff_weighted,     # [ 62: 93]
-        l1_abs_raw_weighted,  # [ 94:125]
-        l1_abs_sqr_weighted,  # [126:157]
-        l2_cross_weighted,    # [158:189]
-        l2_padding            # [190:191]
-    ], dim=1)
-
-    l2_input = torch.clamp(l2_input, 0.0, 1.0)
+        l1_diff_l2_all = torch.clamp(l1c_diff_gated_all * 0.2 + 0.5, 0.0, 1.0) # [B, 12, 32]
+        l1_abs_raw_all = torch.clamp(l1c_abs_gated_all * 0.05 + 0.6, 0.0, 1.0) # [B, 12, 32]
+        l1_abs_sqr_all = l1_abs_raw_all.pow(2.0)                               # [B, 12, 32]
 
 
-    # --- PHASE 6: Output (DeepPath vs Bypass) ---
-    l2c_ = self.l2(l2_input).reshape((-1, self.count, L3)).view(-1, L3)[indices]
-    l2x_ = torch.clamp(l2c_, 0.0, 1.0)
-    l3c_ = self.output(l2x_).reshape((-1, self.count, 1)).view(-1, 1)[indices]
+        # --- PHASE 3: MainPath & Attention 制御 (全12バケット完全独立) ---
+        l1c_main_all = self.l1(l1_main).reshape(-1, self.count, 32) # [B, 12, 32]
+        l1f_ = self.l1_fact(l1_main)                                # [B, 32]
+        l1_combined_all = l1c_main_all + l1f_.unsqueeze(1)          # [B, 12, 32]
 
-    # バケット別の学習パラメータ alpha で L3(Deep) と L1(Bypass) をブレンド
-    bucket_blend = self.blend[ls_indices].reshape(-1, 1)
-    alpha = torch.sigmoid(bucket_blend)
+        gate_d_sub_all = gate_d_all - 0.3
+        l1_combined_all = l1_combined_all * (0.5 + 0.5 * torch.sigmoid(gate_d_sub_all))
 
-    l3c_ = l3c_ * alpha
-    l1_main_bp = l1_main_bp * (1.0 - alpha)
-    final_output = l3c_ + l1_main_bp
+        l1_val_all, l1_main_bp_all = l1_combined_all.split([31, 1], dim=-1)
 
-    return final_output, l3c_, l1_main_bp, l2_input, l1c_diff_gated, l1c_abs_gated, gate_d, gate_a, channel_stats
+        l1_main_sqr_all = torch.clamp(l1_val_all, 0.0, 1.0).pow(2.0) * (127/128) # [B, 12, 31]
+        l1_main_raw_all = torch.clamp(l1_val_all, 0.0, 1.0)                      # [B, 12, 31]
+
+        q_all = self.q_proj(l1_main_raw_all)                                     # [B, 12, q_dim]
+        fm_cat_all = torch.cat([l1_diff_l2_all, l1_abs_raw_all], dim=-1)         # [B, 12, 64]
+        k_all = self.k_proj(fm_cat_all)
+        v_all = self.v_proj(fm_cat_all)
+
+        logit_all = (q_all * k_all).sum(dim=-1, keepdim=True) / 5.656            # [B, 12, 1]
+        safe_temp = torch.clamp(self.lca_temp, min=0.125)
+        att_score_all = torch.sigmoid(logit_all / safe_temp)
+
+        v_clamped_all = torch.clamp(v_all * 0.4 + 0.5, 0.0, 1.0)
+        l1_diff_l2_all = l1_diff_l2_all * (1 - att_score_all) + v_clamped_all * att_score_all # [B, 12, 32]
+
+
+        # --- PHASE 4: CrossFeat (einsum による最適化) ---
+        k_dim = self.cross_dim
+        cross_diff_all = l1_main_sqr_all[:, :, :k_dim] * l1_diff_l2_all[:, :, :k_dim] # [B, 12, k_dim]
+        cross_abs_all  = l1_main_raw_all[:, :, :k_dim] * l1_abs_raw_all[:, :, :k_dim] # [B, 12, k_dim]
+        cross_cat_all  = torch.cat([cross_diff_all, cross_abs_all], dim=-1)           # [B, 12, 2*k_dim]
+
+        # ★ einsum による12バケット個別の全結合演算
+        W_cross = self.cross_proj.weight.view(self.count, 32, -1)  # [12, 32, 2*k_dim]
+        b_cross = self.cross_proj.bias.view(self.count, 32)        # [12, 32]
+        cross_feat_all = torch.einsum("bci,coi->bco", cross_cat_all, W_cross) + b_cross # [B, 12, 32]
+        cross_feat_all = torch.clamp(cross_feat_all, 0.0, 1.0)
+
+
+        # --- PHASE 5: L2 Input 構築 (全12バケット完全独立) ---
+        p0 = phase[:, 0:1].unsqueeze(1) # [B, 1, 1]
+        p1 = phase[:, 1:2].unsqueeze(1)
+        p2 = phase[:, 2:3].unsqueeze(1)
+        p3 = phase[:, 3:4].unsqueeze(1)
+        p4 = phase[:, 4:5].unsqueeze(1)
+        p5 = phase[:, 5:6].unsqueeze(1)
+
+        l2_main_sqr_weighted_all = l1_main_sqr_all * (0.5 + p0 * 0.5) * 1.3
+        l2_main_raw_weighted_all = l1_main_raw_all * (0.5 + p1 * 0.5) * 1.5
+        l2_diff_weighted_all     = l1_diff_l2_all  * (0.5 + p2 * 0.5) * 1.0
+        l1_abs_raw_weighted_all  = l1_abs_raw_all  * (0.5 + p3 * 0.5) * 0.7
+        l1_abs_sqr_weighted_all  = l1_abs_sqr_all  * (0.5 + p4 * 0.5) * 0.88
+        l2_cross_weighted_all    = cross_feat_all  * (0.5 + p5 * 0.5) * 1.5
+
+        l2_padding_all = torch.zeros((l1_main.shape[0], self.count, 2), device=l1_main.device)
+        l2_input_all = torch.cat([
+            l2_main_sqr_weighted_all,
+            l2_main_raw_weighted_all,
+            l2_diff_weighted_all,   
+            l1_abs_raw_weighted_all, 
+            l1_abs_sqr_weighted_all, 
+            l2_cross_weighted_all,   
+            l2_padding_all            
+        ], dim=-1) # Shape: [B, 12, L2_IN_DIM]
+
+        l2_input_all = torch.clamp(l2_input_all, 0.0, 1.0)
+
+
+        # --- PHASE 6: Output (einsum による L2 & Output の高速一括計算) ---
+        # ★ einsum による L2層の計算 [B, 12, L2_IN_DIM] -> [B, 12, L3]
+        W_l2 = self.l2.weight.view(self.count, L3, -1)   # [12, L3, L2_IN_DIM]
+        b_l2 = self.l2.bias.view(self.count, L3)         # [12, L3]
+        l2c_all = torch.einsum("bci,coi->bco", l2_input_all, W_l2) + b_l2
+        l2x_all = torch.clamp(l2c_all, 0.0, 1.0)
+
+        # ★ einsum による Output層の計算 [B, 12, L3] -> [B, 12, 1]
+        W_out = self.output.weight.view(self.count, 1, -1) # [12, 1, L3]
+        b_out = self.output.bias.view(self.count, 1)       # [12, 1]
+        l3c_all = torch.einsum("bci,coi->bco", l2x_all, W_out) + b_out # [B, 12, 1]
+
+        # 1. 各バケット個別の alpha (blend): Shape [1, count, 1]
+        alpha_all = torch.sigmoid(self.blend).view(1, self.count, 1)
+
+        # 2. ★ 真の Oracle 用出力（他バケットの混ざり物ゼロの12バケット個別の最終出力）
+        # Shape: [B, count]
+        all_final_outputs = (l3c_all * alpha_all + l1_main_bp_all * (1.0 - alpha_all)).squeeze(-1)
+
+        # 3. Router の選択重み（routing_weights: [B, count]）を掛けて本命の出力を算出: Shape [B, 1]
+        final_output = (all_final_outputs * routing_weights).sum(dim=-1, keepdim=True)
+
+
+        # --- PHASE 7: ログ・デバッグ用変数の抽出（ルーティング選択された1本のストリーム） ---
+        w_expand = routing_weights.unsqueeze(-1) # [B, 12, 1]
+
+        l3c_selected         = (l3c_all.squeeze(-1) * routing_weights).sum(dim=-1, keepdim=True)
+        l1_main_bp_selected  = (l1_main_bp_all.squeeze(-1) * routing_weights).sum(dim=-1, keepdim=True)
+        l2_input_selected    = (l2_input_all * w_expand).sum(dim=1)
+        l1c_diff_gated_sel   = (l1c_diff_gated_all * w_expand).sum(dim=1)
+        l1c_abs_gated_sel    = (l1c_abs_gated_all * w_expand).sum(dim=1)
+        gate_d_selected       = (gate_d_all * w_expand).sum(dim=1)
+        gate_a_selected       = (gate_a_all * w_expand).sum(dim=1)
+
+        if self.training:
+            self.last_gate_d = gate_d_selected.detach().clone()
+            self.last_gate_a = gate_a_selected.detach().clone()
+            self.last_att_score = (att_score_all.squeeze(-1) * routing_weights).sum(dim=-1, keepdim=True).detach()
+            self.last_lca_temp = safe_temp.detach()
+
+        return (
+            final_output,         # [B, 1] Router選択後のメイン出力
+            l3c_selected,         # [B, 1] 選択された DeepPath 出力
+            l1_main_bp_selected,  # [B, 1] 選択された Bypass 出力
+            l2_input_selected,    # [B, L2_IN_DIM] 選択された L2入力
+            l1c_diff_gated_sel,   # [B, 32]
+            l1c_abs_gated_sel,    # [B, 32]
+            gate_d_selected,      # [B, 32]
+            gate_a_selected,      # [B, 32]
+            channel_stats,        # PhaseGate 統計
+            router_indices,       # [B] 選択インデックス
+            router_logits,        # [B, count] Router CE Loss 用
+            all_final_outputs     # [B, count] ★ 完全独立計算された真の Oracle 評価値
+        )
 
 
   def get_coalesced_layer_stacks(self):
       for i in range(self.count):
           with torch.no_grad():
-              # --- 1. 推論用レイヤーの器 (Instance) の定義 ---
               l1 = nn.Linear(L1_MAIN, 32)
               diff_b = nn.Linear(128, 64)
               abs_b = nn.Linear(128, 64)
@@ -305,62 +370,41 @@ class LayerStacks(nn.Module):
               output = nn.Linear(L3, 1)
               cross_p = nn.Linear(self.cross_dim * 2, 32)
 
-              # --- 2. 共通パラメータ (Shared Parameters) の取得 ---
-              # これらはバケットに依存しないが、便宜上ループ内で参照を渡す
               lca_q = self.q_proj
               lca_k = self.k_proj
               lca_v = self.v_proj
               lca_temp_val = torch.clamp(self.lca_temp, min=0.125).item()
               phase_p = self.phase_proj
 
-              # --- 3. バケット固有の重み抽出 (Slicing & Coalescing) ---
-
-              # [Main Path] バケット別の重みに Factorized(共通)重みを合成
               l1.weight.data = self.l1.weight.data[i*32:(i+1)*32, :] + self.l1_fact.weight.data
               l1.bias.data = self.l1.bias.data[i*32:(i+1)*32] + self.l1_fact.bias.data
 
-              # [FM Paths] インデックスを 64 単位で抽出 (GLUのGate/Valueを含む)
               diff_b.weight.data = self.fm_diff.weight.data[i*64:(i+1)*64, :]
               diff_b.bias.data = self.fm_diff.bias.data[i*64:(i+1)*64]
               abs_b.weight.data = self.fm_abs.weight.data[i*64:(i+1)*64, :]
               abs_b.bias.data = self.fm_abs.bias.data[i*64:(i+1)*64]
 
-              # [Cross Projection] 32次元の出力をバケット単位でスライス
               s_c, e_c = i * 32, (i + 1) * 32
               cross_p.weight.data = self.cross_proj.weight.data[s_c:e_c, :]
               cross_p.bias.data = self.cross_proj.bias.data[s_c:e_c]
 
-              # [L2 / Mid Layer] 全体の流入制御用。i番目のバケットセグメントを抽出
               l2.weight.data = self.l2.weight.data[i*L3:(i+1)*L3, :L2_IN_TOTAL]
               l2.bias.data = self.l2.bias.data[i*L3:(i+1)*L3]
 
-              # [Output / Blend] 最終出力の重みと、バケット別ブレンド係数
               output.weight.data = self.output.weight.data[i:i+1, :]
               output.bias.data = self.output.bias.data[i:i+1]
               bucket_blend = self.blend.data[i].item()
 
-              # --- 4. 生成したセットを yield ---
               yield (l1, diff_b, abs_b, cross_p, l2, output
                      , bucket_blend, lca_q, lca_k, lca_v, lca_temp_val, phase_p)
 
 
 class NNUE(pl.LightningModule):
-  """
-  This model attempts to directly represent the nodchip Stockfish trainer methodology.
-
-  lambda_ = 0.0 - purely based on game results
-  lambda_ = 1.0 - purely based on search scores
-
-  It is not ideal for training a Pytorch quantized model directly.
-  """
   def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1):
     super(NNUE, self).__init__()
     self.num_ls_buckets = NUM_LS_BUCKETS
 
-    # FT層: 合計 (L1_MAIN + FM_DIM * 2) 次元を出力
     self.input = DoubleFeatureTransformerSlice(feature_set.num_features, L1_MAIN, FM_DIM)
-
-    # pair_weights
     self.pair_weights = nn.Parameter(torch.zeros(4, 640, 3))
 
     self.feature_set = feature_set
@@ -384,13 +428,13 @@ class NNUE(pl.LightningModule):
     self.adjust_loss = adjust_loss
     self.last_bucket_losses = None
 
-    # --- 重みクリッピングの設定 ---
-    max_hidden_weight = self.quantized_one / self.weight_scale_hidden # 約1.98
+    max_hidden_weight = self.quantized_one / self.weight_scale_hidden
     max_out_weight = (self.quantized_one * self.quantized_one) / (self.nnue2score * self.weight_scale_out)
 
     self.weight_clipping = [
       {'params' : [self.input.v], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.l1.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight, 'virtual_params' : self.layer_stacks.l1_fact.weight },
+      {'params' : [self.layer_stacks.router.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.fm_diff.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.fm_abs.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
       {'params' : [self.layer_stacks.cross_proj.weight], 'min_weight' : -max_hidden_weight, 'max_weight' : max_hidden_weight },
@@ -404,32 +448,17 @@ class NNUE(pl.LightningModule):
 
     self._zero_virtual_feature_weights()
 
-  '''
-  We zero all virtual feature weights because during serialization to .nnue
-  we compute weights for each real feature as being the sum of the weights for
-  the real feature in question and the virtual features it can be factored to.
-  This means that if we didn't initialize the virtual feature weights to zero
-  we would end up with the real features having effectively unexpected values
-  at initialization - following the bell curve based on how many factors there are.
-  '''
   def _zero_virtual_feature_weights(self):
     weights = self.input.weight
     v_weights = self.input.v
     with torch.no_grad():
       for a, b in self.feature_set.get_virtual_feature_ranges():
-        # メインの線形パスの重みをゼロに
         weights[a:b, :] = 0.0
-        # 因子ベクトル (FM項) の重みもゼロに
         v_weights[a:b, :] = 0.0
 
     self.input.weight = nn.Parameter(weights)
     self.input.v = nn.Parameter(v_weights)
 
-
-  '''
-  Clips the weights of the model based on the min/max values allowed
-  by the quantization scheme.
-  '''
   def _clip_weights(self):
     for group in self.weight_clipping:
       for p in group['params']:
@@ -455,38 +484,17 @@ class NNUE(pl.LightningModule):
               raise Exception('Not supported.')
           p.data.copy_(p_data_fp32)
 
-
-  '''
-  This method attempts to convert the model from using the self.feature_set
-  to new_feature_set.
-  '''
   def set_feature_set(self, new_feature_set):
     if self.feature_set.name == new_feature_set.name:
       return
 
-    # TODO: Implement this for more complicated conversions.
-    #       Currently we support only a single feature block.
     if len(self.feature_set.features) > 1:
       raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
-    # Currently we only support conversion for feature sets with
-    # one feature block each so we'll dig the feature blocks directly
-    # and forget about the set.
     old_feature_block = self.feature_set.features[0]
     new_feature_block = new_feature_set.features[0]
 
-    # next(iter(new_feature_block.factors)) is the way to get the
-    # first item in a OrderedDict. (the ordered dict being str : int
-    # mapping of the factor name to its size).
-    # It is our new_feature_factor_name.
-    # For example old_feature_block.name == "HalfKP"
-    # and new_feature_factor_name == "HalfKP^"
-    # We assume here that the "^" denotes factorized feature block
-    # and we would like feature block implementers to follow this convention.
-    # So if our current feature_set matches the first factor in the new_feature_set
-    # we only have to add the virtual feature on top of the already existing real ones.
     if old_feature_block.name == next(iter(new_feature_block.factors)):
-      # We can just extend with zeros since it's unfactorized -> factorized
       weights = self.input.weight
       padding = weights.new_zeros((new_feature_block.num_virtual_features, weights.shape[1]))
       weights = torch.cat([weights, padding], dim=0)
@@ -498,66 +506,53 @@ class NNUE(pl.LightningModule):
   def forward(self, us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices):
 
     # --- PHASE 1: 入力埋め込みと特徴量分離 ---
-    # 1. 蓄積計算用ベクトル(t)とFM用埋め込み(v)を全入力から取得
     t_w, t_b, v_w, v_b = self.input(white_indices, white_values, black_indices, black_values)
 
-    # 2. 特徴量IDの境界定義 (HalfKA/KSDG系 と Factorized系 を分ける)
     H_START = 12672
-    H_END   = 214210 # KSDG3_Fact の開始点までが H系
+    H_END   = 214210
 
     def process_fm(v_feat, indices):
-        # 特徴量IDに基づいてマスクを作成 (H系 vs それ以外)
         mask_h = (indices >= H_START) & (indices < H_END)
         mask_k = (indices < H_START) | (indices >= H_END)
 
-        # 有効な特徴量のみを抽出
         vh = v_feat * mask_h.unsqueeze(-1)
         vk = v_feat * mask_k.unsqueeze(-1)
 
-        # 合計(Sum)と交互作用(Interaction)を計算
         sh, sk = torch.sum(vh, dim=1), torch.sum(vk, dim=1)
         ih = 0.5 * (sh**2 - torch.sum(vh**2, dim=1))
         ik = 0.5 * (sk**2 - torch.sum(vk**2, dim=1))
         return ih, ik, sh, sk
 
-    # 自軍・敵軍それぞれのFM要素 [ih, ik, sh, sk] を抽出
     ih_w, ik_w, sh_w, sk_w = process_fm(v_w, white_indices)
     ih_b, ik_b, sh_b, sk_b = process_fm(v_b, black_indices)
 
 
     # --- PHASE 2: Main Path (蓄積計算) の処理 ---
-    # 1. 視点(us/them)を考慮して1280次元(640ペア)を生成し、Clippingを適用
+    # ※最初は layer_stack_indicesを使用
     l0_raw = (us * torch.cat([t_w, t_b], dim=1)) + (them * torch.cat([t_b, t_w], dim=1))
     l0_clipped = torch.clamp(l0_raw, 0.0, 1.0)
     l0_s = torch.split(l0_clipped, 640, dim=1)
     
-    # 2. フェーズ進行度 (0.0=序盤 ～ 1.0=終盤) に基づくテント関数の計算
-    # w0: 0.0でピーク, w1: 0.33, w2: 0.66, w3: 1.0
     pf = layer_stack_indices.view(-1, 1, 1).float() / 11.0
     w0 = torch.clamp(1.0 - pf * 3.0, min=0.0)
     w1 = torch.clamp(1.0 - torch.abs(pf * 3.0 - 1.0), min=0.0)
     w2 = torch.clamp(1.0 - torch.abs(pf * 3.0 - 2.0), min=0.0)
     w3 = torch.clamp(pf * 3.0 - 2.0, min=0.0)
 
-    # 3. ペアごとの演算比率(Mul/Diff/Sum)をフェーズでブレンド
     mixed_weights = (w0 * self.pair_weights[0] + 
                      w1 * self.pair_weights[1] + 
                      w2 * self.pair_weights[2] + 
                      w3 * self.pair_weights[3])
     weights = torch.softmax(mixed_weights, dim=2)
 
-    # 4. メインパスの計算
-    # 前半部分
     term_mul = l0_s[0] * l0_s[1]
     term_diff_sq = torch.pow(l0_s[0] - l0_s[1], 2)
     term_sum = (l0_s[0] + l0_s[1]) * 0.5
 
-    # 配合比率を適用
     l1_main_part1 = (weights[:, :, 0] * term_mul + 
                      weights[:, :, 1] * term_diff_sq + 
                      weights[:, :, 2] * term_sum)
 
-    # 後半部分
     term_mul2 = l0_s[2] * l0_s[3]
     term_diff_sq2 = torch.pow(l0_s[2] - l0_s[3], 2)
     term_sum2 = (l0_s[2] + l0_s[3]) * 0.5
@@ -566,12 +561,10 @@ class NNUE(pl.LightningModule):
                      weights[:, :, 1] * term_diff_sq2 + 
                      weights[:, :, 2] * term_sum2)
 
-    # 前半と後半をcat
     l1_main_input = torch.cat([l1_main_part1, l1_main_part2], dim=1) * (127/128)
 
 
     # --- PHASE 3: FM項 (Diff / Abs) のスケーリング ---
-    # 1. FM成分を統合し、視点を考慮した「差(Diff)」と「和(Abs)」を生成
     v_w_all = torch.stack([ih_w, ik_w, sh_w, sk_w], dim=1)
     v_b_all = torch.stack([ih_b, ik_b, sh_b, sk_b], dim=1)
     us_3d = us.view(-1, 1, 1)
@@ -580,46 +573,42 @@ class NNUE(pl.LightningModule):
     raw_diff = (us_3d * (v_w_all - v_b_all)) + (them_3d * (v_b_all - v_w_all))
     raw_abs  = (us_3d * v_w_all) + (them_3d * v_b_all)
 
-    # 2. 成分別正規化
-    # [Inter_H, Inter_K, Sum_H, Sum_K] の順でスケールを適用
     norm_diff = torch.tensor([0.01, 0.01, 0.05, 0.05], device=raw_diff.device).view(1, 4, 1)
     norm_abs  = torch.tensor([0.004, 0.004, 0.02, 0.02], device=raw_abs.device).view(1, 4, 1)
 
     diff_input_scaled = torch.clamp(raw_diff * norm_diff + 0.5, 0.0, 1.0)
     abs_input_scaled  = torch.clamp(raw_abs * norm_abs + 0.5, 0.0, 1.0)
 
-    # 最終的に LayerStacks に渡すために 128次元に flatten
     diff_input = diff_input_scaled.view(-1, 128)
     abs_input  = abs_input_scaled.view(-1, 128)
 
 
     # --- PHASE 4: LayerStacks による深層処理 ---
-    # 構築した3つのパス (Main:1280, Diff:128, Abs:128) を後続層へ
-    final_output, l3_out, l1_main_bp, l2_input, diff_gated, abs_gated, gate_d, gate_a, channel_stats = self.layer_stacks(
-        l1_main_input, diff_input, abs_input, layer_stack_indices
+    # ★ 途中から router の結果 (router_indices) を受け取る
+    final_output, l3_out, l1_main_bp, l2_input, diff_gated, abs_gated, gate_d, gate_a, channel_stats, router_indices, router_logits, all_final_outputs = self.layer_stacks(
+        l1_main_input, diff_input, abs_input, ls_indices=layer_stack_indices
     )
 
-
-    # --- 統計ログの呼び出し ---
+    # --- 統計ログの呼び出し (router_indices を渡してログ出力) ---
     if self.training:
         self._log_detailed_stats(
             us, white_indices, l1_main_input,
             diff_input, abs_input,
             diff_gated, abs_gated,
-            layer_stack_indices, final_output, l3_out, l1_main_bp, l2_input
-            , gate_d, gate_a, channel_stats
+            router_indices,  # ★ ログ出力時には router の結果を使用
+            final_output, l3_out, l1_main_bp, l2_input,
+            gate_d, gate_a, channel_stats
         )
 
-    return final_output
+    return final_output, router_logits, all_final_outputs
 
 
   def _log_detailed_stats(self, us, white_indices, l1_main, 
                          diff_l1, abs_l1,
                          diff_gated, abs_gated,
-                         layer_stack_indices, final_output, l3_out, l1_main_bp, l2_input
-                         , gate_d, gate_a, channel_stats):
+                         layer_stack_indices, final_output, l3_out, l1_main_bp, l2_input,
+                         gate_d, gate_a, channel_stats):
 
-    # --- 実行頻度制御 (500ステップに1回) ---
     if not hasattr(self, 'dbg_cnt'): self.dbg_cnt = 0
     self.dbg_cnt += 1
     if self.dbg_cnt % 500 != 0: return
@@ -627,10 +616,8 @@ class NNUE(pl.LightningModule):
     with torch.no_grad():
       print(f"\n[FM Detailed Debug Step {self.dbg_cnt}]")
 
-      # --- SECTION 1: 基本統計 (特徴量のアクティブ数と入力信号の分布) ---
       _b_size = us.shape[0]
 
-      # 0以上の要素のみをカウント
       _num_active_total = torch.sum(white_indices >= 0).item()
       _num_act_avg = _num_active_total / _b_size
       _unique_active = torch.unique(white_indices[white_indices >= 0]).numel()
@@ -641,8 +628,6 @@ class NNUE(pl.LightningModule):
       print(f"   FM Diff  | mean:{diff_l1.mean():7.4f}, std:{diff_l1.std():7.4f}, min:{diff_l1.min():7.4f}, max:{diff_l1.max():7.4f}")
       print(f"   FM Abs   | mean:{abs_l1.mean():7.4f}, std:{abs_l1.std():7.4f}, min:{abs_l1.min():7.4f}, max:{abs_l1.max():7.4f}")
 
-
-      # --- SECTION 2: 出力構成分析 (DeepPath vs MainBypass の寄与比率) ---
       l3_mag = l3_out.abs().mean().item()
       m_bp_mag = l1_main_bp.abs().mean().item()
 
@@ -653,8 +638,6 @@ class NNUE(pl.LightningModule):
       print(f" Output Composition | L3(Deep): {l3_mag:7.4f} ({l3_ratio:4.1f}%) | MainBypass: {m_bp_mag:7.4f} ({bp_ratio:4.1f}%)")
       print(f" Final Score Range  | Min: {final_output.min():7.2f}, Max: {final_output.max():7.2f}, Mean: {final_output.mean():7.2f}")
 
-
-      # --- SECTION 3: Blend Alpha の可視化 (DeepPath をどの程度採用しているか) ---
       alphas = torch.sigmoid(self.layer_stacks.blend).cpu().numpy()
       alpha_pct = alphas * 100
 
@@ -663,55 +646,43 @@ class NNUE(pl.LightningModule):
       print(f"   Min  : {alpha_pct.min():.2f}%")
       print(f"   Max  : {alpha_pct.max():.2f}%")
 
-
-      # --- SECTION 4: FM 4成分の詳細分析 (Interaction/Sum × H/K 系統) ---
       print("-" * 110)
       print(f"{'FM Component':19} | {'Raw min / mean  / max    / std':33} | {'Zero%':>7} | {'High%':>7}")
       print("-" * 110)
 
-      # 飽和率計算用ヘルパー
       def get_sat_zero(t):
           return (t <= 0.01).float().mean().item() * 100
       def get_sat_high(t):
           return (t >= 0.98).float().mean().item() * 100
 
-      # L1段階 (128次元) を成分ごとに分解
       r_d_4ch = diff_l1.view(-1, 4, 32)
       r_a_4ch = abs_l1.view(-1, 4, 32)
       
       names = ["Inter HalfKA", "Inter KSDG3", "SumV HalfKA", "SumV KSDG3"]
 
       for i, name in enumerate(names):
-          # --- Diff成分 ---
           d_comp = r_d_4ch[:, i, :]
           d_min, d_m, d_max, d_std = d_comp.min(), d_comp.mean(), d_comp.max(), d_comp.std()
           sat_zero_l1_d = get_sat_zero(d_comp)
           sat_high_l1_d = get_sat_high(d_comp)
           print(f" {name+'(Diff)':18} | {d_min:6.3f} / {d_m:6.3f} / {d_max:6.3f} / {d_std:6.3f} | {sat_zero_l1_d:6.2f}% | {sat_high_l1_d:6.2f}%")
           
-          # --- Abs成分 ---
           a_comp = r_a_4ch[:, i, :]
           a_min, a_m, a_max, a_std = a_comp.min(), a_comp.mean(), a_comp.max(), a_comp.std()
           sat_zero_l1_a = get_sat_zero(a_comp)
           sat_high_l1_a = get_sat_high(a_comp)
           print(f" {name+'(Abs)':18} | {a_min:6.3f} / {a_m:6.3f} / {a_max:6.3f} / {a_std:6.3f} | {sat_zero_l1_a:6.2f}% | {sat_high_l1_a:6.2f}%")
 
-
-      # --- SECTION 5: ゲート適用直後の詳細分析 (スライス後の raw 信号強度) ---
       print("-" * 115)
       print(f"{'Component':38} | {'Min':>6} / {'Mean':>6} / {'Max':>6} / {'Std':>6} ")
       print("-" * 115)
 
-      # --- Diff Gated (RMSNorm直後) ---
       d_comp = diff_gated.detach()
       print(f" {'FM Diff (RMSNormed, before scaling)':37} | {d_comp.min():6.2f} / {d_comp.mean():6.2f} / {d_comp.max():6.2f} / {d_comp.std():6.2f}")
 
-      # --- Abs Gated (Gate適用後) ---
       a_comp = abs_gated.detach()
       print(f" {'FM Abs  (Gated, before scaling)':37} | {a_comp.min():6.2f} / {a_comp.mean():6.2f} / {a_comp.max():6.2f} / {a_comp.std():6.2f}")
 
-
-      # --- SECTION 6: L2入力信号のセクション別強度 (どのパスが支配的か) ---
       print("-" * 110)
       print(f"[Signal Strength (L2 Input)]")
       main_sqr_part = l2_input[:, 0:31].abs().mean().item()
@@ -722,8 +693,6 @@ class NNUE(pl.LightningModule):
 
       print(f" L2 In | Main(Sqr): {main_sqr_part:.4f} | Main(Raw): {main_raw_part:.4f} | FM(Diff): {fm_diff_part:.4f} | FM(Abs): {fm_abs_part:.4f}  | cross_feat: {cross_feat:.4f}")
 
-
-      # --- SECTION 7: L2入力信号の統計詳細テーブル ---
       print("-" * 110)
       print(f"{'Section':12} | {'Mean':>7} | {'AbsMean':>7} | {'Std':>7} | {'Max':>7} | {'Min':>7} | {'Zero%':>7} | {'High%':>7}")
       print("-" * 110)
@@ -732,10 +701,9 @@ class NNUE(pl.LightningModule):
           t = tensor.detach().float()
           t_abs = t.abs()
           sparsity = (t_abs < 0.01).float().mean().item() * 100
-          high_signal = (t > 0.95).float().mean().item() * 100 # 1.0に近いものをカウント
+          high_signal = (t > 0.95).float().mean().item() * 100
           print(f"{name:12} | {t.mean():7.3f} | {t_abs.mean():7.3f} | {t.std():7.3f} | {t.max():7.2f} | {t.min():7.2f} | {sparsity:6.1f}% | {high_signal:6.1f}%")
       
-      # l2_inputの構造に基づいた切り出し
       log_stats("Main(Sqr)",    l2_input[:, 0:31])
       log_stats("Main(Raw)",    l2_input[:, 31:62])
       log_stats("FM(Diff)",     l2_input[:, 62:94])
@@ -743,23 +711,16 @@ class NNUE(pl.LightningModule):
       log_stats("FM(Abs_Sqr)",  l2_input[:, 126:158])
       log_stats("cross_feat",   l2_input[:, 158:190])
 
-
-      # --- SECTION 8: 勾配統計 (G_Ratio: FM係数とメイン重みの学習バランス) ---
       if self.input.v.grad is not None:
-          # 1要素あたりの平均絶対勾配
           v_grad_mean = self.input.v.grad.abs().mean().item()
           m_grad_mean = self.input.weight.grad.abs().mean().item()
           g_ratio = v_grad_mean / (m_grad_mean + 1e-9)
           print(f"[Gradient] MeanAbs_V:{v_grad_mean:8.2e}, MeanAbs_M:{m_grad_mean:8.2e}, G_Ratio:{g_ratio:8.4f}")
 
-
-      # --- SECTION 9: パス別の重みノルム (正則化やスケーリングの確認) ---
       print(f"[Weights]  Diff_W:{self.layer_stacks.fm_diff.weight.norm():6.2f}, "
             f"Abs_W:{self.layer_stacks.fm_abs.weight.norm():6.2f}, "
             f"L2_W:{self.layer_stacks.l2.weight.norm():6.2f}")
 
-
-      # --- SECTION 10: 各レイヤー・パーツ別の詳細重み/勾配統計 ---
       w_input_c = self.input.weight.detach().cpu()
       g_input_c = self.input.weight.grad.detach().cpu() if self.input.weight.grad is not None else None
       b_input_c = self.input.bias.detach().cpu()
@@ -770,38 +731,29 @@ class NNUE(pl.LightningModule):
       pw_w = self.pair_weights.detach().cpu()
       pw_g = self.pair_weights.grad.detach().cpu() if self.pair_weights.grad is not None else None
       
-      # 実際の混合比率を Softmax で計算 [640, 3]
-      # 0:積, 1:差, 2:和
       pw_softmax = torch.softmax(pw_w, dim=2) 
 
-      # 特徴量分割点 (現在の構成に合わせて調整してください)
       S0, S1, S2 = 0, 12672, 203670
 
-
-      # --- [ADD] L1_Main と L1_Fact の合成重み・勾配の計算 ---
       l1_main_w = self.layer_stacks.l1.weight.detach().cpu()
       l1_fact_w = self.layer_stacks.l1_fact.weight.detach().cpu()
       
       l1_main_g = self.layer_stacks.l1.weight.grad.detach().cpu() if self.layer_stacks.l1.weight.grad is not None else None
       l1_fact_g = self.layer_stacks.l1_fact.weight.grad.detach().cpu() if self.layer_stacks.l1_fact.weight.grad is not None else None
 
-      # 先に安全にテンソルをCPUに取得する
       l1_main_b = self.layer_stacks.l1.bias.detach().cpu() if self.layer_stacks.l1.bias is not None else None
       l1_fact_b = self.layer_stacks.l1_fact.bias.detach().cpu() if self.layer_stacks.l1_fact.bias is not None else None
       
-      # クリッピング時と同じルールで拡張して足し算（重み）
       xs = l1_main_w.shape[0] // l1_fact_w.shape[0]
       ys = l1_main_w.shape[1] // l1_fact_w.shape[1]
       expanded_fact_w = l1_fact_w.repeat(xs, ys)
       l1_combined_w = l1_main_w + expanded_fact_w
 
-      # 勾配も同様に合成
       if l1_main_g is not None and l1_fact_g is not None:
           l1_combined_g = l1_main_g + l1_fact_g.repeat(xs, ys)
       else:
           l1_combined_g = l1_main_g if l1_main_g is not None else None
 
-      # バイアスも加算（取得した変数を使ってリピート拡張）
       if l1_main_b is not None and l1_fact_b is not None:
           bias_xs = l1_main_b.shape[0] // l1_fact_b.shape[0]
           expanded_fact_b = l1_fact_b.repeat(bias_xs)
@@ -809,20 +761,16 @@ class NNUE(pl.LightningModule):
       else:
           l1_combined_b = l1_main_b if l1_main_b is not None else l1_fact_b
 
-
-      # --- Layer Parts List ---
       parts = [
           ("W_input (All)   ", w_input_c, g_input_c, b_input_c),
           ("W_KSDG3 (Part)  ", w_input_c[S0:S1, :], g_input_c[S0:S1, :] if g_input_c is not None else None, b_input_c),
           ("W_HalfKA (Part) ", w_input_c[S1:S2, :], g_input_c[S1:S2, :] if g_input_c is not None else None, b_input_c),
           ("V_Factor (FM)   ", v_input_c, vg_input_c, None),
           ("Pair_W (Raw)      ", pw_w, pw_g, None),
+          ("router ", self.layer_stacks.router.weight.detach().cpu(), self.layer_stacks.router.weight.grad.detach().cpu() if self.layer_stacks.router.weight.grad is not None else None, self.layer_stacks.router.bias.detach().cpu()),
           ("L1_Main (Linear)", self.layer_stacks.l1.weight.detach().cpu(), self.layer_stacks.l1.weight.grad.detach().cpu() if self.layer_stacks.l1.weight.grad is not None else None, self.layer_stacks.l1.bias.detach().cpu()),
           ("L1_Fact         ", self.layer_stacks.l1_fact.weight.detach().cpu(), self.layer_stacks.l1_fact.weight.grad.detach().cpu() if self.layer_stacks.l1_fact.weight.grad is not None else None, self.layer_stacks.l1_fact.bias.detach().cpu()),
-
-          # 【ADD】合成後のレイヤー統計
           ("L1_Combined (Sum)", l1_combined_w, l1_combined_g, l1_combined_b),
-
           ("FM_Diff_Path    ", self.layer_stacks.fm_diff.weight.detach().cpu(), self.layer_stacks.fm_diff.weight.grad.detach().cpu() if self.layer_stacks.fm_diff.weight.grad is not None else None, self.layer_stacks.fm_diff.bias.detach().cpu()),
           ("FM_Abs_Path     ", self.layer_stacks.fm_abs.weight.detach().cpu(), self.layer_stacks.fm_abs.weight.grad.detach().cpu() if self.layer_stacks.fm_abs.weight.grad is not None else None, self.layer_stacks.fm_abs.bias.detach().cpu()),
           ("cross_proj ", self.layer_stacks.cross_proj.weight.detach().cpu(), self.layer_stacks.cross_proj.weight.grad.detach().cpu() if self.layer_stacks.cross_proj.weight.grad is not None else None, self.layer_stacks.cross_proj.bias.detach().cpu()),
@@ -834,7 +782,6 @@ class NNUE(pl.LightningModule):
           ("Output_Weight   ", self.layer_stacks.output.weight.detach().cpu(), self.layer_stacks.output.weight.grad.detach().cpu() if self.layer_stacks.output.weight.grad is not None else None, self.layer_stacks.output.bias.detach().cpu())
       ]
 
-      # 各フェーズごとの選ばれ方を統計に追加
       phase_names = ["Open", "Mid1", "Mid2", "End "]
       for p in range(4):
           parts.append((f"P_{phase_names[p]}_Mul   ", pw_softmax[p, :, 0], pw_g[p, :, 0], None))
@@ -846,14 +793,11 @@ class NNUE(pl.LightningModule):
       print("-" * 120)
 
       for name, w, g, b in parts:
-          # 勾配の統計 (要素数によるスケーリング)
           gm = (g.norm().item() / (g.numel()**0.5 + 1e-9)) if g is not None else 0.0
           ga = (g != 0).sum().item() if g is not None else 0
 
-          # 重みの統計
           wm, wmin, wmax, ws = w.mean().item(), w.min().item(), w.max().item(), w.std().item()
 
-          # バイアスの統計
           if b is not None and b.numel() > 0:
               bm, bmin, bmax = b.mean().item(), b.min().item(), b.max().item()
               bs = b.std().item() if b.numel() > 1 else 0.0
@@ -863,37 +807,26 @@ class NNUE(pl.LightningModule):
           print(f"{name:<18} | {gm:12.10f} {ga:<8} | {wm:+8.5f} {wmin:+8.5f} {wmax:+8.5f} {ws:8.5f} | {bm:+8.5f} {bmin:+8.5f} {bmax:+8.5f} {bs:8.5f}")
       print("-" * 120)
 
-
-      # --- SECTION 11: Attention 状態 (LCA: Lightweight Cross-Attention) ---
       att = self.layer_stacks.last_att_score
       att_mean, att_min, att_max, att_std = att.mean().item(), att.min().item(), att.max().item(), att.std().item()
 
       print(f"[Attention Status] dynamic_scale (FM-Filter)")
       print(f"  Mean: {att_mean:.4f} | Min: {att_min:.4f} | Max: {att_max:.4f} | Std: {att_std:.4f}")
-      # どの程度「極端に」絞っているかの分布（例：0.2以下、0.8以上）
       low_rate = (att < 0.2).float().mean().item() * 100
       high_rate = (att > 0.8).float().mean().item() * 100
       print(f"  Distribution: Low(<0.2): {low_rate:.1f}% | High(>0.8): {high_rate:.1f}%")
       print(f"  Current Temp (T) : {self.layer_stacks.last_lca_temp.item():.4f}")
 
-
-      # --- SECTION 12: LCA Meta-Learning (動的な温度パラメータの学習方向) ---
       if hasattr(self.layer_stacks, 'lca_temp'):
           temp_param = self.layer_stacks.lca_temp
           t_val = temp_param.item()
           t_grad = temp_param.grad.item() if temp_param.grad is not None else 0.0
           
-          # 勾配の向きの解釈: 
-          # T = T - lr * grad なので
-          # Grad > 0 => Tは減少する方向 => 判断を鋭く(0/1)したい
-          # Grad < 0 => Tは増加する方向 => 判断をマイルド(0.5)にしたい
           direction = "Sharper(0/1) ↓" if t_grad > 0 else "Milder(0.5) ↑"
           print(f"[LCA Meta-Learning]")
           print(f"  Current Temp (T) : {t_val:.4f}")
           print(f"  Temp Grad        : {t_grad:+.2e} [{direction}]")
 
-
-      # --- SECTION 13: 演算ブレンド戦略の詳細統計 (Mul/Diff/Sum の分布) ---
       def get_simple_stats(t):
           return {
               'avg': t.mean().item(),
@@ -911,7 +844,6 @@ class NNUE(pl.LightningModule):
       print(f"  - Diff | Avg: {s_diff['avg']:.1%} | Std: {s_diff['std']:.3f} | Range: [{s_diff['min']:.1%} - {s_diff['max']:.1%}]")
       print(f"  - Sum  | Avg: {s_sum['avg']:.1%} | Std: {s_sum['std']:.3f} | Range: [{s_sum['min']:.1%} - {s_sum['max']:.1%}]")
 
-      # 各フェーズごとの選ばれ方を統計に追加
       phase_names = ["Open", "Mid1", "Mid2", "End "]
       for p in range(4):
           avg_m = pw_softmax[p, :, 0].mean().item()
@@ -919,10 +851,7 @@ class NNUE(pl.LightningModule):
           avg_s = pw_softmax[p, :, 2].mean().item()
           print(f"  Phase {phase_names[p]} Mix Ratio -> Mul: {avg_m:.3f}, Diff: {avg_d:.3f}, Sum: {avg_s:.3f}")
 
-
-      # --- SECTION 14: バケット別詳細統計 (Gate vs Value 分離) ---
       def get_layer_stats(w, g, b):
-          # w, g, b は特定のバケットの特定の32次元スライス
           wm, wmin, wmax, ws = w.mean().item(), w.min().item(), w.max().item(), w.std().item()
           gm = (g.norm().item() / (g.numel()**0.5 + 1e-9)) if g is not None else 0.0
           ga = (g != 0).sum().item() if g is not None else 0
@@ -933,45 +862,33 @@ class NNUE(pl.LightningModule):
       print(f"{'Layer (Bucket)':<22} | {'Grad Mean':<12} {'Active':<8} | {'W_Mean':<8} {'W_Min':<8} {'W_Max':<9} {'W_Std':<7} | {'B_Mean':<8}")
       print("-" * 115)
       
-      # 対象バケット
       target_buckets = [0, 11]
       
       for b_idx in target_buckets:
-          # 64次元周期 (Gate: 0-31, Val: 32-63)
           base = b_idx * 64
 
-          # fm_diff と fm_abs をループ
           for name, layer in [("FM_Diff", self.layer_stacks.fm_diff), ("FM_Abs", self.layer_stacks.fm_abs)]:
               w_all = layer.weight.detach().cpu()
               g_all = layer.weight.grad.detach().cpu() if layer.weight.grad is not None else None
               b_all = layer.bias.detach().cpu()
 
-              # Gate (前半32次元)
               p_gate = get_layer_stats(w_all[base : base+32], 
                                  g_all[base : base+32] if g_all is not None else None,
                                  b_all[base : base+32])
-              # Val (後半32次元)
               p_val = get_layer_stats(w_all[base+32 : base+64], 
                                 g_all[base+32 : base+64] if g_all is not None else None,
                                 b_all[base+32 : base+64])
 
-              # 表示
               print(f"{name+'_Gate(B'+str(b_idx)+')':<22} | {p_gate[0]:12.10f} {p_gate[1]:<8} | {p_gate[2]:+8.5f} {p_gate[3]:+8.5f} {p_gate[4]:+8.5f} {p_gate[5]:8.5f} | {p_gate[6]:+8.5f}")
               print(f"{name+'_Val (B'+str(b_idx)+')':<22} | {p_val[0]:12.10f} {p_val[1]:<8} | {p_val[2]:+8.5f} {p_val[3]:+8.5f} {p_val[4]:+8.5f} {p_val[5]:8.5f} | {p_val[6]:+8.5f}")
 
-          if b_idx == 0: print("-" * 115) # バケット間の区切り
+          if b_idx == 0: print("-" * 115)
       print("-" * 115)
 
-
-      # --- SECTION 15: Inter-Gating Status (実効的な門戸開放率) ---
-      # 1. AbsPath への門戸開放率 (実効値)
       open_to_abs = torch.sigmoid(gate_a).mean().item() * 100.0
-      
-      # 2. MainPath への門戸開放率 (実効値： 0.5 + 0.5 * sigmoid)
       eff_sigmoid_d = 0.5 + 0.5 * torch.sigmoid(gate_d)
       open_to_main = eff_sigmoid_d.mean().item() * 100.0
 
-      # 3. ゲートのsharpness
       sharpness_d = torch.sigmoid(gate_d).var().item()
       sharpness_a = torch.sigmoid(gate_a).var().item()
 
@@ -979,8 +896,6 @@ class NNUE(pl.LightningModule):
       print(f"Abs (Filtered by Abs-Gate) Open: {open_to_abs:.2f}% (sharp:{sharpness_a:.3f})")
       print(f"Main (Filtered by Diff-Gate) Open: {open_to_main:.2f}% (sharp:{sharpness_d:.3f})")
 
-
-      # --- SECTION 16: 6-Channel Phase Gate (適応制御の状態) ---
       print(f"--- 6-Channel Phase Gate Status (Adaptive Control) ---")
       print(f"{'Name':<8} | {'Mean':<5} | {'Std':<5} | {'Range':<11} | {'Low%':<5} | {'High%':<5}")
       print("-" * 62)
@@ -996,59 +911,47 @@ class NNUE(pl.LightningModule):
 
           print(f"{name:<8} | {mean:.3f} | {std:.3f} | [{r_min:.2f}-{r_max:.2f}] | {low:>4.1f}% | {high:>5.1f}%")
 
-
-      # --- SECTION 17: 個別バケット詳細ログの呼び出し ---
+      # ★ router_indices を使用してバケット別ログを出力
       self._log_bucket_stats(l3_out, l1_main_bp, diff_gated, layer_stack_indices, gate_d, gate_a)
 
 
   def _log_bucket_stats(self, l3_out, l1_main_bp, diff_gated, layer_stack_indices, gate_d, gate_a):
     with torch.no_grad():
-      # --- SECTION 1: バケット分布と最終出力の計算 ---
       batch_size = layer_stack_indices.size(0)
       bucket_counts = torch.bincount(layer_stack_indices, minlength=12)
       bucket_ratios = (bucket_counts.float() / batch_size) * 100.0
 
-      # 最終評価値の算出 (DeepPath + MainBypass)
       final_output = l3_out + l1_main_bp
-      # センチポーン(cp)に変換 (self.nnue2score = 600.0)
       final_cp = final_output * self.nnue2score
 
-      # 全バケットの Blend Alpha (DeepPath採用率) を取得
       all_alphas_pct = torch.sigmoid(self.layer_stacks.blend).cpu().numpy() * 100
 
-      print(f"[Bucket-wise FM Value & Gate Analysis]")
+      print(f"[Bucket-wise FM Value & Gate Analysis (Router-based)]")
       print("-" * 110)
-      header = f"{'B_ID':<4} | Samples% | {'Eval(cp)':<9} | {'L1_Main':<8} | {'FM_Diff_V':<12} | {'FM_Abs_V':<12} | {'AbsOpen(GatebyAbs)%':<10} | {'MainOpen(GatebyDiff)%':<10} | {'L2_Layer':<8} | {'L3(Deep)%':<8} | {'Blend(Alpha)%':<10}"
+      header = f"{'B_ID':<4} | Samples% | {'Eval(avg_cp,abs_cp)':<9} | {'L1_Main':<8} | {'FM_Diff_V':<12} | {'FM_Abs_V':<12} | {'AbsOpen(GatebyAbs)%':<10} | {'MainOpen(GatebyDiff)%':<10} | {'L2_Layer':<8} | {'L3(Deep)%':<8} | {'Blend(Alpha)%':<10}"
       print(header)
       print("-" * 110)
 
-      # 重みと勾配の事前取得 (統計計算用)
       w1 = self.layer_stacks.l1.weight.detach().cpu()
       wd = self.layer_stacks.fm_diff.weight.detach().cpu()
       wa = self.layer_stacks.fm_abs.weight.detach().cpu()
 
-      # 勾配がある場合は取得、なければゼロ埋め
       gd_grad = self.layer_stacks.fm_diff.weight.grad.detach().cpu() if self.layer_stacks.fm_diff.weight.grad is not None else torch.zeros_like(wd)
       ga_grad = self.layer_stacks.fm_abs.weight.grad.detach().cpu() if self.layer_stacks.fm_abs.weight.grad is not None else torch.zeros_like(wa)
 
       w2 = self.layer_stacks.l2.weight.detach().cpu()
 
-
-      # --- SECTION 2: バケットごとの詳細ループ ---
       for i in range(self.layer_stacks.count):
         mask = (layer_stack_indices == i)
         if not mask.any():
             continue
 
-        # 出現頻度
         s_ratio = bucket_ratios[i].item()
 
-        # インデックス計算 (L1:32次元周期, FM:64次元周期(GLU), L2:96次元周期)
         s1, e1 = i * 32, (i + 1) * 32
         sf, ef = i * 64, (i + 1) * 64
         s2, e2 = i * 96, (i + 1) * 96
 
-        # FM Value側の重み(w)と勾配(g)の統計 (GLUの後半32次元がValueに相当)
         md_w = wd[sf+32:ef].abs().mean().item()
         md_g = gd_grad[sf+32:ef].abs().mean().item()
 
@@ -1058,37 +961,27 @@ class NNUE(pl.LightningModule):
         b_mask = (layer_stack_indices == i)
 
         if b_mask.sum() > 0:
-            # このバケットに属する局面の平均 Eval
             avg_cp = final_cp[b_mask].mean().item()
             abs_cp = final_cp[b_mask].abs().mean().item()
 
-            # ゲートの開放率 (実際にどの程度の信号を通しているか)
-            # AbsGate (Absを通す率): sigmoid(gate_a)
             open_abs = torch.sigmoid(gate_a[b_mask]).mean().item() * 100
-            # DiffGate (Mainを通す率): 0.5 + 0.5 * sigmoid(gate_d)
             open_main = (0.5 + 0.5 * torch.sigmoid(gate_d[b_mask])).mean().item() * 100
 
-            # DeepPath(L3)が最終出力に占める寄与度
             fm_r = (l3_out[b_mask].abs().mean().item() / 
                    (l3_out[b_mask].abs().mean().item() + l1_main_bp[b_mask].abs().mean().item() + 1e-9)) * 100
         else:
-            avg_cp, abs_cp, open_abs, open_main, fm_r = 0.0, 0.0, 0.0
+            avg_cp, abs_cp, open_abs, open_main, fm_r = 0.0, 0.0, 0.0, 0.0, 0.0
 
-        # このバケットのブレンド係数
         current_alpha = all_alphas_pct[i]
 
-        # 出力
-        print(f"B{i:02d} | {s_ratio:5.1f}% | {avg_cp:+6.1f}({abs_cp:6.1f}) | {w1[s1:e1].abs().mean():.3f} | {md_w:.3f}|{md_g:.1e} | {ma_w:.3f}|{ma_g:.1e} | {open_abs:5.1f}% | {open_main:5.1f}% | {w2[s2:e2].abs().mean():.3f}   | {fm_r:5.1f}% | {current_alpha:5.1f}%")
+        print(f"B{i:02d} | {s_ratio:5.1f}% | {avg_cp:+7.1f}({abs_cp:6.1f}) | {w1[s1:e1].abs().mean():.3f} | {md_w:.3f}|{md_g:.1e} | {ma_w:.3f}|{ma_g:.1e} | {open_abs:5.1f}% | {open_main:5.1f}% | {w2[s2:e2].abs().mean():.3f}   | {fm_r:5.1f}% | {current_alpha:5.1f}%")
       print("-" * 110)
 
-
-      # --- SECTION 3: Bucket-wise Phase Detail (6チャンネル適応制御) ---
-      print("\n[Bucket-wise Phase Gate Analysis (6-Channel)]")
+      print("\n[Bucket-wise Phase Gate Analysis (6-Channel Router-based)]")
       print("-" * 110)
-      print(f"{'B_ID':<4} | {'MSqr':<5} | {'MRaw':<5} | {'Diff':<5} | {'AbsR':<5} | {'AbsS':<5} | {'Cross':<5} | {'Low%':<5} | {'High%':<6} | {'Samples%':<8} | {'AttScore(mean/std)':<18} | {'Loss':<8} ")
+      print(f"{'B_ID':<4} | {'MSqr':<5} | {'MRaw':<5} | {'Diff':<5} | {'AbsR':<5} | {'AbsS':<5} | {'Cross':<5} | {'Low%':<5} | {'High%':<6} | {'Samples%':<8} | {'AttScore(mean/std)':<18} | {'ValBaseLoss':<8} ")
       print("-" * 110)
 
-      # バッチ全体のサンプル数を取得
       total_samples = layer_stack_indices.size(0)
 
       for i in range(12):
@@ -1096,104 +989,282 @@ class NNUE(pl.LightningModule):
           count = mask.sum().item()
           if count == 0: continue
 
-          # このバケットに属する局面の 6ch ゲート平均値
           p_batch = self.layer_stacks.last_phase[mask]
-          p_means = p_batch.mean(dim=0) # [6]
+          p_means = p_batch.mean(dim=0)
 
-          # 飽和統計 (どれくらい 0/1 に張り付いているか)
           low_r  = (p_batch < 0.2).float().mean().item() * 100
           high_r = (p_batch > 0.8).float().mean().item() * 100
           s_ratio = (count / total_samples) * 100
 
-          # 6つの信号 (MainSqr, MainRaw, Diff, AbsRaw, AbsSqr, Cross) の平均値
           m_sq, m_ra, f_di, f_ar, f_as, crs = p_means.tolist()
 
-          # LCA (Cross-Attention) スコアの統計
           att = self.layer_stacks.last_att_score[mask]
 
-          # Loss
           if torch.is_tensor(self.last_bucket_losses):
-              loss_val = self.last_bucket_losses[i].cpu().item() # ループ内で個別に取る場合
+              loss_val = self.last_bucket_losses[i].cpu().item()
           else:
-              loss_val = self.last_bucket_losses[i] # すでにリスト化されている場合
+              loss_val = self.last_bucket_losses[i] if self.last_bucket_losses is not None else 0.0
 
           print(f"B{i:02d}  | {m_sq:.3f} | {m_ra:.3f} | {f_di:.3f} | {f_ar:.3f} | {f_as:.3f} | {crs:.3f} | {low_r:>4.1f}% | {high_r:>5.1f}% | {s_ratio:>7.1f}% | {att.mean().item():.3f} / {att.std().item():.3f} | {loss_val:>7.5f} ")
       print("-" * 110)
 
 
   def step_(self, batch, batch_idx, loss_type):
-      # --- SECTION 1: データ展開とパラメータの準備 ---
-      self._clip_weights()
-      us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material, kif_group_id = batch
+        self._clip_weights()
+        us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material, kif_group_id = batch
 
-      # --- SECTION 2: Lambda の決定 ---
-      actual_lambda = self._get_actual_lambda(loss_type)
+        actual_lambda = self._get_actual_lambda(loss_type)
 
-      # --- SECTION 3: ネットワーク出力の計算と勝率変換 ---
-      scorenet = self(us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices)
-      scorenet = scorenet * self.nnue2score
+        scorenet, router_logits, all_final_outputs = self(us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices)
+        scorenet = scorenet * self.nnue2score
 
-      # シグモイド関数を用いて勝率(0.0~1.0)に変換
-      q  = ( scorenet - self.offset1) / self.in_scaling
-      qm = (-scorenet - self.offset2) / self.in_scaling
-      qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+        # --- 選ばれたバケットの勝率計算 ---
+        q  = ( scorenet - self.offset1) / self.in_scaling
+        qm = (-scorenet - self.offset2) / self.in_scaling
+        qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
 
-      # 教師スコア(Search Score)も勝率空間へ変換
-      p  = ( score - self.offset1) / self.out_scaling
-      pm = (-score - self.offset2) / self.out_scaling
-      pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
+        # --- 教師データの勝率計算 (pt) ---
+        p  = ( score - self.offset1) / self.out_scaling
+        pm = (-score - self.offset2) / self.out_scaling
+        pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
 
-      # ターゲット作成 (教師勝率 + 実際の対局結果)
-      pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
+        pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
 
-      # --- SECTION 4: 各種損失の計算 ---
-      kif_group_id_flat = kif_group_id.view(-1)
 
-      # 1. Base Loss (ID: 1, 2 対象)
-      base_loss = self._compute_base_loss(pt, qf, pf, kif_group_id_flat)
+        # --- 教師誘導 Router Loss の計算 & メトリクス取得 ---
+        router_ce_loss, r_info = self._compute_router_teacher_loss(all_final_outputs, router_logits, pt)
 
-      # Pairwise / Listwise ソート用の共通データ準備 (ID: 3 対象)
-      pairwise_mask = (kif_group_id_flat == 3)
-      n_pairwise = pairwise_mask.sum().item()
+        # --- 定期ログ出力 (詳細デバッグ) ---
+        if self.training and (self.global_step % 500 == 0):
+            self._print_router_bucket_debug(
+                r_info['best_bucket_indices'], 
+                r_info['pred_bucket_indices'], 
+                r_info['oracle_gaps'],
+                router_logits  # <- 追加
+            )
 
-      sorted_data = self._prepare_sorted_data(
-          pairwise_mask, n_pairwise, pt, qf, score, scorenet, layer_stack_indices, material
-      )
 
-      # 2. Pairwise Loss (ID: 3 対象)
-      pairwise_loss, pair_metrics = self._compute_pairwise_loss(sorted_data, n_pairwise, pt.device)
+        kif_group_id_flat = kif_group_id.view(-1)
+        base_loss = self._compute_base_loss(pt, qf, pf, kif_group_id_flat)
 
-      # 3. Listwise Loss (ID: 3 対象)
-      listwise_loss, pt_range = self._compute_listwise_loss(sorted_data, n_pairwise, pt.device)
+        pairwise_mask = (kif_group_id_flat == 3)
+        n_pairwise = pairwise_mask.sum().item()
 
-      # --- SECTION 5: 最終損失の結合 ---
-      pairwise_weight = 0.010
-      listwise_weight = 0.030
-      loss = base_loss + (pairwise_weight * pairwise_loss) + (listwise_weight * listwise_loss)
+        # Routerの決定結果をバケットインデックスとして後続処理・集計に活用
+        active_indices = getattr(self.layer_stacks, 'last_routing_indices', layer_stack_indices)
 
-      # 4. Phase Gate (適応制御) 正則化ペナルティの加算
-      phase_penalty = self._compute_phase_penalty()
-      # 必要に応じて適用
-      loss = loss + 0.002 * phase_penalty
+        sorted_data = self._prepare_sorted_data(
+            pairwise_mask, n_pairwise, pt, qf, score, scorenet, active_indices, material
+        )
 
-      # --- SECTION 6: [検証用] バケット別損失の統計集計 ---
-      self._update_bucket_stats(pt, qf, layer_stack_indices, loss_type)
+        pairwise_loss, pair_metrics = self._compute_pairwise_loss(sorted_data, n_pairwise, pt.device)
+        listwise_loss, pt_range = self._compute_listwise_loss(sorted_data, n_pairwise, pt.device)
+        phase_penalty = self._compute_phase_penalty()
 
-      # --- SECTION 7: ログ出力・デバッグ ---
-      self._log_debug_info(
-          loss_type, loss, base_loss, pairwise_loss, listwise_loss,
-          pt, qf, score, scorenet, layer_stack_indices, kif_group_id_flat, actual_lambda,
-          pair_metrics, pt_range
-      )
+        # 既存の Router Loss (ロードバランシング・Margin)
+        router_loss, router_margin_loss = self._compute_router_loss(margin=0.3)
+        
+        # Soft Orthogonality Loss
+        ortho_loss = self._compute_ortho_loss(threshold=0.2)
 
-      return loss
+        # --- Loss 重み係数の定義 ---
+        weights = {
+            'pairwise': 0.0100,
+            'listwise': 0.0300,
+            'phase': 0.0020,
+            'router': 0.0010,
+            'router_margin': 0.0010,
+            'router_ce': 0.0010,
+            'ortho': 0.0010,
+        }
 
-  # =========================================================================
-  #  Helper Methods
-  # =========================================================================
+        # --- Total Loss の計算 ---
+        loss = base_loss \
+             + (weights['pairwise']      * pairwise_loss) \
+             + (weights['listwise']      * listwise_loss) \
+             + (weights['phase']         * phase_penalty) \
+             + (weights['router']        * router_loss) \
+             + (weights['router_margin'] * router_margin_loss) \
+             + (weights['router_ce']     * router_ce_loss) \
+             + (weights['ortho']         * ortho_loss)
+
+        # バケット別損失集計に Router の結果を使用
+        self._update_bucket_stats(pt, qf, active_indices, loss_type)
+
+        self._log_debug_info(
+            loss_type, loss, base_loss, pairwise_loss, listwise_loss,
+            pt, qf, score, scorenet, active_indices, kif_group_id_flat, actual_lambda,
+            pair_metrics, pt_range, router_loss, phase_penalty, ortho_loss, router_margin_loss, 
+            router_ce_loss, r_info['router_acc'], r_info['gap_mean'], r_info['gap_median'], r_info['gap_max'],
+            r_info['gw_mean'], r_info['gw_median'], r_info['gw_gt_05'], r_info['gw_gt_08'], r_info['router_acc_high'],
+            weights
+        )
+
+        return loss
+
+
+  def _compute_router_teacher_loss(self, all_final_outputs, router_logits, pt):
+        """
+        全バケット出力からOracleターゲットを算出し、教師誘導 Router Loss (Hard CE + Soft KL) 
+        および各種メトリクスを計算する。
+        """
+        with torch.no_grad():
+            # 全12バケットの出力を評価値スケールに変換: [B, 12]
+            all_scorenet = all_final_outputs * self.nnue2score
+            
+            # 全12バケットの勝率 (all_qf) を一括計算: [B, 12]
+            all_q  = ( all_scorenet - self.offset1) / self.in_scaling
+            all_qm = (-all_scorenet - self.offset2) / self.in_scaling
+            all_qf = 0.5 * (1.0 + all_q.sigmoid() - all_qm.sigmoid())
+
+            # 教師ターゲット pt: [B, 1] と全バケット勝率: [B, 12] の絶対誤差を比較
+            bucket_errors = torch.abs(all_qf - pt.view(-1, 1))
+
+            # Top1 と Top2 の誤差差 (Gap) を算出
+            sorted_errors, _ = torch.sort(bucket_errors, dim=-1)
+            oracle_gaps = sorted_errors[:, 1] - sorted_errors[:, 0]
+
+            # 最も誤差が小さかったバケット (Oracle) および予測バケットの取得
+            best_bucket_indices = torch.argmin(bucket_errors, dim=-1)
+            pred_bucket_indices = torch.argmax(router_logits, dim=-1)
+            router_acc = (pred_bucket_indices == best_bucket_indices).float().mean()
+
+        # 1. Gap Weight (Sigmoid による連続的・滑らかな重み付け)
+        raw_gap_weight = torch.sigmoid((oracle_gaps - 0.008) / 0.003)
+        gap_weight = raw_gap_weight * 0.95 + 0.05
+
+        # 2. Hard Teacher (Gap 重み付き Cross-Entropy)
+        ce_per_sample = F.cross_entropy(router_logits, best_bucket_indices, reduction='none')
+        gap_weight_sum = gap_weight.sum()
+        if gap_weight_sum > 1e-6:
+            router_ce_loss = (ce_per_sample * gap_weight).sum() / gap_weight_sum
+        else:
+            router_ce_loss = ce_per_sample.mean()
+
+        # 3. Soft Teacher (誤差ベースの KL Divergence)
+        temp = 0.005
+        relative_errors = bucket_errors - bucket_errors.min(dim=1, keepdim=True).values
+        soft_targets = F.softmax(-relative_errors / temp, dim=-1)
+
+        router_logprob = F.log_softmax(router_logits, dim=-1)
+        router_kl_loss = F.kl_div(router_logprob, soft_targets, reduction='batchmean')
+
+        # 4. 損失の統合 (Hard CE を主軸にしたハイブリッド化)
+        alpha, beta = 0.9, 0.1
+        router_ce_loss = alpha * router_ce_loss + beta * router_kl_loss
+
+        # ログ出力タイミング（例: 100ステップ毎）のみ統計計算を行う
+        if self.training and (self.global_step % 100 == 0):
+            with torch.no_grad():
+                gw_mean   = gap_weight.mean().item()
+                gw_median = gap_weight.median().item()
+                gw_gt_05  = (gap_weight > 0.5).float().mean().item() * 100
+                gw_gt_08  = (gap_weight > 0.8).float().mean().item() * 100
+
+                high_gap_mask = gap_weight > 0.5
+                if high_gap_mask.sum() > 0:
+                    router_acc_high = (pred_bucket_indices[high_gap_mask] == best_bucket_indices[high_gap_mask]).float().mean().item() * 100
+                else:
+                    router_acc_high = 0.0
+        else:
+            # ログを出力しないステップではダミー値（またはNone）を入れておく
+            gw_mean = gw_median = gw_gt_05 = gw_gt_08 = router_acc_high = 0.0
+
+        metrics = {
+            'router_acc': router_acc,
+            'gap_mean': oracle_gaps.mean().item(),
+            'gap_median': oracle_gaps.median().item(),
+            'gap_max': oracle_gaps.max().item(),
+            'gw_mean': gw_mean,
+            'gw_median': gw_median,
+            'gw_gt_05': gw_gt_05,
+            'gw_gt_08': gw_gt_08,
+            'router_acc_high': router_acc_high,
+            'best_bucket_indices': best_bucket_indices,
+            'pred_bucket_indices': pred_bucket_indices,
+            'oracle_gaps': oracle_gaps,
+        }
+
+        return router_ce_loss, metrics
+
+  def _print_router_bucket_debug(self, best_bucket_indices, pred_bucket_indices, oracle_gaps, router_logits):
+        """定期ログ用: 詳細なバケット別 Gap / 精度解析を出力する"""
+        with torch.no_grad():
+            num_buckets = self.layer_stacks.count
+
+            # --- Router Softmax 確率の計算 ---
+            router_probs = F.softmax(router_logits, dim=-1) # [B, num_buckets]
+
+            oracle_counts = torch.bincount(best_bucket_indices, minlength=num_buckets)
+            pred_counts   = torch.bincount(pred_bucket_indices, minlength=num_buckets)
+
+            is_correct = (pred_bucket_indices == best_bucket_indices)
+            correct_counts = torch.bincount(best_bucket_indices[is_correct], minlength=num_buckets)
+            per_bucket_acc = (correct_counts.float() / (oracle_counts.float() + 1e-8) * 100)
+
+            best_gap_means, pred_gap_means, oracle_prob_means = [], [], []
+            for b in range(num_buckets):
+                b_mask = (best_bucket_indices == b)
+                b_gap = oracle_gaps[b_mask].mean().item() if b_mask.any() else float('nan')
+                best_gap_means.append(round(b_gap, 6))
+
+                # --- 変更点: * 100 して % 表記（小数第1位まで）にする ---
+                b_prob = (router_probs[b_mask, b].mean().item() * 100) if b_mask.any() else float('nan')
+                oracle_prob_means.append(round(b_prob, 1))
+
+                p_mask = (pred_bucket_indices == b)
+                p_gap = oracle_gaps[p_mask].mean().item() if p_mask.any() else float('nan')
+                pred_gap_means.append(round(p_gap, 6))
+
+            pred_cond_acc = []
+            for b in range(num_buckets):
+                p_mask = (pred_bucket_indices == b)
+                correct_when_pred = (best_bucket_indices[p_mask] == b).float().mean().item() * 100 if p_mask.any() else float('nan')
+                pred_cond_acc.append(round(correct_when_pred, 2))
+
+            high_gap_thr = 0.01
+            high_gap_mask = oracle_gaps > high_gap_thr
+            high_gap_acc_per_bucket = []
+            for b in range(num_buckets):
+                mask = (best_bucket_indices == b) & high_gap_mask
+                acc = (pred_bucket_indices[mask] == best_bucket_indices[mask]).float().mean().item() * 100 if mask.any() else float('nan')
+                high_gap_acc_per_bucket.append(round(acc, 2))
+
+            pred_gap_correct, pred_gap_wrong = [], []
+            for b in range(num_buckets):
+                p_mask = (pred_bucket_indices == b)
+                if p_mask.any():
+                    correct_mask = p_mask & (best_bucket_indices == pred_bucket_indices)
+                    wrong_mask = p_mask & (best_bucket_indices != pred_bucket_indices)
+                    mean_correct = oracle_gaps[correct_mask].mean().item() if correct_mask.any() else float('nan')
+                    mean_wrong = oracle_gaps[wrong_mask].mean().item() if wrong_mask.any() else float('nan')
+                else:
+                    mean_correct, mean_wrong = float('nan'), float('nan')
+                pred_gap_correct.append(round(mean_correct, 6))
+                pred_gap_wrong.append(round(mean_wrong, 6))
+
+            conf_mat = torch.zeros((num_buckets, num_buckets), dtype=torch.int64)
+            for o, p in zip(best_bucket_indices.tolist(), pred_bucket_indices.tolist()):
+                conf_mat[o, p] += 1
+
+        print("\n[BUCKET DISTRIBUTION DEBUG]")
+        print(f"  Oracle Counts (正解件数) : {oracle_counts.tolist()}")
+        print(f"  Pred Counts   (予測件数) : {pred_counts.tolist()}")
+        print(f"  Bucket Accs   (精度 % )  : {[round(a,1) for a in per_bucket_acc.tolist()]}")
+        print(f"  Oracle Target Probs (正解確率 %): {oracle_prob_means}")  # <- % 表記
+        print(f"  Best Gaps     (正解時Gap): {best_gap_means}")
+        print(f"  Pred Gaps     (予測時Gap): {pred_gap_means}")
+        print(f"  Pred-Cond Acc (% when Pred=b): {pred_cond_acc}")
+        print(f"  HighGap Acc (gap>{high_gap_thr}) : {high_gap_acc_per_bucket}")
+        print(f"  Pred Gap Mean (when correct) : {pred_gap_correct}")
+        print(f"  Pred Gap Mean (when wrong)   : {pred_gap_wrong}")
+        print("\n  Confusion Matrix (rows=Oracle, cols=Pred):")
+        for i in range(num_buckets):
+            row = conf_mat[i].tolist()
+            print(f"    B{i:02d}: {row}")
+
 
   def _get_actual_lambda(self, loss_type):
-      """Lambda の動的／固定設定を取得"""
       lambda_dict = {
           'val_loss_lambda1.0': 1.0,
           'val_loss_lambda0.0': 0.0,
@@ -1206,22 +1277,19 @@ class NNUE(pl.LightningModule):
       return self.start_lambda + (self.end_lambda - self.start_lambda) * (self.current_epoch / self.max_epoch)
 
   def _compute_base_loss(self, pt, qf, pf, kif_group_id_flat):
-      """ベースとなる点推定損失の計算 (kif_group_id == 1, 2)"""
       loss_elements = torch.pow(torch.abs(pt - qf), 2.5)
       loss_elements = loss_elements * ((qf > pt) * self.adjust_loss + 1)
 
       weights = 1 + (2.0**1.2 - 1) * torch.pow((pf - 0.5) ** 2 * pf * (1 - pf), 0.8)
       weights_flat = weights.view(-1)
 
-      # Base Loss は 1 と 2 のみ
       base_loss_mask = (kif_group_id_flat == 1) | (kif_group_id_flat == 2)
 
       if base_loss_mask.any():
           return (loss_elements.view(-1)[base_loss_mask] * weights_flat[base_loss_mask]).sum() / weights_flat[base_loss_mask].sum()
       return torch.tensor(0.0, device=pt.device)
 
-  def _prepare_sorted_data(self, pairwise_mask, n_pairwise, pt, qf, score, scorenet, layer_stack_indices, material):
-      """Pairwise/Listwise計算用にデータを抽出し、ソートして返す (kif_group_id == 3 対象)"""
+  def _prepare_sorted_data(self, pairwise_mask, n_pairwise, pt, qf, score, scorenet, active_indices, material):
       if n_pairwise <= 1:
           return None
 
@@ -1229,7 +1297,7 @@ class NNUE(pl.LightningModule):
       qf_p = qf.view(-1)[pairwise_mask]
       score_p = score.view(-1)[pairwise_mask]
       scorenet_p = scorenet.view(-1)[pairwise_mask]
-      lsind_p = layer_stack_indices.view(-1)[pairwise_mask]
+      lsind_p = active_indices.view(-1)[pairwise_mask]
       material_p = material.view(-1)[pairwise_mask]
 
       if self.training and self.global_step % 500 == 0:
@@ -1237,8 +1305,9 @@ class NNUE(pl.LightningModule):
           print(f"  [material_p] Min: {material_p.min().item():.1f} | Max: {material_p.max().item():.1f} | Mean: {material_p.mean().item():.1f}")
           print(f"  [pt_p]       Min: {pt_p.min().item():.4f} | Max: {pt_p.max().item():.4f}")
 
-      # ソートキーは「material, pt」
-      sort_key = material_p + pt_p
+      #sort_key = material_p + pt_p
+      sort_key = pt_p
+
       sorted_indices = torch.argsort(sort_key)
 
       return {
@@ -1251,7 +1320,6 @@ class NNUE(pl.LightningModule):
       }
 
   def _compute_pairwise_loss(self, sorted_data, n_pairwise, device):
-      """ミニバッチ内擬似ペアワイズ損失の計算"""
       default_metrics = {
           'total_valid_pairs': 0, 'all_pred_diffs': [], 'all_target_directions': [],
           'all_value_gaps': [], 'all_num_equals': 0, 'all_valid_lsinds': [], 'all_diff_abs': [],
@@ -1287,7 +1355,8 @@ class NNUE(pl.LightningModule):
 
           diff_abs = (pt_A - pt_B).abs()
 
-          tol = torch.where(lsind_true_A < 4, 400, torch.where(lsind_true_A < 8, 200, 100))
+          #tol = torch.where(lsind_true_A < 4, 400, torch.where(lsind_true_A < 8, 200, 100))
+          tol = 10000
           valid_pair_mask = (diff_abs > 0.003) & (diff_abs <= 0.10) & ((material_A - material_B).abs() <= tol)
 
           if valid_pair_mask.any():
@@ -1298,25 +1367,20 @@ class NNUE(pl.LightningModule):
               pair_weight_curve = torch.sigmoid((diff_abs - 0.005) * 150) * torch.sigmoid((0.05 - diff_abs) * 120)
               scale = 2.0 + 3.0 * torch.exp(-(diff_abs / 0.02)**2)
 
-              # 1. [方向の損失]
               direction_loss = -F.logsigmoid(target_direction * pred_diff * scale)
 
-              # 2. [値の損失]
               true_cp_compressed = torch.tanh((cp_true_A - cp_true_B) / 400.0)
               pred_cp_compressed = torch.tanh((cp_pred_A - cp_pred_B) / 400.0)
               value_loss_cp = F.smooth_l1_loss(pred_cp_compressed, true_cp_compressed, reduction="none", beta=0.1)
 
-              # 3. [ハイブリッド結合]
               raw_pairwise = (direction_loss + 0.6 * value_loss_cp) * pair_weight_curve
               equal_penalty = pred_diff.pow(2) * 1.0
               pairwise_loss_all = torch.where(target_direction != 0, raw_pairwise, equal_penalty)
 
-              # 集計
               total_pairwise_loss += pairwise_loss_all[valid_pair_mask].sum()
               valid_cnt = valid_pair_mask.sum().item()
               total_valid_pairs += valid_cnt
 
-              # 評価メトリクス用
               all_pred_diffs.append(pred_diff[valid_pair_mask].detach())
               all_target_directions.append(target_direction[valid_pair_mask].detach())
               all_num_equals += num_equal
@@ -1340,13 +1404,15 @@ class NNUE(pl.LightningModule):
       return pairwise_loss, metrics
 
   def _compute_listwise_loss(self, sorted_data, n_pairwise, device):
-      """マルチウィンドウ Listwise 損失の計算"""
       if sorted_data is None:
           return torch.tensor(0.0, device=device), None
 
       list_size = 6
       temperature = 0.15
-      stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8]
+
+      #stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8]
+      stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 
+                      21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
 
       pt_s, qf_s = sorted_data['pt'], sorted_data['qf']
       mat_s, lsind_s = sorted_data['material'], sorted_data['lsind']
@@ -1370,9 +1436,9 @@ class NNUE(pl.LightningModule):
           mat_lists = mat_blocks[:, ::stride]
           lsind_lists = lsind_blocks[:, ::stride]
 
-          # フィルタリング判定
           lsind_ref = lsind_lists[:, 0]
-          tol = torch.where(lsind_ref < 4, 400, torch.where(lsind_ref < 8, 200, 100))
+          #tol = torch.where(lsind_ref < 4, 400, torch.where(lsind_ref < 8, 200, 100))
+          tol = 10000
           material_mask = (mat_lists.max(dim=1).values - mat_lists.min(dim=1).values) <= tol
 
           pt_range_current = pt_lists.max(dim=1).values - pt_lists.min(dim=1).values
@@ -1400,7 +1466,6 @@ class NNUE(pl.LightningModule):
       return torch.tensor(0.0, device=device), None
 
   def _compute_phase_penalty(self):
-      """Phase Gate (適応制御) への正則化ペナルティの計算"""
       phase = getattr(self.layer_stacks, 'current_phase_for_loss', None)
       if phase is None:
           return 0.0
@@ -1408,23 +1473,91 @@ class NNUE(pl.LightningModule):
       p_means = phase.mean(dim=0)
       p_stds  = phase.std(dim=0)
 
-      # 1. 全体平均を 0.5 に近づける制約
       overall_mean = p_means.mean() 
       mean_penalty = (overall_mean - 0.5) ** 2
 
-      # 2. 境界値ペナルティ: 各チャンネルの平均が極端（0.05未満 or 0.95超）になるのを防ぐ
       mean_bounds_penalty = torch.mean(
           torch.clamp(p_means - 0.95, min=0) ** 2
           + torch.clamp(0.05 - p_means, min=0) ** 2
       )
 
-      # 3. 分散ペナルティ: 局面に応じて「開閉」の変化（多様性）を促す
       std_penalty = torch.mean(torch.clamp(0.15 - p_stds, min=0) ** 2)
 
       return mean_penalty + mean_bounds_penalty + std_penalty
 
-  def _update_bucket_stats(self, pt, qf, layer_stack_indices, loss_type):
-      """検証フェーズにおけるバケット(Bucket)別損失の統計更新"""
+
+  def _compute_router_loss(self, margin=0.3):
+        if not hasattr(self.layer_stacks, 'last_router_probs') or self.layer_stacks.last_router_probs is None:
+            zero_tensor = torch.tensor(0.0, device=self.device)
+            return zero_tensor, zero_tensor
+
+        probs = self.layer_stacks.last_router_probs  # [batch_size, num_buckets]
+        num_buckets = probs.shape[-1]
+
+        # 1. 実際に Argmax で選ばれたバケット (ハード選択) の頻度 f_i を計算
+        chosen_buckets = torch.argmax(probs, dim=-1)  # [batch_size]
+        
+        # one_hot化してバッチ内の選択割合 (f_i) を算出
+        hard_fractions = torch.nn.functional.one_hot(
+            chosen_buckets, num_classes=num_buckets
+        ).float().mean(dim=0)  # [num_buckets]
+
+        # 2. Router の Softmax 確率の平均 (P_i)
+        mean_probs = probs.mean(dim=0)  # [num_buckets]
+
+        # 3. Load Balancing Loss
+        router_loss = num_buckets * torch.sum(hard_fractions * mean_probs)
+
+        # 4. Router Margin Loss (Top1確率 - Top2確率の差を広げるペナルティ)
+        top2_probs, _ = torch.topk(probs, k=2, dim=-1)
+        top1_p = top2_probs[:, 0]
+        top2_p = top2_probs[:, 1]
+
+        # (Top1確率 - Top2確率) が margin (例: 0.3) 未満のケースにペナルティ
+        margin_diff = top1_p - top2_p
+        router_margin_loss = F.relu(margin - margin_diff).mean()
+
+        return router_loss, router_margin_loss
+
+
+  def _compute_ortho_loss(self, threshold=0.2):
+        """
+        順序に依存しない Soft Orthogonality Loss。
+        バケット間の類似度が threshold (デフォルト 0.2) 以下であればペナルティをかけず、
+        適度な共通表現（滑らかさ）を残しながら過度な重複を防ぎます。
+        """
+        count = self.layer_stacks.count
+        device = self.device
+
+        bucket_vectors = []
+        for i in range(count):
+            w_l1   = self.layer_stacks.l1.weight[i * 32 : (i + 1) * 32].reshape(-1)
+            w_fd   = self.layer_stacks.fm_diff.weight[i * 64 : (i + 1) * 64].reshape(-1)
+            w_fa   = self.layer_stacks.fm_abs.weight[i * 64 : (i + 1) * 64].reshape(-1)
+            w_cross= self.layer_stacks.cross_proj.weight[i * 32 : (i + 1) * 32].reshape(-1)
+            w_l2   = self.layer_stacks.l2.weight[i * L3 : (i + 1) * L3].reshape(-1)
+            w_out  = self.layer_stacks.output.weight[i : i + 1].reshape(-1)
+
+            v_i = torch.cat([w_l1, w_fd, w_fa, w_cross, w_l2, w_out], dim=0)
+            bucket_vectors.append(v_i)
+
+        V = torch.stack(bucket_vectors, dim=0)
+        V_norm = F.normalize(V, p=2, dim=1)
+        G = torch.mm(V_norm, V_norm.t()) # コサイン類似度行列 [count, count]
+
+        # 自分自身との類似度(1.0)を除外するため、対角成分を 0 にしたマスクを作成
+        I = torch.eye(count, device=device)
+        off_diagonal_sim = G * (1.0 - I)
+
+        # 類似度が threshold (例: 0.2) を超えた部分だけにペナルティを発生させる
+        # (0.2 以下なら F.relu により 0 になるためロスは発生しない)
+        excess_sim = F.relu(off_diagonal_sim - threshold)
+        ortho_loss = torch.mean(excess_sim ** 2)
+
+        return ortho_loss
+
+
+  def _update_bucket_stats(self, pt, qf, active_indices, loss_type):
       with torch.no_grad():
           loss_per_sample = torch.pow(torch.abs(pt - qf), 2.5).detach().squeeze()
 
@@ -1435,143 +1568,221 @@ class NNUE(pl.LightningModule):
                       'count': torch.zeros(12, device=pt.device)
                   }
 
-              indices = layer_stack_indices.squeeze()
+              indices = active_indices.squeeze()
               self.bucket_stats['loss_sum'].index_add_(0, indices, loss_per_sample)
               self.bucket_stats['count'].index_add_(0, indices, torch.ones_like(loss_per_sample))
 
-  def _log_debug_info(self, loss_type, loss, base_loss, pairwise_loss, listwise_loss,
-                      pt, qf, score, scorenet, layer_stack_indices, kif_group_id_flat, actual_lambda,
-                      pair_metrics, pt_range):
-      """コンソール出力および TensorBoard/Lightning ログ記録"""
-      mean_base = base_loss.item()
-      mean_pair = pairwise_loss.item()
-      mean_list = listwise_loss.item()
-      mean_total = loss.item()
+  def _log_debug_info(
+        self,
+        loss_type, loss, base_loss, pairwise_loss, listwise_loss,
+        pt, qf, score, scorenet, active_indices, kif_group_id_flat, actual_lambda,
+        pair_metrics, pt_range, router_loss, phase_penalty, ortho_loss, router_margin_loss,
+        router_ce_loss, router_acc, gap_mean, gap_median, gap_max
+        , gw_mean, gw_median, gw_gt_05, gw_gt_08, router_acc_high
+        , weights
+    ):
 
-      if self.training:
-          self.log("train/base_loss", mean_base, prog_bar=False)
-          self.log("train/pairwise_loss", mean_pair, prog_bar=False)
-          self.log("train/listwise_loss", mean_list, prog_bar=False)
+        def _to_float(val):
+            if val is None:
+                return 0.0
+            if hasattr(val, "item"):
+                return val.item()
+            return float(val)
 
-      # 500ステップ毎のコンソール詳細出力
-      if self.training and (self.global_step % 500 == 0):
-          valid_count = pair_metrics['total_valid_pairs']
-          max_possible = pair_metrics['max_possible_pairs']
+        mean_base   = _to_float(base_loss)
+        mean_pair   = _to_float(pairwise_loss)
+        mean_list   = _to_float(listwise_loss)
+        mean_router = _to_float(router_loss)
+        mean_margin = _to_float(router_margin_loss)
+        mean_ce     = _to_float(router_ce_loss) # ★ 追加
+        mean_acc = _to_float(router_acc) # ★ 追加
+        mean_phase  = _to_float(phase_penalty)
+        mean_ortho  = _to_float(ortho_loss)
+        mean_total  = _to_float(loss)
 
-          print(f"\n[DEBUG LOSS] Total: {mean_total:.6f} | Base: {mean_base:.6f} | Pairwise: {mean_pair:.6f} | Listwise: {mean_list:.6f} (Valid Pairs: {valid_count}/{max_possible})")
-          print(f"  [PT Distribution] Min: {pt.min().item():.4f} | Median: {pt.median().item():.4f} | Max: {pt.max().item():.4f} | Std: {pt.std().item():.4f}")
+        w_pair_coef   = weights.get('pairwise', 0.010) if weights else 0.010
+        w_list_coef   = weights.get('listwise', 0.030) if weights else 0.030
+        w_phase_coef  = weights.get('phase', 0.002) if weights else 0.002
+        w_router_coef = weights.get('router', 0.001) if weights else 0.001
+        w_margin_coef = weights.get('router_margin', 0.001) if weights else 0.001
+        w_ce_coef     = weights.get('router_ce', 0.001) if weights else 0.001 # ★ 追加
+        w_ortho_coef  = weights.get('ortho', 0.001) if weights else 0.001
 
-          with torch.no_grad():
-              counts = torch.bincount(kif_group_id_flat, minlength=4)
-              print(f"  [Kif Group Counts] ID_1: {counts[1].item()} | ID_2: {counts[2].item()} | ID_3: {counts[3].item()} (Batch Total: {pt.size(0)})")
+        w_base   = mean_base
+        w_pair   = mean_pair   * w_pair_coef
+        w_list   = mean_list   * w_list_coef
+        w_phase  = mean_phase  * w_phase_coef
+        w_router = mean_router * w_router_coef
+        w_margin = mean_margin * w_margin_coef
+        w_ce     = mean_ce     * w_ce_coef # ★ 追加
+        w_ortho  = mean_ortho  * w_ortho_coef
 
-          if valid_count > 0 and len(pair_metrics['all_pred_diffs']) > 0:
-              flat_pred_diff = torch.cat(pair_metrics['all_pred_diffs'], dim=0)
-              flat_targets = torch.cat(pair_metrics['all_target_directions'], dim=0)
-              flat_diff_abs = torch.cat(pair_metrics['all_diff_abs'], dim=0)
+        if self.training:
+            self.log("train/base_loss", mean_base, prog_bar=False)
+            self.log("train/pairwise_loss", mean_pair, prog_bar=False)
+            self.log("train/listwise_loss", mean_list, prog_bar=False)
+            if router_loss is not None:
+                self.log("train/router_loss", mean_router, prog_bar=False)
+            if router_margin_loss is not None:
+                self.log("train/router_margin_loss", mean_margin, prog_bar=False)
+            if router_ce_loss is not None:
+                self.log("train/router_ce_loss", mean_ce, prog_bar=False) # ★ 追加
+                self.log("train/router_acc", mean_acc, prog_bar=False) # ★ 追加 (Routerの一致率)
+            if phase_penalty is not None:
+                self.log("train/phase_penalty", mean_phase, prog_bar=False)
+            if ortho_loss is not None:
+                self.log("train/ortho_loss", mean_ortho, prog_bar=False)
 
-              print(f"  equal={pair_metrics['all_num_equals'] / valid_count:.3%}")
-              pd_abs_mean = flat_pred_diff.abs().mean().item()
-              print(f"  pred_diff_abs_mean={pd_abs_mean:.6f}")
+        if self.training and (self.global_step % 500 == 0):
+            valid_count = pair_metrics['total_valid_pairs']
+            max_possible = pair_metrics['max_possible_pairs']
 
-              pair_acc = ((flat_targets * flat_pred_diff) > 0).float().mean()
-              print(f"  pair_acc={pair_acc.item():.4f}")
+            print(f"\n[DEBUG LOSS] Total: {mean_total:.6f} | "
+                  f"Base: {mean_base:.6f} | "
+                  f"Pairwise: {mean_pair:.6f} (w: {w_pair:.6f}) | "
+                  f"Listwise: {mean_list:.6f} (w: {w_list:.6f}) | "
+                  f"Router: {mean_router:.6f} (w: {w_router:.6f}) | "
+                  f"R_Margin: {mean_margin:.6f} (w: {w_margin:.6f}) | "
+                  f"R_CE: {mean_ce:.6f} (w: {w_ce:.6f}) (Acc: {mean_acc:.2%}) | " # ★ (Acc: xx.xx%) で表示！
+                  f"Oracle Gap (Mean: {gap_mean:.6f}, Med: {gap_median:.6f}, Max: {gap_max:.6f}) | " # ★ 追加
+                  f"Phase: {mean_phase:.6f} (w: {w_phase:.6f}) | "
+                  f"Ortho: {mean_ortho:.6f} (w: {w_ortho:.6f}) "
+                  f"(Valid Pairs: {valid_count}/{max_possible})")
 
-              # 範囲別集計
-              bins = [(0.000, 0.002), (0.002, 0.005), (0.005, 0.010), (0.010, 0.020), (0.020, 0.030),
-                      (0.030, 0.050), (0.050, 0.070), (0.070, 0.100), (0.100, 0.150)]
-              
-              print(f"  [Pairwise Detail per Range]")
-              for start, end in bins:
-                  label = f"{start*100:.1f}%-{end*100:.1f}%"
-                  mask = (flat_diff_abs >= start) & (flat_diff_abs < end)
-                  count = mask.sum().item()
+            print(f"[GAP WEIGHT DEBUG] "
+                  f"GW Mean: {gw_mean:.3f} | Med: {gw_median:.3f} | "
+                  f">0.5: {gw_gt_05:.1f}% | >0.8: {gw_gt_08:.1f}% || "
+                  f"Acc(All): {router_acc.item()*100:.1f}% | Acc(HighGap): {router_acc_high:.1f}%")
 
-                  if count > 0:
-                      sub_t = flat_targets[mask]
-                      sub_pd = flat_pred_diff[mask]
-                      acc = ((sub_t * sub_pd) > 0).float().mean().item()
-                      s_mean = (sub_t * sub_pd).mean().item()
-                      pd_abs_m = sub_pd.abs().mean().item()
-                      print(f"    {label:<11}: {count:>6}t | acc={acc:.4f} | signed_m={s_mean:+.5f} | pred_diff_abs_m={pd_abs_m:.6f}")
 
-                      if self.training:
-                          self.log(f"pair_acc_range/{label}", acc, prog_bar=False)
-                          self.log(f"pair_signed_mean_range/{label}", s_mean, prog_bar=False)
-                          self.log(f"pair_pred_diff_abs_range/{label}", pd_abs_m, prog_bar=False)
-                  else:
-                      print(f"    {label:<11}:      0t | acc=0.0000 | signed_m=+0.00000 | pred_diff_abs_m=0.000000")
+            print(f"  [PT Distribution] Min: {pt.min().item():.4f} | Median: {pt.median().item():.4f} | Max: {pt.max().item():.4f} | Std: {pt.std().item():.4f}")
+            
+            target_model = getattr(self, "layer_stacks", self)
+            if hasattr(target_model, "last_routing_weights") and target_model.last_routing_weights is not None:
+                with torch.no_grad():
+                    r_counts = target_model.last_routing_weights.sum(dim=0).long()
+                    total_samples = pt.size(0)
+                    
+                    counts_str = " | ".join([f"L{i:02d}: {r_counts[i].item():>5d}" for i in range(target_model.count)])
+                    pcts_str   = " | ".join([f"L{i:02d}: {r_counts[i].item() / total_samples:>5.1%}" for i in range(target_model.count)])
+                    
+                    print(f"  [Router Bucket Counts] {counts_str} (Total: {total_samples})")
+                    print(f"  [Router Bucket Share ] {pcts_str}")
 
-              signed_mean = (flat_targets * flat_pred_diff).mean().item()
-              print(f"  signed_mean={signed_mean:.5f}")
+            with torch.no_grad():
+                counts = torch.bincount(kif_group_id_flat, minlength=4)
+                print(f"  [Kif Group Counts] ID_1: {counts[1].item()} | ID_2: {counts[2].item()} | ID_3: {counts[3].item()} (Batch Total: {pt.size(0)})")
 
-              flat_gaps = torch.cat(pair_metrics['all_value_gaps'], dim=0)
-              value_gap_mean = flat_gaps.mean().item()
-              print(f"  value_diff_cp_mae={value_gap_mean:.3f} cp")
+            if valid_count > 0 and len(pair_metrics['all_pred_diffs']) > 0:
+                flat_pred_diff = torch.cat(pair_metrics['all_pred_diffs'], dim=0)
+                flat_targets = torch.cat(pair_metrics['all_target_directions'], dim=0)
+                flat_diff_abs = torch.cat(pair_metrics['all_diff_abs'], dim=0)
 
-              if len(pair_metrics['all_valid_lsinds']) > 0:
-                  with torch.no_grad():
-                      flat_lsinds = torch.cat(pair_metrics['all_valid_lsinds'], dim=0).long()
-                      lsind_counts = torch.bincount(flat_lsinds, minlength=12)
-                      counts_str = " | ".join([f"L{i}: {lsind_counts[i].item()}" for i in range(12)])
-                      print(f"  [Pairwise Valid Pairs per Layer] {counts_str}")
+                print(f"  equal={pair_metrics['all_num_equals'] / valid_count:.3%}")
+                pd_abs_mean = flat_pred_diff.abs().mean().item()
+                print(f"  pred_diff_abs_mean={pd_abs_mean:.6f}")
 
-              if self.training:
-                  self.log("train/pair_acc", pair_acc, prog_bar=False)
-                  self.log("train/pred_diff_abs_mean", pd_abs_mean, prog_bar=False)
-                  self.log("train/value_diff_mae", value_gap_mean, prog_bar=False)
+                pair_acc = ((flat_targets * flat_pred_diff) > 0).float().mean()
+                print(f"  pair_acc={pair_acc.item():.4f}")
 
-          if pt_range is not None and pt_range.numel() > 0:
-              print(
-                  f"[Listwise Range] (Total Active Groups: {pt_range.numel()})\n"
-                  f"  Mean: {pt_range.mean():.4f} | Std: {pt_range.std():.4f} | Median: {pt_range.median():.4f} | Min: {pt_range.min():.4f} | Max: {pt_range.max():.4f}\n"
-                  f"  [Histogram]\n"
-                  f"    0.00-0.01 : {torch.sum((pt_range >= 0.00) & (pt_range < 0.01)).item():5d}t\n"
-                  f"    0.01-0.02 : {torch.sum((pt_range >= 0.01) & (pt_range < 0.02)).item():5d}t\n"
-                  f"    0.02-0.05 : {torch.sum((pt_range >= 0.02) & (pt_range < 0.05)).item():5d}t\n"
-                  f"    0.05-0.10 : {torch.sum((pt_range >= 0.05) & (pt_range < 0.10)).item():5d}t\n"
-                  f"    0.10-0.20 : {torch.sum((pt_range >= 0.10) & (pt_range < 0.20)).item():5d}t\n"
-                  f"    0.20-0.30 : {torch.sum((pt_range >= 0.20) & (pt_range < 0.30)).item():5d}t\n"
-                  f"    >0.30     : {torch.sum(pt_range >= 0.30).item():5d}t"
-              )
+                bins = [(0.000, 0.002), (0.002, 0.005), (0.005, 0.010), (0.010, 0.020), (0.020, 0.030),
+                        (0.030, 0.050), (0.050, 0.070), (0.070, 0.100), (0.100, 0.150)]
+                
+                print(f"  [Pairwise Detail per Range]")
+                for start, end in bins:
+                    label = f"{start*100:.1f}%-{end*100:.1f}%"
+                    mask = (flat_diff_abs >= start) & (flat_diff_abs < end)
+                    count = mask.sum().item()
 
-      # 100ステップ毎の TensorBoard ヒストグラム出力
-      if self.training and (self.global_step % 100 == 0) and hasattr(self, "logger") and self.logger is not None:
-          self.logger.experiment.add_histogram("Distribution/PT_Target", pt.view(-1), global_step=self.global_step)
-          self.logger.experiment.add_histogram("Distribution/QF_Prediction", qf.view(-1), global_step=self.global_step)
-          self.logger.experiment.add_histogram("Distribution/score_Target", score.view(-1), global_step=self.global_step)
-          self.logger.experiment.add_histogram("Distribution/scorenet", scorenet.view(-1), global_step=self.global_step)
+                    if count > 0:
+                        sub_t = flat_targets[mask]
+                        sub_pd = flat_pred_diff[mask]
+                        acc = ((sub_t * sub_pd) > 0).float().mean().item()
+                        s_mean = (sub_t * sub_pd).mean().item()
+                        pd_abs_m = sub_pd.abs().mean().item()
+                        print(f"    {label:<11}: {count:>6}t | acc={acc:.4f} | signed_m={s_mean:+.5f} | pred_diff_abs_m={pd_abs_m:.6f}")
 
-          score_flat = score.view(-1)
-          scorenet_flat = scorenet.view(-1)
-          for i in range(12):
-              layer_mask = (layer_stack_indices.view(-1) == i)
-              if layer_mask.any():
-                  self.logger.experiment.add_histogram(f"Distribution_Layer/L{i:02d}_score_Target", score_flat[layer_mask], global_step=self.global_step)
-                  self.logger.experiment.add_histogram(f"Distribution_Layer/L{i:02d}_scorenet", scorenet_flat[layer_mask], global_step=self.global_step)
+                        if self.training:
+                            self.log(f"pair_acc_range/{label}", acc, prog_bar=False)
+                            self.log(f"pair_signed_mean_range/{label}", s_mean, prog_bar=False)
+                            self.log(f"pair_pred_diff_abs_range/{label}", pd_abs_m, prog_bar=False)
+                    else:
+                        print(f"    {label:<11}:      0t | acc=0.0000 | signed_m=+0.00000 | pred_diff_abs_m=0.000000")
 
-      # 検証時（Val）のログ出力
-      if loss_type == 'val_loss_actual_lambda' and self.global_step > 1:
-          self.log('actual_lambda', actual_lambda)
-          self.log("val_loss/base_loss", mean_base, prog_bar=False)
-          self.log("val_loss/pairwise_loss", mean_pair, prog_bar=False)
-          self.log("val_loss/listwise_loss", mean_list, prog_bar=False)
+                signed_mean = (flat_targets * flat_pred_diff).mean().item()
+                print(f"  signed_mean={signed_mean:.5f}")
 
-          if pair_metrics['total_valid_pairs'] > 0 and len(pair_metrics['all_pred_diffs']) > 0:
-              flat_pd = torch.cat(pair_metrics['all_pred_diffs'], dim=0)
-              flat_t = torch.cat(pair_metrics['all_target_directions'], dim=0)
-              val_pair_acc = ((flat_t * flat_pd) > 0).float().mean()
-              val_value_gap_mean = torch.cat(pair_metrics['all_value_gaps'], dim=0).mean().item()
+                flat_gaps = torch.cat(pair_metrics['all_value_gaps'], dim=0)
+                value_gap_mean = flat_gaps.mean().item()
+                print(f"  value_diff_cp_mae={value_gap_mean:.3f} cp")
 
-              self.log("val_loss/pair_acc", val_pair_acc, prog_bar=False)
-              self.log("val_loss/value_diff_cp_mae", val_value_gap_mean, prog_bar=False)
-          else:
-              self.log("val_loss/pair_acc", 0.0, prog_bar=False)
-              self.log("val_loss/value_diff_cp_mae", 0.0, prog_bar=False)
+                if len(pair_metrics['all_valid_lsinds']) > 0:
+                    with torch.no_grad():
+                        flat_lsinds = torch.cat(pair_metrics['all_valid_lsinds'], dim=0).long()
+                        lsind_counts = torch.bincount(flat_lsinds, minlength=12)
+                        counts_str = " | ".join([f"L{i:02d}: {lsind_counts[i].item()}" for i in range(12)])
+                        print(f"  [Pairwise Valid Pairs per Layer] {counts_str}")
 
-      self.log(loss_type, loss)
+                if self.training:
+                    self.log("train/pair_acc", pair_acc, prog_bar=False)
+                    self.log("train/pred_diff_abs_mean", pd_abs_mean, prog_bar=False)
+                    self.log("train/value_diff_mae", value_gap_mean, prog_bar=False)
 
-  # =========================================================================
+            if pt_range is not None and pt_range.numel() > 0:
+                print(
+                    f"[Listwise Range] (Total Active Groups: {pt_range.numel()})\n"
+                    f"  Mean: {pt_range.mean():.4f} | Std: {pt_range.std():.4f} | Median: {pt_range.median():.4f} | Min: {pt_range.min():.4f} | Max: {pt_range.max():.4f}\n"
+                    f"  [Histogram]\n"
+                    f"    0.00-0.01 : {torch.sum((pt_range >= 0.00) & (pt_range < 0.01)).item():5d}t\n"
+                    f"    0.01-0.02 : {torch.sum((pt_range >= 0.01) & (pt_range < 0.02)).item():5d}t\n"
+                    f"    0.02-0.05 : {torch.sum((pt_range >= 0.02) & (pt_range < 0.05)).item():5d}t\n"
+                    f"    0.05-0.10 : {torch.sum((pt_range >= 0.05) & (pt_range < 0.10)).item():5d}t\n"
+                    f"    0.10-0.20 : {torch.sum((pt_range >= 0.10) & (pt_range < 0.20)).item():5d}t\n"
+                    f"    0.20-0.30 : {torch.sum((pt_range >= 0.20) & (pt_range < 0.30)).item():5d}t\n"
+                    f"    >0.30     : {torch.sum(pt_range >= 0.30).item():5d}t"
+                )
+
+        if self.training and (self.global_step % 100 == 0) and hasattr(self, "logger") and self.logger is not None:
+            self.logger.experiment.add_histogram("Distribution/PT_Target", pt.view(-1), global_step=self.global_step)
+            self.logger.experiment.add_histogram("Distribution/QF_Prediction", qf.view(-1), global_step=self.global_step)
+            self.logger.experiment.add_histogram("Distribution/score_Target", score.view(-1), global_step=self.global_step)
+            self.logger.experiment.add_histogram("Distribution/scorenet", scorenet.view(-1), global_step=self.global_step)
+
+            target_model = getattr(self, "layer_stacks", self)
+            if hasattr(target_model, "last_router_probs_log") and target_model.last_router_probs_log is not None:
+                self.logger.experiment.add_histogram("Distribution/Router_Probs", target_model.last_router_probs_log, global_step=self.global_step)
+
+            score_flat = score.view(-1)
+            scorenet_flat = scorenet.view(-1)
+            for i in range(12):
+                layer_mask = (active_indices.view(-1) == i)
+                if layer_mask.any():
+                    self.logger.experiment.add_histogram(f"Distribution_Layer/L{i:02d}_score_Target", score_flat[layer_mask], global_step=self.global_step)
+                    self.logger.experiment.add_histogram(f"Distribution_Layer/L{i:02d}_scorenet", scorenet_flat[layer_mask], global_step=self.global_step)
+
+        if loss_type == 'val_loss_actual_lambda' and self.global_step > 1:
+            self.log('actual_lambda', actual_lambda)
+            self.log("val_loss/base_loss", mean_base, prog_bar=False)
+            self.log("val_loss/pairwise_loss", mean_pair, prog_bar=False)
+            self.log("val_loss/listwise_loss", mean_list, prog_bar=False)
+            if router_loss is not None:
+                self.log("val_loss/router_loss", mean_router, prog_bar=False)
+            if router_ce_loss is not None:
+                self.log("val_loss/router_ce_loss", mean_ce, prog_bar=False) # ★ 追加
+
+            if pair_metrics['total_valid_pairs'] > 0 and len(pair_metrics['all_pred_diffs']) > 0:
+                flat_pd = torch.cat(pair_metrics['all_pred_diffs'], dim=0)
+                flat_t = torch.cat(pair_metrics['all_target_directions'], dim=0)
+                val_pair_acc = ((flat_t * flat_pd) > 0).float().mean()
+                val_value_gap_mean = torch.cat(pair_metrics['all_value_gaps'], dim=0).mean().item()
+
+                self.log("val_loss/pair_acc", val_pair_acc, prog_bar=False)
+                self.log("val_loss/value_diff_cp_mae", val_value_gap_mean, prog_bar=False)
+            else:
+                self.log("val_loss/pair_acc", 0.0, prog_bar=False)
+                self.log("val_loss/value_diff_cp_mae", 0.0, prog_bar=False)
+
+        self.log(loss_type, loss)
 
 
   def training_step(self, batch, batch_idx):
@@ -1585,7 +1796,6 @@ class NNUE(pl.LightningModule):
     self.step_(batch, batch_idx, 'val_loss_lambda0.5')
     self.step_(batch, batch_idx, 'val_loss_lambda0.8')
 
-    # 学習率のトラッキング
     optimizer = self.optimizers()
     current_lr = optimizer.param_groups[0]['lr']
     self.log('current_lr', current_lr, on_step=False, on_epoch=True)
@@ -1594,159 +1804,115 @@ class NNUE(pl.LightningModule):
     self.step_(batch, batch_idx, 'test_loss')
 
   def on_validation_epoch_end(self):
-      """検証エポック終了時：バケットごとの損失統計を確定させる"""
       if hasattr(self, 'bucket_stats'):
           s = self.bucket_stats['loss_sum']
           c = self.bucket_stats['count']
 
-          # --- 1. 平均損失の算出 (ゼロ除算を考慮) ---
-          # 各バケットの累積損失をサンプル数で割り、デバッグ表示用のプロパティへ格納
           avg_losses = (s / (c + 1e-9)).detach().cpu().numpy()
           self.last_bucket_losses = avg_losses
 
-          # --- 2. 統計のリセット ---
-          # 次のエポックで新鮮な集計を行うためにゼロ埋め
           self.bucket_stats['loss_sum'].zero_()
           self.bucket_stats['count'].zero_()
 
-
   def on_train_batch_end(self, outputs, batch, batch_idx):
-    """学習バッチ終了時：100ステップごとに内部状態(ゲートや重み)を可視化"""
     if self.global_step % 100 == 0:
         with torch.no_grad():
-            # --- 1. ゲート制御信号の取得 ---
-            # Forwardパスで保存された最新のゲート値 (Raw Logits)
             gate_d = self.layer_stacks.last_gate_d
             gate_a = self.layer_stacks.last_gate_a
 
             sig_d = torch.sigmoid(gate_d)
             sig_a = torch.sigmoid(gate_a)
 
-            # --- 2. 実効的な開放率(Open Rate)の計算 ---
-            # AbsPath: 0.0(全閉) ～ 1.0(全開) の範囲
             eff_open_abs = sig_a.mean() * 100.0
-            
-            # MainPath: 0.5(半開) ～ 1.0(全開) の範囲にスケーリング
-            # ※構造上、Mainは最低でも50%の信号を流す仕様を反映
             eff_open_main = (0.5 + 0.5 * sig_d).mean() * 100.0
 
-            # --- 3. 指標のログ記録 (Scalars) ---
             self.log("gate/open_rate_abs_to_abs", eff_open_abs)
             self.log("gate/open_rate_diff_to_main", eff_open_main)
             self.log("gate/sharpness_diff", sig_d.var())
             self.log("gate/sharpness_abs", sig_a.var())
 
-            # --- 4. 分布の記録 (Histograms) ---
             tensorboard = self.logger.experiment
-            # Absゲートの分布
             tensorboard.add_histogram("gate_dist/abs_to_abs_effective", sig_a, self.global_step)
-            # Mainゲートの実効値(0.5~1.0)分布
             eff_sig_d = 0.5 + 0.5 * sig_d
             tensorboard.add_histogram("gate_dist/diff_to_main_effective", eff_sig_d, self.global_step)
 
-            # --- 5. pair_weights(Mul/Diff/Sum) 演算ブレンド戦略の記録 ---
-            pw = self.pair_weights.detach().cpu() # [4フェーズ, 640特徴量, 3演算]
-            # 生の重み分布を確認
+            pw = self.pair_weights.detach().cpu()
             tensorboard.add_histogram("pair_w/overall_raw", pw, self.global_step)
-            # Softmaxによる実効比率の算出 (3演算の合計が1.0になるよう正規化)
             pw_softmax = torch.softmax(pw, dim=2) 
 
-            # --- 6. フェーズ別(序・中1・中2・終)の戦略比率 ---
             phase_labels = ["Open", "Mid1", "Mid2", "End"]
             for i, label in enumerate(phase_labels):
-                # 戦略ごとの比率ヒストグラム (フェーズごと)
                 tensorboard.add_histogram(f"pair_w_ratio_{label}/mul",  pw_softmax[i, :, 0], self.global_step)
                 tensorboard.add_histogram(f"pair_w_ratio_{label}/diff", pw_softmax[i, :, 1], self.global_step)
                 tensorboard.add_histogram(f"pair_w_ratio_{label}/sum",  pw_softmax[i, :, 2], self.global_step)
 
-                # スカラー値としての平均比率 (折れ線グラフで推移が見やすくなる)
                 self.log(f"pair_w_avg_{label}/mul_ratio",  pw_softmax[i, :, 0].mean())
                 self.log(f"pair_w_avg_{label}/diff_ratio", pw_softmax[i, :, 1].mean())
                 self.log(f"pair_w_avg_{label}/sum_ratio",  pw_softmax[i, :, 2].mean())
 
-            # 全フェーズを通じた総合的な演算傾向
             self.log("pair_w_avg_total/mul",  pw_softmax[:, :, 0].mean())
             self.log("pair_w_avg_total/diff", pw_softmax[:, :, 1].mean())
             self.log("pair_w_avg_total/sum",  pw_softmax[:, :, 2].mean())
 
-
   def configure_optimizers(self):
+    # =========================================================
+    # 【一時的】Routerの重みとバイアスを再初期化
+    # =========================================================
+    """
+    with torch.no_grad():
+      nn.init.normal_(self.layer_stacks.router.weight, std=0.01)
+      nn.init.constant_(self.layer_stacks.router.bias, 0.0)
+      print("Routerの重みとバイアスを再初期化")
+    """
+    # =========================================================
+
+
     LR = self.lr
 
-    # --- SECTION 1: パラメータグループ別の学習戦略設定 ---
-    # 各コンポーネントの役割に応じて LR倍率や Weight Decay を微調整
     train_params = [
-      # 入力層 (Feature Transformer)
       {'params' : [self.input.weight], 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
       {'params' : [self.input.bias]  , 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
-
-      # FM（Factorization Machine）因子ベクトル
       {'params' : [self.input.v]     , 'lr' : LR * 1.5, 'weight_decay': 0.0 }, 
-
-      # pair_weights（mul/diff/sum）
       {'params' : [self.pair_weights], 'lr' : LR * 1.0, 'weight_decay': 1e-5 }, 
-
-      # LayerStacks Main Path
+      {'params' : [self.layer_stacks.router.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.router.bias]    , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.l1.weight]      , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.l1.bias]        , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.l1_fact.weight] , 'lr' : LR * 0.5 , 'weight_decay': 1e-5 },
-      {'params' : [self.layer_stacks.l1_fact.bias]   , 'lr' : LR * 0.5 , 'weight_decay': 1e-5 },
-
-      # FM Diff Path
-      {'params' : [self.layer_stacks.fm_diff.weight] , 'lr' : LR * 1.0, 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.fm_diff.bias]   , 'lr' : LR * 1.0, 'weight_decay': 0.0 },
-
-      # FM Abs Path
-      {'params' : [self.layer_stacks.fm_abs.weight]  , 'lr' : LR * 1.0, 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.fm_abs.bias]    , 'lr' : LR * 1.0, 'weight_decay': 0.0 },
-
-      # L2 / Output Layer
+      {'params' : [self.layer_stacks.l1_fact.weight] , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.l1_fact.bias]   , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.fm_diff.weight] , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.fm_diff.bias]   , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.fm_abs.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.fm_abs.bias]    , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.cross_proj.weight], 'lr' : LR * 1.0, 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.cross_proj.bias]  , 'lr' : LR * 1.0, 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.q_proj.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.k_proj.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.v_proj.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.lca_temp]      , 'lr' : LR * 0.1 , 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.phase_proj.weight], 'lr': LR * 1.0, 'weight_decay': 0.0 },
+      {'params' : [self.layer_stacks.phase_proj.bias]  , 'lr': LR * 1.0, 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.l2.weight]      , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.l2.bias]        , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.output.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.output.bias]    , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-
-      # L3とバイパスのブレンド
       {'params' : [self.layer_stacks.blend]          , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-
-      # cross_proj
-      {'params' : [self.layer_stacks.cross_proj.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.cross_proj.bias]    , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-
-      # LCA
-      {'params' : [self.layer_stacks.q_proj.weight]      , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.q_proj.bias]        , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.k_proj.weight]      , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.k_proj.bias]        , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.v_proj.weight]      , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.v_proj.bias]        , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.lca_temp]           , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-
-      # phase_proj
-      {'params' : [self.layer_stacks.phase_proj.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
-      {'params' : [self.layer_stacks.phase_proj.bias]    , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
     ]
 
-    # Increasing the eps leads to less saturated nets with a few dead neurons.
-    # Gradient localisation appears slightly harmful.
-    #optimizer = ranger.Ranger(
-    #  train_params, betas=(0.9, 0.999), eps=1.0e-7, gc_loc=False, use_gc=False
-    #)
+
     """
-    optimizer = ranger21.Ranger21(train_params,
-      lr=1.0, betas=(.9, 0.999), eps=1.0e-7,
-      using_gc=False, using_normgc=False,
-      weight_decay=0.0,
-      num_batches_per_epoch=int(self.epoch_size / self.batch_size), num_epochs=self.max_epoch,
-      warmdown_active=False, use_warmup=False,
-      use_adaptive_gradient_clipping=False,
-      softplus=False,
-      pnm_momentum_factor=0.0)
-    scheduler = torch.optim.lr_scheduler.StepLR(
-      optimizer, step_size=1, gamma=self.gamma
-    )
-    return [optimizer], [scheduler]
+    optimizer = ranger.Ranger(train_params, lr=LR, betas=(0.9, 0.999), eps=1e-8)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.gamma)
+
+    return {
+        'optimizer': optimizer,
+        'lr_scheduler': {
+            'scheduler': scheduler,
+            'interval': 'epoch',
+            'frequency': 1,
+        }
     """
+
 
     # --- SECTION 2: オプティマイザの構築 (AdamW 8-bit) ---
     # メモリ節約と学習速度向上のため 8-bit AdamW を採用。
@@ -1766,16 +1932,6 @@ class NNUE(pl.LightningModule):
         'interval': 'epoch',
         'frequency': 1
     }
+
     return [optimizer], [scheduler]
 
-  def get_layers(self, filt):
-    """
-    Returns a list of layers.
-    filt: Return true to include the given layer.
-    """
-    for i in self.children():
-      if filt(i):
-        if isinstance(i, nn.Linear):
-          for p in i.parameters():
-            if p.requires_grad:
-              yield p

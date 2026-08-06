@@ -78,6 +78,11 @@ class NNUEWriter():
     self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
     self.write_feature_transformer(model, ft_compression)
 
+    # --- [追加] Router Layer は共通で1個だけ書き出す (ループの外) ---
+    print(f"Router Layer START [Pos: {len(self.buf)}]")
+    self.write_fc_layer(model, model.layer_stacks.router)
+    print(f"Router Layer END [Pos: {len(self.buf)}]")
+
     for (l1, diff_b, abs_b, cross_p, l2, output
          , bucket_blend, lca_q, lca_k, lca_v, lca_temp_val, phase_p) in model.layer_stacks.get_coalesced_layer_stacks():
 
@@ -324,6 +329,15 @@ class NNUEReader():
     self.model.layer_stacks.l1_fact.weight.data.fill_(0.0)
     self.model.layer_stacks.l1_fact.bias.data.fill_(0.0)
 
+
+    # --- [追加] Router Layer は共通で1個だけ読み込む (ループの外) ---
+    # パディングで12は32になる
+    router_p_tmp = nn.Linear(384, 32)
+    self.read_fc_layer(router_p_tmp)
+    self.model.layer_stacks.router.weight.data = router_p_tmp.weight.data[:12, :]
+    self.model.layer_stacks.router.bias.data   = router_p_tmp.bias.data[:12]
+
+
     for i in range(self.model.num_ls_buckets):
       # --- 1. 一時レイヤーの定義 ---
       l1_tmp      = nn.Linear(M.L1_MAIN, 32)
@@ -408,8 +422,8 @@ class NNUEReader():
       self.model.layer_stacks.lca_temp.data      = torch.tensor(lca_temp_val)
 
       # Phase Gate パラメータの分配 (全バケット共通だが、最新の値をセット)
-      self.model.layer_stacks.phase_proj.weight.data = phase_p_tmp.weight.data
-      self.model.layer_stacks.phase_proj.bias.data   = phase_p_tmp.bias.data
+      self.model.layer_stacks.phase_proj.weight.data = phase_p_tmp.weight.data[:6, :]
+      self.model.layer_stacks.phase_proj.bias.data   = phase_p_tmp.bias.data[:6]
 
       # Blend Parameter (alpha)
       eps = 1e-6
