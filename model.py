@@ -93,6 +93,9 @@ class LayerStacks(nn.Module):
     self.idx_offset = None
     self._init_layers()
 
+    self.step_counter = 0
+
+
   def _init_layers(self):
     with torch.no_grad():
       self.l1_fact.weight.fill_(0.0)
@@ -133,6 +136,8 @@ class LayerStacks(nn.Module):
 
 
   def forward(self, l1_main, diff_in, abs_in, ls_indices=None):
+        if self.training:
+            self.step_counter += 1
 
         # --- PHASE 0: Router による動的バケット選択 (384 -> 12) ---
         p_abs_base = torch.clamp(abs_in - 0.5, 0.0, 1.0) * 2.0   # [B, 128]
@@ -158,8 +163,8 @@ class LayerStacks(nn.Module):
             noisy_indices = logits_for_routing.argmax(dim=-1)
 
             # ノイズによって選択が変わった割合 (Flip Rate)
-            flip_rate = (raw_indices != noisy_indices).float().mean().item()
-            if torch.rand(1).item() < 0.001:
+            if self.step_counter % 500 == 0:
+                flip_rate = (raw_indices != noisy_indices).float().mean().item()
                 print(f"[Router Check] Logits Mean: {router_logits.mean().item():.4f}, Std: {router_logits.std().item():.4f}")
                 print(f"[Jitter Check] Flip Rate: {flip_rate:.1%}")
             #-----
@@ -177,7 +182,7 @@ class LayerStacks(nn.Module):
         self.last_routing_indices = router_indices.detach()
 
 
-        # 3. [統計・ログ用] 
+        # 3. [loss算出用、統計・ログ用] 
         self.last_router_logits = router_logits
         self.last_router_probs = F.softmax(router_logits, dim=-1)
         self.last_router_probs_log = self.last_router_probs.detach()
@@ -201,18 +206,19 @@ class LayerStacks(nn.Module):
         p_detached = phase.detach()
         phase_names = ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"]
         channel_stats = []
-        for i in range(6):
-            p_ch = p_detached[:, i]
-            stats = {
-                'name': phase_names[i],
-                'mean': p_ch.mean().item(),
-                'std':  p_ch.std().item(),
-                'min':  p_ch.min().item(),
-                'max':  p_ch.max().item(),
-                'low': (p_ch < 0.2).float().mean().item() * 100,
-                'high':(p_ch > 0.8).float().mean().item() * 100
-            }
-            channel_stats.append(stats)
+        if self.training and (self.step_counter % 100 == 0):
+            for i in range(6):
+                p_ch = p_detached[:, i]
+                stats = {
+                    'name': phase_names[i],
+                    'mean': p_ch.mean().item(),
+                    'std':  p_ch.std().item(),
+                    'min':  p_ch.min().item(),
+                    'max':  p_ch.max().item(),
+                    'low': (p_ch < 0.2).float().mean().item() * 100,
+                    'high':(p_ch > 0.8).float().mean().item() * 100
+                }
+                channel_stats.append(stats)
 
         if self.training:
             self.last_phase = phase.detach()
@@ -448,6 +454,7 @@ class NNUE(pl.LightningModule):
 
     self._zero_virtual_feature_weights()
 
+
   def _zero_virtual_feature_weights(self):
     weights = self.input.weight
     v_weights = self.input.v
@@ -545,6 +552,38 @@ class NNUE(pl.LightningModule):
                      w3 * self.pair_weights[3])
     weights = torch.softmax(mixed_weights, dim=2)
 
+    # --- Branch Dropout (学習時のみ適用) ---
+    branch_drop_prob = 0.03
+    if self.training and branch_drop_prob > 0.0:
+        # mixed_weightsと同じ形状 [batch, channels, 3] でマスク生成
+        drop_mask = (torch.rand_like(mixed_weights) >= branch_drop_prob).float()
+        
+        # 3ブランチ全てがdropした場合は全復元（無効な重みを防止）
+        all_dropped = (drop_mask.sum(dim=2, keepdim=True) == 0)
+        drop_mask = torch.where(all_dropped, torch.ones_like(drop_mask), drop_mask)
+        
+        # （例: 500ステップごとに表示する場合）
+        if self.global_step % 500 == 0:
+            mul_drop_pct   = (1.0 - drop_mask[:, :, 0].mean()).item() * 100
+            diff2_drop_pct = (1.0 - drop_mask[:, :, 1].mean()).item() * 100
+            sum_drop_pct   = (1.0 - drop_mask[:, :, 2].mean()).item() * 100
+            all_keep_pct   = (drop_mask.sum(dim=2) == 3).float().mean().item() * 100
+            two_keep_pct   = (drop_mask.sum(dim=2) == 2).float().mean().item() * 100
+            one_keep_pct   = (drop_mask.sum(dim=2) == 1).float().mean().item() * 100
+
+            print(f"Branch Drop:\n"
+                  f"  mul_drop   {mul_drop_pct:5.1f}%\n"
+                  f"  diff2_drop {diff2_drop_pct:5.1f}%\n"
+                  f"  sum_drop   {sum_drop_pct:5.1f}%\n"
+                  f"  all_keep   {all_keep_pct:5.1f}%\n"
+                  f"  two_keep   {two_keep_pct:5.1f}%\n"
+                  f"  one_keep   {one_keep_pct:5.1f}%")
+
+        # マスク適用後、残ったブランチの合計が 1.0 になるよう再正規化
+        masked_weights = weights * drop_mask
+        weights = masked_weights / (masked_weights.sum(dim=2, keepdim=True) + 1e-8)
+
+    # --- Part 1 (l0_s[0] & l0_s[1]) ---
     term_mul = l0_s[0] * l0_s[1]
     term_diff_sq = torch.pow(l0_s[0] - l0_s[1], 2)
     term_sum = (l0_s[0] + l0_s[1]) * 0.5
@@ -553,6 +592,7 @@ class NNUE(pl.LightningModule):
                      weights[:, :, 1] * term_diff_sq + 
                      weights[:, :, 2] * term_sum)
 
+    # --- Part 2 (l0_s[2] & l0_s[3]) ---
     term_mul2 = l0_s[2] * l0_s[3]
     term_diff_sq2 = torch.pow(l0_s[2] - l0_s[3], 2)
     term_sum2 = (l0_s[2] + l0_s[3]) * 0.5
@@ -1010,258 +1050,231 @@ class NNUE(pl.LightningModule):
 
 
   def step_(self, batch, batch_idx, loss_type):
-        self._clip_weights()
-        us, them, white_indices, white_values, black_indices, black_values, outcome, score, layer_stack_indices, material, kif_group_id = batch
+    self.print_mem("step_() start")
 
-        actual_lambda = self._get_actual_lambda(loss_type)
+    self._clip_weights()
+    self.print_mem("After _clip_weights")
 
-        scorenet, router_logits, all_final_outputs = self(us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices)
-        scorenet = scorenet * self.nnue2score
+    (
+        us,
+        them,
+        white_indices,
+        white_values,
+        black_indices,
+        black_values,
+        outcome,
+        score,
+        layer_stack_indices,
+        material,
+        kif_group_id,
+    ) = batch
+    self.print_mem("After batch")
 
-        # --- 選ばれたバケットの勝率計算 ---
-        q  = ( scorenet - self.offset1) / self.in_scaling
-        qm = (-scorenet - self.offset2) / self.in_scaling
-        qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+    # ==========================================
+    # Phase 1: Forward推論 & 基本変数の準備
+    # ==========================================
+    actual_lambda = self._get_actual_lambda(loss_type)
+    kif_group_id_flat = kif_group_id.view(-1)
 
-        # --- 教師データの勝率計算 (pt) ---
-        p  = ( score - self.offset1) / self.out_scaling
-        pm = (-score - self.offset2) / self.out_scaling
-        pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
+    self.print_mem("Before Student Forward")
 
-        pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
+    # Studentモデル推論
+    scorenet, router_logits, all_final_outputs = self(
+        us,
+        them,
+        white_indices,
+        white_values,
+        black_indices,
+        black_values,
+        layer_stack_indices,
+    )
+    self.print_mem("After Student Forward")  # 活性化値（中間テンソル）の保持量を計測
+
+    scorenet = scorenet * self.nnue2score
+
+    # 実際のルーティング結果インデックスを取得
+    active_indices = getattr(
+        self.layer_stacks, "last_routing_indices", layer_stack_indices
+    )
+
+    # ==========================================
+    # Phase 2: スコアから勝率(qf, pf, pt)への変換
+    # ==========================================
+    # 選ばれたバケットの予測勝率 (Student)
+    q = (scorenet - self.offset1) / self.in_scaling
+    qm = (-scorenet - self.offset2) / self.in_scaling
+    qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+
+    # 教師データの目標勝率 (Target)
+    p = (score - self.offset1) / self.out_scaling
+    pm = (-score - self.offset2) / self.out_scaling
+    pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
+
+    pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
+
+    # ==========================================
+    # Phase 3: 各種 Loss の計算
+    # ==========================================
+
+    # --- 3-1. メイン損失 ---
+    base_loss = self._compute_base_loss(pt, qf, pf, kif_group_id_flat)
+    self.print_mem("After Base Loss")
 
 
-        # --- 教師誘導 Router Loss の計算 & メトリクス取得 ---
-        router_ce_loss, r_info = self._compute_router_teacher_loss(all_final_outputs, router_logits, pt)
+    # --- 3-2. EMA蒸留 ---
+    ema_distill_loss = self._compute_ema_loss(
+        scorenet,
+        router_logits,       # 追加
+        all_final_outputs,   # 追加
+        us,
+        them,
+        white_indices,
+        white_values,
+        black_indices,
+        black_values,
+        layer_stack_indices,
+    )
 
-        # --- 定期ログ出力 (詳細デバッグ) ---
-        if self.training and (self.global_step % 500 == 0):
-            self._print_router_bucket_debug(
-                r_info['best_bucket_indices'], 
-                r_info['pred_bucket_indices'], 
-                r_info['oracle_gaps'],
-                router_logits  # <- 追加
-            )
+
+    # --- 3-3. Router 関連損失 ---
+    router_ce_loss, r_info = self._compute_router_teacher_loss(all_final_outputs, router_logits, pt)
+
+    router_load_loss, router_margin_loss = self._compute_router_loss(
+        best_bucket_indices=r_info['best_bucket_indices'],
+        oracle_gaps=r_info['oracle_gaps'],
+        margin_base=0.05,
+        margin_scale=0.25,
+        margin_min=0.02,
+        margin_max=0.25,
+        soft_incorrect_weight=0.2,
+        use_logit_margin=False
+    )
 
 
-        kif_group_id_flat = kif_group_id.view(-1)
-        base_loss = self._compute_base_loss(pt, qf, pf, kif_group_id_flat)
+    # --- 3-4. Bucket Distillation ---
+    bucket_distill_loss = self._compute_bucket_distill_loss(
+        all_final_outputs=all_final_outputs,
+        pt=pt,
+        active_indices=active_indices,
+        oracle_top_k=2,
+    )
+    self.print_mem("After Bucket Distill Loss")
 
-        pairwise_mask = (kif_group_id_flat == 3)
-        n_pairwise = pairwise_mask.sum().item()
 
-        # Routerの決定結果をバケットインデックスとして後続処理・集計に活用
-        active_indices = getattr(self.layer_stacks, 'last_routing_indices', layer_stack_indices)
+    # --- 3-5. ランキング損失 (Pairwise / Listwise) ---
+    pairwise_mask = kif_group_id_flat == 3
+    n_pairwise = pairwise_mask.sum().item()
 
-        sorted_data = self._prepare_sorted_data(
-            pairwise_mask, n_pairwise, pt, qf, score, scorenet, active_indices, material
+    sorted_data = self._prepare_sorted_data(
+        pairwise_mask,
+        n_pairwise,
+        pt,
+        qf,
+        score,
+        scorenet,
+        active_indices,
+        material,
+    )
+    self.print_mem("After Prepare Sorted Data")
+
+    pairwise_loss, pair_metrics = self._compute_pairwise_loss(
+        sorted_data, n_pairwise, pt.device
+    )
+    self.print_mem("After Pairwise Loss")
+
+    listwise_loss, pt_range = self._compute_listwise_loss(
+        sorted_data, n_pairwise, pt.device
+    )
+    self.print_mem("After Listwise Loss")
+
+
+    # --- 3-6. 正則化・ペナルティ損失 ---
+    phase_penalty = self._compute_phase_penalty()
+    self.print_mem("After Phase Penalty")
+
+    ortho_loss = self._compute_ortho_loss(threshold=0.2)
+    self.print_mem("After Ortho Loss")
+
+    # ==========================================
+    # Phase 4: Total Loss の計算
+    # ==========================================
+    weights = {
+        "pairwise"      : 0.0100,
+        "listwise"      : 0.0300,
+        "phase"         : 0.0020,
+        "router_load"   : 0.0010,
+        "router_margin" : 0.0010,
+        "router_ce"     : 0.0030,
+        "ortho"         : 0.0010,
+        "ema_distill"   : 0.0003,
+        "bucket_distill": 0.0030, # 未選択bucketへの弱い蒸留
+    }
+
+    loss = (
+        base_loss
+        + (weights["pairwise"] * pairwise_loss)
+        + (weights["listwise"] * listwise_loss)
+        + (weights["phase"] * phase_penalty)
+        + (weights["router_load"] * router_load_loss)
+        + (weights["router_margin"] * router_margin_loss)
+        + (weights["router_ce"] * router_ce_loss)
+        + (weights["ortho"] * ortho_loss)
+        + (weights["ema_distill"] * ema_distill_loss)
+        + (weights["bucket_distill"] * bucket_distill_loss)
+    )
+    self.print_mem("After Total Loss")
+
+    # ==========================================
+    # Phase 5: 統計更新 & ログ出力
+    # ==========================================
+    if self.training and (self.global_step % 500 == 0):
+        self._print_router_bucket_debug(
+            r_info["best_bucket_indices"],
+            r_info["pred_bucket_indices"],
+            r_info["oracle_gaps"],
+            router_logits,
         )
 
-        pairwise_loss, pair_metrics = self._compute_pairwise_loss(sorted_data, n_pairwise, pt.device)
-        listwise_loss, pt_range = self._compute_listwise_loss(sorted_data, n_pairwise, pt.device)
-        phase_penalty = self._compute_phase_penalty()
+    self._update_bucket_stats(pt, qf, active_indices, loss_type)
 
-        # 既存の Router Loss (ロードバランシング・Margin)
-        router_loss, router_margin_loss = self._compute_router_loss(margin=0.3)
-        
-        # Soft Orthogonality Loss
-        ortho_loss = self._compute_ortho_loss(threshold=0.2)
+    self._log_debug_info(
+        loss_type,
+        loss,
+        base_loss,
+        pairwise_loss,
+        listwise_loss,
+        pt,
+        qf,
+        score,
+        scorenet,
+        active_indices,
+        kif_group_id_flat,
+        actual_lambda,
+        pair_metrics,
+        pt_range,
+        router_load_loss,
+        phase_penalty,
+        ortho_loss,
+        router_margin_loss,
+        ema_distill_loss,
+        router_ce_loss,
+        bucket_distill_loss,
+        r_info["router_acc"],
+        r_info["gap_mean"],
+        r_info["gap_median"],
+        r_info["gap_max"],
+        r_info["gw_mean"],
+        r_info["gw_median"],
+        r_info["gw_gt_05"],
+        r_info["gw_gt_08"],
+        r_info["router_acc_high"],
+        weights,
+    )
 
-        # --- Loss 重み係数の定義 ---
-        weights = {
-            'pairwise': 0.0100,
-            'listwise': 0.0300,
-            'phase': 0.0020,
-            'router': 0.0010,
-            'router_margin': 0.0010,
-            'router_ce': 0.0010,
-            'ortho': 0.0010,
-        }
+    self._log_debug_gpu_info()
+    self.print_mem("step_() end")
 
-        # --- Total Loss の計算 ---
-        loss = base_loss \
-             + (weights['pairwise']      * pairwise_loss) \
-             + (weights['listwise']      * listwise_loss) \
-             + (weights['phase']         * phase_penalty) \
-             + (weights['router']        * router_loss) \
-             + (weights['router_margin'] * router_margin_loss) \
-             + (weights['router_ce']     * router_ce_loss) \
-             + (weights['ortho']         * ortho_loss)
-
-        # バケット別損失集計に Router の結果を使用
-        self._update_bucket_stats(pt, qf, active_indices, loss_type)
-
-        self._log_debug_info(
-            loss_type, loss, base_loss, pairwise_loss, listwise_loss,
-            pt, qf, score, scorenet, active_indices, kif_group_id_flat, actual_lambda,
-            pair_metrics, pt_range, router_loss, phase_penalty, ortho_loss, router_margin_loss, 
-            router_ce_loss, r_info['router_acc'], r_info['gap_mean'], r_info['gap_median'], r_info['gap_max'],
-            r_info['gw_mean'], r_info['gw_median'], r_info['gw_gt_05'], r_info['gw_gt_08'], r_info['router_acc_high'],
-            weights
-        )
-
-        return loss
-
-
-  def _compute_router_teacher_loss(self, all_final_outputs, router_logits, pt):
-        """
-        全バケット出力からOracleターゲットを算出し、教師誘導 Router Loss (Hard CE + Soft KL) 
-        および各種メトリクスを計算する。
-        """
-        with torch.no_grad():
-            # 全12バケットの出力を評価値スケールに変換: [B, 12]
-            all_scorenet = all_final_outputs * self.nnue2score
-            
-            # 全12バケットの勝率 (all_qf) を一括計算: [B, 12]
-            all_q  = ( all_scorenet - self.offset1) / self.in_scaling
-            all_qm = (-all_scorenet - self.offset2) / self.in_scaling
-            all_qf = 0.5 * (1.0 + all_q.sigmoid() - all_qm.sigmoid())
-
-            # 教師ターゲット pt: [B, 1] と全バケット勝率: [B, 12] の絶対誤差を比較
-            bucket_errors = torch.abs(all_qf - pt.view(-1, 1))
-
-            # Top1 と Top2 の誤差差 (Gap) を算出
-            sorted_errors, _ = torch.sort(bucket_errors, dim=-1)
-            oracle_gaps = sorted_errors[:, 1] - sorted_errors[:, 0]
-
-            # 最も誤差が小さかったバケット (Oracle) および予測バケットの取得
-            best_bucket_indices = torch.argmin(bucket_errors, dim=-1)
-            pred_bucket_indices = torch.argmax(router_logits, dim=-1)
-            router_acc = (pred_bucket_indices == best_bucket_indices).float().mean()
-
-        # 1. Gap Weight (Sigmoid による連続的・滑らかな重み付け)
-        raw_gap_weight = torch.sigmoid((oracle_gaps - 0.008) / 0.003)
-        gap_weight = raw_gap_weight * 0.95 + 0.05
-
-        # 2. Hard Teacher (Gap 重み付き Cross-Entropy)
-        ce_per_sample = F.cross_entropy(router_logits, best_bucket_indices, reduction='none')
-        gap_weight_sum = gap_weight.sum()
-        if gap_weight_sum > 1e-6:
-            router_ce_loss = (ce_per_sample * gap_weight).sum() / gap_weight_sum
-        else:
-            router_ce_loss = ce_per_sample.mean()
-
-        # 3. Soft Teacher (誤差ベースの KL Divergence)
-        temp = 0.005
-        relative_errors = bucket_errors - bucket_errors.min(dim=1, keepdim=True).values
-        soft_targets = F.softmax(-relative_errors / temp, dim=-1)
-
-        router_logprob = F.log_softmax(router_logits, dim=-1)
-        router_kl_loss = F.kl_div(router_logprob, soft_targets, reduction='batchmean')
-
-        # 4. 損失の統合 (Hard CE を主軸にしたハイブリッド化)
-        alpha, beta = 0.9, 0.1
-        router_ce_loss = alpha * router_ce_loss + beta * router_kl_loss
-
-        # ログ出力タイミング（例: 100ステップ毎）のみ統計計算を行う
-        if self.training and (self.global_step % 100 == 0):
-            with torch.no_grad():
-                gw_mean   = gap_weight.mean().item()
-                gw_median = gap_weight.median().item()
-                gw_gt_05  = (gap_weight > 0.5).float().mean().item() * 100
-                gw_gt_08  = (gap_weight > 0.8).float().mean().item() * 100
-
-                high_gap_mask = gap_weight > 0.5
-                if high_gap_mask.sum() > 0:
-                    router_acc_high = (pred_bucket_indices[high_gap_mask] == best_bucket_indices[high_gap_mask]).float().mean().item() * 100
-                else:
-                    router_acc_high = 0.0
-        else:
-            # ログを出力しないステップではダミー値（またはNone）を入れておく
-            gw_mean = gw_median = gw_gt_05 = gw_gt_08 = router_acc_high = 0.0
-
-        metrics = {
-            'router_acc': router_acc,
-            'gap_mean': oracle_gaps.mean().item(),
-            'gap_median': oracle_gaps.median().item(),
-            'gap_max': oracle_gaps.max().item(),
-            'gw_mean': gw_mean,
-            'gw_median': gw_median,
-            'gw_gt_05': gw_gt_05,
-            'gw_gt_08': gw_gt_08,
-            'router_acc_high': router_acc_high,
-            'best_bucket_indices': best_bucket_indices,
-            'pred_bucket_indices': pred_bucket_indices,
-            'oracle_gaps': oracle_gaps,
-        }
-
-        return router_ce_loss, metrics
-
-  def _print_router_bucket_debug(self, best_bucket_indices, pred_bucket_indices, oracle_gaps, router_logits):
-        """定期ログ用: 詳細なバケット別 Gap / 精度解析を出力する"""
-        with torch.no_grad():
-            num_buckets = self.layer_stacks.count
-
-            # --- Router Softmax 確率の計算 ---
-            router_probs = F.softmax(router_logits, dim=-1) # [B, num_buckets]
-
-            oracle_counts = torch.bincount(best_bucket_indices, minlength=num_buckets)
-            pred_counts   = torch.bincount(pred_bucket_indices, minlength=num_buckets)
-
-            is_correct = (pred_bucket_indices == best_bucket_indices)
-            correct_counts = torch.bincount(best_bucket_indices[is_correct], minlength=num_buckets)
-            per_bucket_acc = (correct_counts.float() / (oracle_counts.float() + 1e-8) * 100)
-
-            best_gap_means, pred_gap_means, oracle_prob_means = [], [], []
-            for b in range(num_buckets):
-                b_mask = (best_bucket_indices == b)
-                b_gap = oracle_gaps[b_mask].mean().item() if b_mask.any() else float('nan')
-                best_gap_means.append(round(b_gap, 6))
-
-                # --- 変更点: * 100 して % 表記（小数第1位まで）にする ---
-                b_prob = (router_probs[b_mask, b].mean().item() * 100) if b_mask.any() else float('nan')
-                oracle_prob_means.append(round(b_prob, 1))
-
-                p_mask = (pred_bucket_indices == b)
-                p_gap = oracle_gaps[p_mask].mean().item() if p_mask.any() else float('nan')
-                pred_gap_means.append(round(p_gap, 6))
-
-            pred_cond_acc = []
-            for b in range(num_buckets):
-                p_mask = (pred_bucket_indices == b)
-                correct_when_pred = (best_bucket_indices[p_mask] == b).float().mean().item() * 100 if p_mask.any() else float('nan')
-                pred_cond_acc.append(round(correct_when_pred, 2))
-
-            high_gap_thr = 0.01
-            high_gap_mask = oracle_gaps > high_gap_thr
-            high_gap_acc_per_bucket = []
-            for b in range(num_buckets):
-                mask = (best_bucket_indices == b) & high_gap_mask
-                acc = (pred_bucket_indices[mask] == best_bucket_indices[mask]).float().mean().item() * 100 if mask.any() else float('nan')
-                high_gap_acc_per_bucket.append(round(acc, 2))
-
-            pred_gap_correct, pred_gap_wrong = [], []
-            for b in range(num_buckets):
-                p_mask = (pred_bucket_indices == b)
-                if p_mask.any():
-                    correct_mask = p_mask & (best_bucket_indices == pred_bucket_indices)
-                    wrong_mask = p_mask & (best_bucket_indices != pred_bucket_indices)
-                    mean_correct = oracle_gaps[correct_mask].mean().item() if correct_mask.any() else float('nan')
-                    mean_wrong = oracle_gaps[wrong_mask].mean().item() if wrong_mask.any() else float('nan')
-                else:
-                    mean_correct, mean_wrong = float('nan'), float('nan')
-                pred_gap_correct.append(round(mean_correct, 6))
-                pred_gap_wrong.append(round(mean_wrong, 6))
-
-            conf_mat = torch.zeros((num_buckets, num_buckets), dtype=torch.int64)
-            for o, p in zip(best_bucket_indices.tolist(), pred_bucket_indices.tolist()):
-                conf_mat[o, p] += 1
-
-        print("\n[BUCKET DISTRIBUTION DEBUG]")
-        print(f"  Oracle Counts (正解件数) : {oracle_counts.tolist()}")
-        print(f"  Pred Counts   (予測件数) : {pred_counts.tolist()}")
-        print(f"  Bucket Accs   (精度 % )  : {[round(a,1) for a in per_bucket_acc.tolist()]}")
-        print(f"  Oracle Target Probs (正解確率 %): {oracle_prob_means}")  # <- % 表記
-        print(f"  Best Gaps     (正解時Gap): {best_gap_means}")
-        print(f"  Pred Gaps     (予測時Gap): {pred_gap_means}")
-        print(f"  Pred-Cond Acc (% when Pred=b): {pred_cond_acc}")
-        print(f"  HighGap Acc (gap>{high_gap_thr}) : {high_gap_acc_per_bucket}")
-        print(f"  Pred Gap Mean (when correct) : {pred_gap_correct}")
-        print(f"  Pred Gap Mean (when wrong)   : {pred_gap_wrong}")
-        print("\n  Confusion Matrix (rows=Oracle, cols=Pred):")
-        for i in range(num_buckets):
-            row = conf_mat[i].tolist()
-            print(f"    B{i:02d}: {row}")
+    return loss
 
 
   def _get_actual_lambda(self, loss_type):
@@ -1276,6 +1289,7 @@ class NNUE(pl.LightningModule):
           return lambda_dict[loss_type]
       return self.start_lambda + (self.end_lambda - self.start_lambda) * (self.current_epoch / self.max_epoch)
 
+
   def _compute_base_loss(self, pt, qf, pf, kif_group_id_flat):
       loss_elements = torch.pow(torch.abs(pt - qf), 2.5)
       loss_elements = loss_elements * ((qf > pt) * self.adjust_loss + 1)
@@ -1288,6 +1302,317 @@ class NNUE(pl.LightningModule):
       if base_loss_mask.any():
           return (loss_elements.view(-1)[base_loss_mask] * weights_flat[base_loss_mask]).sum() / weights_flat[base_loss_mask].sum()
       return torch.tensor(0.0, device=pt.device)
+
+
+  def _compute_ema_loss(
+      self,
+      scorenet: torch.Tensor,
+      router_logits: torch.Tensor,
+      all_final_outputs: torch.Tensor,
+      us,
+      them,
+      white_indices,
+      white_values,
+      black_indices,
+      black_values,
+      layer_stack_indices,
+  ) -> torch.Tensor:
+      """EMA (Teacher) モデルとの Consistency Loss を計算する。"""
+      
+      # EMAネット (Teacher) の推論
+      with torch.no_grad():
+          self.ema_model.eval()
+          scorenet_ema, router_logits_ema, all_outputs_ema = self.ema_model(
+              us,
+              them,
+              white_indices,
+              white_values,
+              black_indices,
+              black_values,
+              layer_stack_indices,
+          )
+          scorenet_ema = scorenet_ema * self.nnue2score
+          all_outputs_ema = all_outputs_ema * self.nnue2score
+  
+      # 1. 主出力 (全バケット) の Consistency Loss
+      # scorenet 単体ではなく、全12バケットの出力に対して平滑化誤差をとる
+      score_ema_loss = F.smooth_l1_loss(all_final_outputs * self.nnue2score, all_outputs_ema, beta=10.0)
+  
+      # 2. Router の Consistency Loss (KL Divergence による分布の一致)
+      p_student = F.log_softmax(router_logits, dim=-1)
+      q_teacher = F.softmax(router_logits_ema, dim=-1)
+      router_ema_loss = F.kl_div(p_student, q_teacher, reduction='batchmean')
+  
+      # 3. 統合 (重み比率は状況に応じて調整)
+      total_ema_loss = score_ema_loss + 0.1 * router_ema_loss
+  
+      # 定期デバッグ出力
+      if self.training and (self.global_step % 500 == 0):
+          with torch.no_grad():
+              cp_diff = torch.abs(scorenet - scorenet_ema)
+              print("[EMA DEBUG]")
+              print(f"  Student CP : mean={scorenet.abs().mean():.2f}")
+              print(f"  EMA CP     : mean={scorenet_ema.abs().mean():.2f}")
+              print(f"  CP diff    : mean={cp_diff.mean():.2f} / median={cp_diff.median():.2f}")
+              print(f"  Router KL  : {router_ema_loss.item():.5f}")
+  
+      return total_ema_loss
+
+
+  def _compute_router_teacher_loss(self, all_final_outputs, router_logits, pt):
+    """
+    全バケット出力からOracleターゲットを算出し、教師誘導 Router Loss (Hard CE + Soft KL) 
+    および各種メトリクスを計算する。
+    """
+    with torch.no_grad():
+        # 全12バケットの出力を評価値スケールに変換: [B, 12]
+        all_scorenet = all_final_outputs * self.nnue2score
+        
+        # 全12バケットの勝率 (all_qf) を一括計算: [B, 12]
+        all_q  = ( all_scorenet - self.offset1) / self.in_scaling
+        all_qm = (-all_scorenet - self.offset2) / self.in_scaling
+        all_qf = 0.5 * (1.0 + all_q.sigmoid() - all_qm.sigmoid())
+
+        # 教師ターゲット pt: [B, 1] と全バケット勝率: [B, 12] の絶対誤差を比較
+        bucket_errors = torch.abs(all_qf - pt.view(-1, 1))
+
+        # Top1 と Top2 の誤差差 (Gap) を算出
+        sorted_errors, _ = torch.sort(bucket_errors, dim=-1)
+        oracle_gaps = sorted_errors[:, 1] - sorted_errors[:, 0]
+
+        # 最も誤差が小さかったバケット (Oracle) および予測バケットの取得
+        best_bucket_indices = torch.argmin(bucket_errors, dim=-1)
+        pred_bucket_indices = torch.argmax(router_logits, dim=-1)
+        router_acc = (pred_bucket_indices == best_bucket_indices).float().mean()
+
+    # 1. Gap Weight (Sigmoid による連続的・滑らかな重み付け)
+    raw_gap_weight = torch.sigmoid((oracle_gaps - 0.008) / 0.003)
+    gap_weight = raw_gap_weight * 0.95 + 0.05
+
+    # 2. Hard Teacher (Gap 重み付き Cross-Entropy)
+    ce_per_sample = F.cross_entropy(router_logits, best_bucket_indices, reduction='none')
+    gap_weight_sum = gap_weight.sum()
+    if gap_weight_sum > 1e-6:
+        router_ce_loss = (ce_per_sample * gap_weight).sum() / gap_weight_sum
+    else:
+        router_ce_loss = ce_per_sample.mean()
+
+    # 3. Soft Teacher (誤差ベースの KL Divergence)
+    temp = 0.005
+    relative_errors = bucket_errors - bucket_errors.min(dim=1, keepdim=True).values
+    soft_targets = F.softmax(-relative_errors / temp, dim=-1)
+
+    router_logprob = F.log_softmax(router_logits, dim=-1)
+    router_kl_loss = F.kl_div(router_logprob, soft_targets, reduction='batchmean')
+
+    # 4. 損失の統合 (Hard CE を主軸にしたハイブリッド化)
+    alpha, beta = 0.7, 0.3
+    router_ce_loss = alpha * router_ce_loss + beta * router_kl_loss
+
+    # 辞書の初期化時にデフォルト値を設定しておく
+    metrics = {
+        'router_acc': router_acc,
+        'gap_mean': oracle_gaps.mean().item(),
+        'gap_median': oracle_gaps.median().item(),
+        'gap_max': oracle_gaps.max().item(),
+        'best_bucket_indices': best_bucket_indices,
+        'pred_bucket_indices': pred_bucket_indices,
+        'oracle_gaps': oracle_gaps,
+        'gap_weight': gap_weight,
+        # デフォルト値を設定 (KeyError 防止)
+        'gw_mean': 0.0,
+        'gw_median': 0.0,
+        'gw_gt_05': 0.0,
+        'gw_gt_08': 0.0,
+        'router_acc_high': 0.0,
+    }
+
+    # 100ステップ毎のみ実際の値を上書き計算
+    if self.training and (self.global_step % 100 == 0):
+        with torch.no_grad():
+            metrics['gw_mean'] = gap_weight.mean().item()
+            metrics['gw_median'] = gap_weight.median().item()
+            metrics['gw_gt_05'] = (gap_weight > 0.5).float().mean().item() * 100
+            metrics['gw_gt_08'] = (gap_weight > 0.8).float().mean().item() * 100
+
+            high_gap_mask = gap_weight > 0.5
+            if high_gap_mask.sum() > 0:
+                metrics['router_acc_high'] = (pred_bucket_indices[high_gap_mask] == best_bucket_indices[high_gap_mask]).float().mean().item() * 100
+            else:
+                metrics['router_acc_high'] = 0.0
+
+    return router_ce_loss, metrics
+
+
+  def _compute_router_loss(self,
+                         best_bucket_indices,
+                         oracle_gaps,
+                         margin_base=0.05,
+                         margin_scale=0.25,
+                         margin_min=0.02,
+                         margin_max=0.3,
+                         soft_incorrect_weight=0.2,
+                         use_logit_margin=False):  # デフォルトは確率空間(False)を推奨
+    """
+    Returns: (router_load_loss, router_margin_loss)
+    """
+    if not hasattr(self.layer_stacks, 'last_router_probs') or self.layer_stacks.last_router_probs is None:
+        zero = torch.tensor(0.0, device=self.device)
+        return zero, zero
+
+    probs = self.layer_stacks.last_router_probs  # [B, num_buckets]
+    device = probs.device
+    best_bucket_indices = best_bucket_indices.to(device)
+    oracle_gaps = oracle_gaps.to(device)
+
+    num_buckets = probs.shape[-1]
+
+    # 1) Load balancing loss
+    chosen_buckets = torch.argmax(probs, dim=-1)
+    hard_fractions = F.one_hot(chosen_buckets, num_classes=num_buckets).float().mean(dim=0)
+    mean_probs = probs.mean(dim=0)
+    router_load_loss = num_buckets * torch.sum(hard_fractions * mean_probs)
+
+    # 2) Target prob / logit と Other max の差分計算
+    target_probs = torch.gather(probs, dim=-1, index=best_bucket_indices.unsqueeze(-1)).squeeze(-1)
+
+    masked_probs = probs.clone()
+    masked_probs.scatter_(dim=-1, index=best_bucket_indices.unsqueeze(-1), value=-1.0)
+    max_other_probs, _ = torch.max(masked_probs, dim=-1)
+
+    if use_logit_margin and hasattr(self.layer_stacks, 'last_router_logits'):
+        logits = self.layer_stacks.last_router_logits.to(device)
+        target_logits = torch.gather(logits, dim=-1, index=best_bucket_indices.unsqueeze(-1)).squeeze(-1)
+        
+        masked_logits = logits.clone()
+        masked_logits.scatter_(dim=-1, index=best_bucket_indices.unsqueeze(-1), value=-1e9)
+        max_other_logits, _ = torch.max(masked_logits, dim=-1)
+        
+        margin_diff = target_logits - max_other_logits
+        
+        # Logit 空間用の Target Margin スケール (例: 0.2 ~ 1.2)
+        raw_margin_target = 0.2 + 1.0 * torch.sigmoid((oracle_gaps - 0.008) / 0.003)
+        margin_target = raw_margin_target.clamp(min=0.1, max=1.5)
+    else:
+        margin_diff = target_probs - max_other_probs
+        
+        # 確率空間用の Target Margin スケール (0.05 ~ 0.30)
+        raw_margin_target = margin_base + margin_scale * torch.sigmoid((oracle_gaps - 0.008) / 0.003)
+        margin_target = raw_margin_target.clamp(min=margin_min, max=margin_max)
+
+    # 3) apply_mask: 正解時 1.0 / 不正解時は確信度に応じたソフトな重み
+    pred_bucket_indices = torch.argmax(probs, dim=-1)
+    correct_mask = (pred_bucket_indices == best_bucket_indices).float()
+    top1_conf = torch.gather(probs, dim=-1, index=pred_bucket_indices.unsqueeze(-1)).squeeze(-1)
+    
+    apply_mask = correct_mask + (1.0 - correct_mask) * (soft_incorrect_weight * top1_conf)
+    apply_mask = apply_mask.clamp(0.0, 1.0)
+
+    # 4) Hinge loss & Weighted average
+    raw_margin_loss = F.relu(margin_target - margin_diff)
+    weighted_sum = (raw_margin_loss * apply_mask).sum()
+    denom = apply_mask.sum().clamp(min=1e-6)
+    router_margin_loss = weighted_sum / denom
+
+    return router_load_loss, router_margin_loss
+
+
+  def _compute_bucket_distill_loss(
+      self,
+      all_final_outputs,
+      pt,
+      active_indices,
+      oracle_top_k=2,
+  ):
+      """
+      Oracleに近い未選択bucketだけをptへ蒸留する。
+      """
+  
+      all_scorenet = all_final_outputs * self.nnue2score
+  
+      all_q = (all_scorenet - self.offset1) / self.in_scaling
+      all_qm = (-all_scorenet - self.offset2) / self.in_scaling
+  
+      all_qf = 0.5 * (
+          1.0
+          + all_q.sigmoid()
+          - all_qm.sigmoid()
+      )
+  
+      pt_target = pt.view(-1, 1).detach()
+  
+      # 各bucketの教師との距離
+      errors = torch.abs(all_qf - pt_target)
+  
+      # Oracle Top-K
+      _, oracle_indices = torch.topk(
+          errors,
+          k=oracle_top_k,
+          dim=1,
+          largest=False,
+      )
+  
+      num_buckets = all_final_outputs.shape[1]
+  
+      bucket_ids = torch.arange(
+          num_buckets,
+          device=all_final_outputs.device,
+      ).view(1, -1)
+  
+      active = active_indices.view(-1, 1)
+  
+      # Oracle Top-Kに入っているbucket
+      oracle_mask = torch.zeros_like(errors, dtype=torch.bool)
+  
+      oracle_mask.scatter_(
+          1,
+          oracle_indices,
+          True,
+      )
+  
+      # ただし選択済みbucketは除外
+      unselected_mask = bucket_ids != active
+  
+      mask = oracle_mask & unselected_mask
+  
+      batch_size = all_final_outputs.shape[0]
+
+      if not mask.any():
+          distill_loss = all_final_outputs.sum() * 0.0
+          valid_count = 0
+      else:
+          distill_loss = F.smooth_l1_loss(
+              all_qf[mask],
+              pt_target.expand_as(all_qf)[mask],
+              beta=0.01,
+              reduction="mean",
+          )
+          # 少なくとも1つの未選択Oracleバケットが割り当たったサンプル数
+          valid_count = mask.any(dim=1).sum().item()
+
+      # ログ表示
+      if self.training and (self.global_step % 500 == 0):
+          bucket_stats = []
+          for i in range(num_buckets):
+              m_i = mask[:, i]
+              cnt = m_i.sum().item()
+              if cnt > 0:
+                  # Top-2に入った局面における平均絶対誤差 (Abs Error)
+                  avg_err = errors[:, i][m_i].mean().item()
+                  bucket_stats.append(f"B{i:02d}: count={cnt:<4d} error={avg_err:.3f}")
+              else:
+                  bucket_stats.append(f"B{i:02d}: count=0    error=0.000")
+  
+          print("[BUCKET DISTILL]")
+          print(f"Loss: {distill_loss.item():.5f}")
+          print(f"Valid: {valid_count} / {batch_size}")
+          print("Target Bucket Detail:")
+          # 見やすく4バケットずつ改行して表示
+          for b in range(0, num_buckets, 4):
+              print("  " + " | ".join(bucket_stats[b : b + 4]))
+
+      return distill_loss
+
 
   def _prepare_sorted_data(self, pairwise_mask, n_pairwise, pt, qf, score, scorenet, active_indices, material):
       if n_pairwise <= 1:
@@ -1306,7 +1631,10 @@ class NNUE(pl.LightningModule):
           print(f"  [pt_p]       Min: {pt_p.min().item():.4f} | Max: {pt_p.max().item():.4f}")
 
       #sort_key = material_p + pt_p
-      sort_key = pt_p
+      #sort_key = pt_p
+
+      material_bin = torch.round(material_p / 200.0)
+      sort_key = material_bin * 10.0 + pt_p
 
       sorted_indices = torch.argsort(sort_key)
 
@@ -1318,6 +1646,7 @@ class NNUE(pl.LightningModule):
           'lsind': lsind_p[sorted_indices],
           'material': material_p[sorted_indices],
       }
+
 
   def _compute_pairwise_loss(self, sorted_data, n_pairwise, device):
       default_metrics = {
@@ -1403,6 +1732,7 @@ class NNUE(pl.LightningModule):
 
       return pairwise_loss, metrics
 
+
   def _compute_listwise_loss(self, sorted_data, n_pairwise, device):
       if sorted_data is None:
           return torch.tensor(0.0, device=device), None
@@ -1465,6 +1795,7 @@ class NNUE(pl.LightningModule):
 
       return torch.tensor(0.0, device=device), None
 
+
   def _compute_phase_penalty(self):
       phase = getattr(self.layer_stacks, 'current_phase_for_loss', None)
       if phase is None:
@@ -1484,40 +1815,6 @@ class NNUE(pl.LightningModule):
       std_penalty = torch.mean(torch.clamp(0.15 - p_stds, min=0) ** 2)
 
       return mean_penalty + mean_bounds_penalty + std_penalty
-
-
-  def _compute_router_loss(self, margin=0.3):
-        if not hasattr(self.layer_stacks, 'last_router_probs') or self.layer_stacks.last_router_probs is None:
-            zero_tensor = torch.tensor(0.0, device=self.device)
-            return zero_tensor, zero_tensor
-
-        probs = self.layer_stacks.last_router_probs  # [batch_size, num_buckets]
-        num_buckets = probs.shape[-1]
-
-        # 1. 実際に Argmax で選ばれたバケット (ハード選択) の頻度 f_i を計算
-        chosen_buckets = torch.argmax(probs, dim=-1)  # [batch_size]
-        
-        # one_hot化してバッチ内の選択割合 (f_i) を算出
-        hard_fractions = torch.nn.functional.one_hot(
-            chosen_buckets, num_classes=num_buckets
-        ).float().mean(dim=0)  # [num_buckets]
-
-        # 2. Router の Softmax 確率の平均 (P_i)
-        mean_probs = probs.mean(dim=0)  # [num_buckets]
-
-        # 3. Load Balancing Loss
-        router_loss = num_buckets * torch.sum(hard_fractions * mean_probs)
-
-        # 4. Router Margin Loss (Top1確率 - Top2確率の差を広げるペナルティ)
-        top2_probs, _ = torch.topk(probs, k=2, dim=-1)
-        top1_p = top2_probs[:, 0]
-        top2_p = top2_probs[:, 1]
-
-        # (Top1確率 - Top2確率) が margin (例: 0.3) 未満のケースにペナルティ
-        margin_diff = top1_p - top2_p
-        router_margin_loss = F.relu(margin - margin_diff).mean()
-
-        return router_loss, router_margin_loss
 
 
   def _compute_ortho_loss(self, threshold=0.2):
@@ -1557,6 +1854,83 @@ class NNUE(pl.LightningModule):
         return ortho_loss
 
 
+  def _print_router_bucket_debug(self, best_bucket_indices, pred_bucket_indices, oracle_gaps, router_logits):
+        """定期ログ用: 詳細なバケット別 Gap / 精度解析を出力する"""
+        with torch.no_grad():
+            num_buckets = self.layer_stacks.count
+
+            # --- Router Softmax 確率の計算 ---
+            router_probs = F.softmax(router_logits, dim=-1) # [B, num_buckets]
+
+            oracle_counts = torch.bincount(best_bucket_indices, minlength=num_buckets)
+            pred_counts   = torch.bincount(pred_bucket_indices, minlength=num_buckets)
+
+            is_correct = (pred_bucket_indices == best_bucket_indices)
+            correct_counts = torch.bincount(best_bucket_indices[is_correct], minlength=num_buckets)
+            per_bucket_acc = (correct_counts.float() / (oracle_counts.float() + 1e-8) * 100)
+
+            best_gap_means, pred_gap_means, oracle_prob_means = [], [], []
+            for b in range(num_buckets):
+                b_mask = (best_bucket_indices == b)
+                b_gap = oracle_gaps[b_mask].mean().item() if b_mask.any() else float('nan')
+                best_gap_means.append(round(b_gap, 6))
+
+                # --- 変更点: * 100 して % 表記（小数第1位まで）にする ---
+                b_prob = (router_probs[b_mask, b].mean().item() * 100) if b_mask.any() else float('nan')
+                oracle_prob_means.append(round(b_prob, 1))
+
+                p_mask = (pred_bucket_indices == b)
+                p_gap = oracle_gaps[p_mask].mean().item() if p_mask.any() else float('nan')
+                pred_gap_means.append(round(p_gap, 6))
+
+            pred_cond_acc = []
+            for b in range(num_buckets):
+                p_mask = (pred_bucket_indices == b)
+                correct_when_pred = (best_bucket_indices[p_mask] == b).float().mean().item() * 100 if p_mask.any() else float('nan')
+                pred_cond_acc.append(round(correct_when_pred, 2))
+
+            high_gap_thr = 0.01
+            high_gap_mask = oracle_gaps > high_gap_thr
+            high_gap_acc_per_bucket = []
+            for b in range(num_buckets):
+                mask = (best_bucket_indices == b) & high_gap_mask
+                acc = (pred_bucket_indices[mask] == best_bucket_indices[mask]).float().mean().item() * 100 if mask.any() else float('nan')
+                high_gap_acc_per_bucket.append(round(acc, 2))
+
+            pred_gap_correct, pred_gap_wrong = [], []
+            for b in range(num_buckets):
+                p_mask = (pred_bucket_indices == b)
+                if p_mask.any():
+                    correct_mask = p_mask & (best_bucket_indices == pred_bucket_indices)
+                    wrong_mask = p_mask & (best_bucket_indices != pred_bucket_indices)
+                    mean_correct = oracle_gaps[correct_mask].mean().item() if correct_mask.any() else float('nan')
+                    mean_wrong = oracle_gaps[wrong_mask].mean().item() if wrong_mask.any() else float('nan')
+                else:
+                    mean_correct, mean_wrong = float('nan'), float('nan')
+                pred_gap_correct.append(round(mean_correct, 6))
+                pred_gap_wrong.append(round(mean_wrong, 6))
+
+            conf_mat = torch.zeros((num_buckets, num_buckets), dtype=torch.int64)
+            for o, p in zip(best_bucket_indices.tolist(), pred_bucket_indices.tolist()):
+                conf_mat[o, p] += 1
+
+        print("\n[BUCKET DISTRIBUTION DEBUG]")
+        print(f"  Oracle Counts (正解件数) : {oracle_counts.tolist()}")
+        print(f"  Pred Counts   (予測件数) : {pred_counts.tolist()}")
+        print(f"  Bucket Accs   (精度 % )  : {[round(a,1) for a in per_bucket_acc.tolist()]}")
+        print(f"  Oracle Target Probs (正解確率 %): {oracle_prob_means}")  # <- % 表記
+        print(f"  Best Gaps     (正解時Gap): {best_gap_means}")
+        print(f"  Pred Gaps     (予測時Gap): {pred_gap_means}")
+        print(f"  Pred-Cond Acc (% when Pred=b): {pred_cond_acc}")
+        print(f"  HighGap Acc (gap>{high_gap_thr}) : {high_gap_acc_per_bucket}")
+        print(f"  Pred Gap Mean (when correct) : {pred_gap_correct}")
+        print(f"  Pred Gap Mean (when wrong)   : {pred_gap_wrong}")
+        print("\n  Confusion Matrix (rows=Oracle, cols=Pred):")
+        for i in range(num_buckets):
+            row = conf_mat[i].tolist()
+            print(f"    B{i:02d}: {row}")
+
+
   def _update_bucket_stats(self, pt, qf, active_indices, loss_type):
       with torch.no_grad():
           loss_per_sample = torch.pow(torch.abs(pt - qf), 2.5).detach().squeeze()
@@ -1576,8 +1950,8 @@ class NNUE(pl.LightningModule):
         self,
         loss_type, loss, base_loss, pairwise_loss, listwise_loss,
         pt, qf, score, scorenet, active_indices, kif_group_id_flat, actual_lambda,
-        pair_metrics, pt_range, router_loss, phase_penalty, ortho_loss, router_margin_loss,
-        router_ce_loss, router_acc, gap_mean, gap_median, gap_max
+        pair_metrics, pt_range, router_load_loss, phase_penalty, ortho_loss, router_margin_loss, ema_distill_loss,
+        router_ce_loss, bucket_distill_loss, router_acc, gap_mean, gap_median, gap_max
         , gw_mean, gw_median, gw_gt_05, gw_gt_08, router_acc_high
         , weights
     ):
@@ -1592,37 +1966,33 @@ class NNUE(pl.LightningModule):
         mean_base   = _to_float(base_loss)
         mean_pair   = _to_float(pairwise_loss)
         mean_list   = _to_float(listwise_loss)
-        mean_router = _to_float(router_loss)
+        mean_router = _to_float(router_load_loss)
         mean_margin = _to_float(router_margin_loss)
         mean_ce     = _to_float(router_ce_loss) # ★ 追加
         mean_acc = _to_float(router_acc) # ★ 追加
         mean_phase  = _to_float(phase_penalty)
         mean_ortho  = _to_float(ortho_loss)
+        mean_ema_distill  = _to_float(ema_distill_loss)
+        mean_bucket_distill = _to_float(bucket_distill_loss)
         mean_total  = _to_float(loss)
 
-        w_pair_coef   = weights.get('pairwise', 0.010) if weights else 0.010
-        w_list_coef   = weights.get('listwise', 0.030) if weights else 0.030
-        w_phase_coef  = weights.get('phase', 0.002) if weights else 0.002
-        w_router_coef = weights.get('router', 0.001) if weights else 0.001
-        w_margin_coef = weights.get('router_margin', 0.001) if weights else 0.001
-        w_ce_coef     = weights.get('router_ce', 0.001) if weights else 0.001 # ★ 追加
-        w_ortho_coef  = weights.get('ortho', 0.001) if weights else 0.001
-
         w_base   = mean_base
-        w_pair   = mean_pair   * w_pair_coef
-        w_list   = mean_list   * w_list_coef
-        w_phase  = mean_phase  * w_phase_coef
-        w_router = mean_router * w_router_coef
-        w_margin = mean_margin * w_margin_coef
-        w_ce     = mean_ce     * w_ce_coef # ★ 追加
-        w_ortho  = mean_ortho  * w_ortho_coef
+        w_pair   = mean_pair   * weights["pairwise"]
+        w_list   = mean_list   * weights["listwise"]
+        w_phase  = mean_phase  * weights["phase"]
+        w_router = mean_router * weights["router_load"]
+        w_margin = mean_margin * weights["router_margin"]
+        w_ce     = mean_ce     * weights["router_ce"]
+        w_ortho  = mean_ortho  * weights["ortho"]
+        w_ema_distill = mean_ema_distill * weights["ema_distill"]
+        w_bucket_distill = mean_bucket_distill * weights["bucket_distill"]
 
         if self.training:
             self.log("train/base_loss", mean_base, prog_bar=False)
             self.log("train/pairwise_loss", mean_pair, prog_bar=False)
             self.log("train/listwise_loss", mean_list, prog_bar=False)
-            if router_loss is not None:
-                self.log("train/router_loss", mean_router, prog_bar=False)
+            if router_load_loss is not None:
+                self.log("train/router_load_loss", mean_router, prog_bar=False)
             if router_margin_loss is not None:
                 self.log("train/router_margin_loss", mean_margin, prog_bar=False)
             if router_ce_loss is not None:
@@ -1632,6 +2002,10 @@ class NNUE(pl.LightningModule):
                 self.log("train/phase_penalty", mean_phase, prog_bar=False)
             if ortho_loss is not None:
                 self.log("train/ortho_loss", mean_ortho, prog_bar=False)
+            if ema_distill_loss is not None:
+                self.log("train/ema_distill_loss", mean_ema_distill, prog_bar=False)
+            if bucket_distill_loss is not None:
+                self.log("train/bucket_distill_loss", mean_bucket_distill, prog_bar=False)
 
         if self.training and (self.global_step % 500 == 0):
             valid_count = pair_metrics['total_valid_pairs']
@@ -1641,12 +2015,14 @@ class NNUE(pl.LightningModule):
                   f"Base: {mean_base:.6f} | "
                   f"Pairwise: {mean_pair:.6f} (w: {w_pair:.6f}) | "
                   f"Listwise: {mean_list:.6f} (w: {w_list:.6f}) | "
-                  f"Router: {mean_router:.6f} (w: {w_router:.6f}) | "
+                  f"Router_Load: {mean_router:.6f} (w: {w_router:.6f}) | "
                   f"R_Margin: {mean_margin:.6f} (w: {w_margin:.6f}) | "
                   f"R_CE: {mean_ce:.6f} (w: {w_ce:.6f}) (Acc: {mean_acc:.2%}) | " # ★ (Acc: xx.xx%) で表示！
                   f"Oracle Gap (Mean: {gap_mean:.6f}, Med: {gap_median:.6f}, Max: {gap_max:.6f}) | " # ★ 追加
                   f"Phase: {mean_phase:.6f} (w: {w_phase:.6f}) | "
-                  f"Ortho: {mean_ortho:.6f} (w: {w_ortho:.6f}) "
+                  f"Ortho: {mean_ortho:.6f} (w: {w_ortho:.6f}) | "
+                  f"Ema_Distill: {mean_ema_distill:.6f} (w: {w_ema_distill:.6f}) | "
+                  f"Bucket_Distill: {mean_bucket_distill:.6f} (w: {w_bucket_distill:.6f}) | "
                   f"(Valid Pairs: {valid_count}/{max_possible})")
 
             print(f"[GAP WEIGHT DEBUG] "
@@ -1765,8 +2141,8 @@ class NNUE(pl.LightningModule):
             self.log("val_loss/base_loss", mean_base, prog_bar=False)
             self.log("val_loss/pairwise_loss", mean_pair, prog_bar=False)
             self.log("val_loss/listwise_loss", mean_list, prog_bar=False)
-            if router_loss is not None:
-                self.log("val_loss/router_loss", mean_router, prog_bar=False)
+            if router_load_loss is not None:
+                self.log("val_loss/router_load_loss", mean_router, prog_bar=False)
             if router_ce_loss is not None:
                 self.log("val_loss/router_ce_loss", mean_ce, prog_bar=False) # ★ 追加
 
@@ -1783,6 +2159,46 @@ class NNUE(pl.LightningModule):
                 self.log("val_loss/value_diff_cp_mae", 0.0, prog_bar=False)
 
         self.log(loss_type, loss)
+
+
+  def _log_debug_gpu_info(self):
+      if self.training and (self.global_step % 500 == 0):
+          print(f"\n[_log_debug_gpu_info] Step: {self.global_step}")
+          #print(torch.cuda.memory_summary())
+          print("allocated:", torch.cuda.memory_allocated() / 1024**3, "GB")
+          print("reserved:",  torch.cuda.memory_reserved() / 1024**3, "GB")
+          print("max allocated:", torch.cuda.max_memory_allocated() / 1024**3, "GB")
+
+          """
+          import gc
+          for obj in gc.get_objects():
+              try:
+                  if torch.is_tensor(obj) and obj.is_cuda:
+                      print(
+                          obj.shape,
+                          obj.dtype,
+                          obj.numel() * obj.element_size() / 1024**3,
+                          obj.device
+                      )
+              except:
+                  pass
+          """
+
+      if self.training and (self.global_step % 500 == 0):
+          import gc
+          gc.collect()
+          torch.cuda.empty_cache()
+
+          print("torch.cuda.empty_cache()!!")
+          print("allocated:", torch.cuda.memory_allocated() / 1024**3, "GB")
+          print("reserved:",  torch.cuda.memory_reserved() / 1024**3, "GB")
+          print("max allocated:", torch.cuda.max_memory_allocated() / 1024**3, "GB")
+
+
+  def print_mem(self, tag):
+      if self.training and (self.global_step % 500 == 1):
+          mb = torch.cuda.memory_allocated() / (1024**2)
+          print(f"[{tag}] Allocated Memory: {mb:.2f} MB")
 
 
   def training_step(self, batch, batch_idx):
@@ -1853,6 +2269,50 @@ class NNUE(pl.LightningModule):
             self.log("pair_w_avg_total/mul",  pw_softmax[:, :, 0].mean())
             self.log("pair_w_avg_total/diff", pw_softmax[:, :, 1].mean())
             self.log("pair_w_avg_total/sum",  pw_softmax[:, :, 2].mean())
+
+
+    """バッチ学習終了後にEMAモデルの重みを更新"""
+    if self.training:
+        with torch.no_grad():
+            decay = 0.9995
+            # Student (self) の重みを Teacher (self.ema_model) に EMA更新
+            for p_student, p_ema in zip(self.parameters(), self.ema_model.parameters()):
+                p_ema.data.mul_(decay).add_(p_student.data, alpha=1.0 - decay)
+
+
+  def on_fit_start(self):
+    if not hasattr(self, 'ema_model') or self.ema_model is None:
+        self.ema_model = NNUE(
+            feature_set=self.feature_set,
+            start_lambda=self.start_lambda,
+            end_lambda=self.end_lambda,
+            max_epoch=self.max_epoch,
+            gamma=self.gamma,
+            lr=self.lr,
+            epoch_size=self.epoch_size,
+            batch_size=self.batch_size,
+            in_scaling=self.in_scaling,
+            out_scaling=self.out_scaling,
+            offset=self.offset,
+            offset1=self.offset1,
+            offset2=self.offset2,
+            adjust_loss=self.adjust_loss
+        ).to(self.device)
+        
+        # strict=False を追加して不一致キーを無視
+        self.ema_model.load_state_dict(self.state_dict(), strict=False)
+        self.ema_model.eval()
+        for param in self.ema_model.parameters():
+            param.requires_grad = False
+
+
+  def on_load_checkpoint(self, checkpoint):
+    """過去の余分な EMA キーを安全に削除"""
+    state_dict = checkpoint.get("state_dict", {})
+    for k in [k for k in state_dict.keys() if k.startswith("ema_model.")]:
+      del state_dict[k]
+
+
 
   def configure_optimizers(self):
     # =========================================================
