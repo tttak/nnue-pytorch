@@ -553,7 +553,7 @@ class NNUE(pl.LightningModule):
     weights = torch.softmax(mixed_weights, dim=2)
 
     # --- Branch Dropout (学習時のみ適用) ---
-    branch_drop_prob = 0.03
+    branch_drop_prob = 0.01
     if self.training and branch_drop_prob > 0.0:
         # mixed_weightsと同じ形状 [batch, channels, 3] でマスク生成
         drop_mask = (torch.rand_like(mixed_weights) >= branch_drop_prob).float()
@@ -1202,11 +1202,11 @@ class NNUE(pl.LightningModule):
         "pairwise"      : 0.0100,
         "listwise"      : 0.0300,
         "phase"         : 0.0020,
-        "router_load"   : 0.0010,
-        "router_margin" : 0.0010,
+        "router_load"   : 0.0030,
+        "router_margin" : 0.0030,
         "router_ce"     : 0.0030,
         "ortho"         : 0.0010,
-        "ema_distill"   : 0.0003,
+        "ema_distill"   : 0.0070,
         "bucket_distill": 0.0030, # 未選択bucketへの弱い蒸留
     }
 
@@ -1331,30 +1331,35 @@ class NNUE(pl.LightningModule):
               black_values,
               layer_stack_indices,
           )
-          scorenet_ema = scorenet_ema * self.nnue2score
-          all_outputs_ema = all_outputs_ema * self.nnue2score
+          # ★ cp 単位への変換 (* self.nnue2score) は EMA Loss の計算では行わない
   
-      # 1. 主出力 (全バケット) の Consistency Loss
-      # scorenet 単体ではなく、全12バケットの出力に対して平滑化誤差をとる
-      score_ema_loss = F.smooth_l1_loss(all_final_outputs * self.nnue2score, all_outputs_ema, beta=10.0)
+      # 1. 主出力 (全バケット) の Consistency Loss (生出力のまま計算)
+      # cpスケールで beta=10.0 だった場合、生出力空間では beta=0.1 ~ 0.5 程度が目安です
+      score_ema_loss = F.smooth_l1_loss(all_final_outputs, all_outputs_ema, beta=0.1)
   
-      # 2. Router の Consistency Loss (KL Divergence による分布の一致)
+      # 2. Router の Consistency Loss (KL Divergence)
       p_student = F.log_softmax(router_logits, dim=-1)
       q_teacher = F.softmax(router_logits_ema, dim=-1)
       router_ema_loss = F.kl_div(p_student, q_teacher, reduction='batchmean')
   
-      # 3. 統合 (重み比率は状況に応じて調整)
-      total_ema_loss = score_ema_loss + 0.1 * router_ema_loss
+      # 3. 統合 (スケールが揃うため 0.1 ~ 1.0 程度でバランスが取れるようになります)
+      w_router = 0.5  # ログを見ながら 0.1 ~ 1.0 で調整
+      total_ema_loss = score_ema_loss + w_router * router_ema_loss
   
       # 定期デバッグ出力
       if self.training and (self.global_step % 500 == 0):
           with torch.no_grad():
-              cp_diff = torch.abs(scorenet - scorenet_ema)
+              # scorenet はすでに cp 単位、scorenet_ema は生出力なので EMA 側にだけ nnue2score を掛ける
+              scorenet_ema_cp = scorenet_ema * self.nnue2score
+              cp_diff = torch.abs(scorenet - scorenet_ema_cp)
+  
               print("[EMA DEBUG]")
               print(f"  Student CP : mean={scorenet.abs().mean():.2f}")
-              print(f"  EMA CP     : mean={scorenet_ema.abs().mean():.2f}")
+              print(f"  EMA CP     : mean={scorenet_ema_cp.abs().mean():.2f}")
               print(f"  CP diff    : mean={cp_diff.mean():.2f} / median={cp_diff.median():.2f}")
-              print(f"  Router KL  : {router_ema_loss.item():.5f}")
+              print("[EMA Loss Breakdown]")
+              print(f"  Score EMA Loss (Raw) : {score_ema_loss.item():.5f}")
+              print(f"  Router KL Loss       : {router_ema_loss.item():.5f} (Weighted: {w_router * router_ema_loss.item():.5f})")
   
       return total_ema_loss
 
