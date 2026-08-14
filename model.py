@@ -434,6 +434,10 @@ class NNUE(pl.LightningModule):
     self.adjust_loss = adjust_loss
     self.last_bucket_losses = None
 
+    # 浅い Auxiliary Head（線形層）を追加
+    self.main_aux_head = nn.Linear(1280, 1)      # l1_main_input からの予測
+    self.fm_aux_head   = nn.Linear(128 + 128, 1) # diff_input + abs_input からの予測
+
     max_hidden_weight = self.quantized_one / self.weight_scale_hidden
     max_out_weight = (self.quantized_one * self.quantized_one) / (self.nnue2score * self.weight_scale_out)
 
@@ -623,6 +627,11 @@ class NNUE(pl.LightningModule):
     abs_input  = abs_input_scaled.view(-1, 128)
 
 
+    # Aux Score の計算 (学習時・デバッグ時のみでも可)
+    main_score = self.main_aux_head(l1_main_input)
+    residual_pred = self.fm_aux_head(torch.cat([diff_input, abs_input], dim=1))
+
+
     # --- PHASE 4: LayerStacks による深層処理 ---
     # ★ 途中から router の結果 (router_indices) を受け取る
     final_output, l3_out, l1_main_bp, l2_input, diff_gated, abs_gated, gate_d, gate_a, channel_stats, router_indices, router_logits, all_final_outputs = self.layer_stacks(
@@ -640,7 +649,7 @@ class NNUE(pl.LightningModule):
             gate_d, gate_a, channel_stats
         )
 
-    return final_output, router_logits, all_final_outputs
+    return final_output, router_logits, all_final_outputs, main_score, residual_pred
 
 
   def _log_detailed_stats(self, us, white_indices, l1_main, 
@@ -807,6 +816,8 @@ class NNUE(pl.LightningModule):
           ("W_HalfKA (Part) ", w_input_c[S1:S2, :], g_input_c[S1:S2, :] if g_input_c is not None else None, b_input_c),
           ("V_Factor (FM)   ", v_input_c, vg_input_c, None),
           ("Pair_W (Raw)      ", pw_w, pw_g, None),
+          ("main_aux_head ", self.main_aux_head.weight.detach().cpu(), self.main_aux_head.weight.grad.detach().cpu() if self.main_aux_head.weight.grad is not None else None, self.main_aux_head.bias.detach().cpu()),
+          ("fm_aux_head ", self.fm_aux_head.weight.detach().cpu(), self.fm_aux_head.weight.grad.detach().cpu() if self.fm_aux_head.weight.grad is not None else None, self.fm_aux_head.bias.detach().cpu()),
           ("router ", self.layer_stacks.router.weight.detach().cpu(), self.layer_stacks.router.weight.grad.detach().cpu() if self.layer_stacks.router.weight.grad is not None else None, self.layer_stacks.router.bias.detach().cpu()),
           ("L1_Main (Linear)", self.layer_stacks.l1.weight.detach().cpu(), self.layer_stacks.l1.weight.grad.detach().cpu() if self.layer_stacks.l1.weight.grad is not None else None, self.layer_stacks.l1.bias.detach().cpu()),
           ("L1_Fact         ", self.layer_stacks.l1_fact.weight.detach().cpu(), self.layer_stacks.l1_fact.weight.grad.detach().cpu() if self.layer_stacks.l1_fact.weight.grad is not None else None, self.layer_stacks.l1_fact.bias.detach().cpu()),
@@ -1079,7 +1090,7 @@ class NNUE(pl.LightningModule):
     self.print_mem("Before Student Forward")
 
     # Studentモデル推論
-    scorenet, router_logits, all_final_outputs = self(
+    scorenet, router_logits, all_final_outputs, main_score, residual_pred = self(
         us,
         them,
         white_indices,
@@ -1132,7 +1143,7 @@ class NNUE(pl.LightningModule):
         white_values,
         black_indices,
         black_values,
-        layer_stack_indices,
+        active_indices,
     )
 
 
@@ -1195,6 +1206,21 @@ class NNUE(pl.LightningModule):
     ortho_loss = self._compute_ortho_loss(threshold=0.2)
     self.print_mem("After Ortho Loss")
 
+
+    # --- 3-7. FM Residual / Main Aux 損失 ---
+    # 形状を pt に安全に合わせる
+    main_score_flat = main_score.view_as(pt)
+    residual_pred_flat = residual_pred.view_as(pt)
+
+    # 1. Main Path 単体で Teacher (pt) を予測させる Loss
+    main_aux_loss = F.smooth_l1_loss(main_score_flat, pt, beta=0.1)
+
+    # 2. Main Path が残した誤差 (残差) を FM Path に予測させる Loss (main_score は勾配を切る)
+    residual_target = pt - main_score_flat.detach()
+    fm_residual_loss = F.smooth_l1_loss(residual_pred_flat, residual_target, beta=0.1)
+    self.print_mem("After FM Residual Loss")
+
+
     # ==========================================
     # Phase 4: Total Loss の計算
     # ==========================================
@@ -1208,6 +1234,8 @@ class NNUE(pl.LightningModule):
         "ortho"         : 0.0010,
         "ema_distill"   : 0.0070,
         "bucket_distill": 0.0030, # 未選択bucketへの弱い蒸留
+        "main_aux"      : 0.0050, # Main Path (1次情報) 単体の指導Loss
+        "fm_residual"   : 0.0050, # FM Path (2次情報) の残差指導Loss
     }
 
     loss = (
@@ -1221,6 +1249,8 @@ class NNUE(pl.LightningModule):
         + (weights["ortho"] * ortho_loss)
         + (weights["ema_distill"] * ema_distill_loss)
         + (weights["bucket_distill"] * bucket_distill_loss)
+        + (weights["main_aux"] * main_aux_loss)
+        + (weights["fm_residual"] * fm_residual_loss)
     )
     self.print_mem("After Total Loss")
 
@@ -1269,6 +1299,8 @@ class NNUE(pl.LightningModule):
         r_info["gw_gt_08"],
         r_info["router_acc_high"],
         weights,
+        main_aux_loss,     # ★ 必要に応じて _log_debug_info の引数に追加
+        fm_residual_loss,  # ★ 必要に応じて _log_debug_info の引数に追加
     )
 
     self._log_debug_gpu_info()
@@ -1322,7 +1354,7 @@ class NNUE(pl.LightningModule):
       # EMAネット (Teacher) の推論
       with torch.no_grad():
           self.ema_model.eval()
-          scorenet_ema, router_logits_ema, all_outputs_ema = self.ema_model(
+          scorenet_ema, router_logits_ema, all_outputs_ema, main_score_ema, residual_pred_ema = self.ema_model(
               us,
               them,
               white_indices,
@@ -1958,7 +1990,7 @@ class NNUE(pl.LightningModule):
         pair_metrics, pt_range, router_load_loss, phase_penalty, ortho_loss, router_margin_loss, ema_distill_loss,
         router_ce_loss, bucket_distill_loss, router_acc, gap_mean, gap_median, gap_max
         , gw_mean, gw_median, gw_gt_05, gw_gt_08, router_acc_high
-        , weights
+        , weights, main_aux_loss, fm_residual_loss
     ):
 
         def _to_float(val):
@@ -1979,6 +2011,8 @@ class NNUE(pl.LightningModule):
         mean_ortho  = _to_float(ortho_loss)
         mean_ema_distill  = _to_float(ema_distill_loss)
         mean_bucket_distill = _to_float(bucket_distill_loss)
+        mean_main_aux      = _to_float(main_aux_loss)     # ★ 追加
+        mean_fm_residual   = _to_float(fm_residual_loss)  # ★ 追加
         mean_total  = _to_float(loss)
 
         w_base   = mean_base
@@ -1991,6 +2025,8 @@ class NNUE(pl.LightningModule):
         w_ortho  = mean_ortho  * weights["ortho"]
         w_ema_distill = mean_ema_distill * weights["ema_distill"]
         w_bucket_distill = mean_bucket_distill * weights["bucket_distill"]
+        w_main_aux         = mean_main_aux       * weights["main_aux"]     # ★ 追加
+        w_fm_residual      = mean_fm_residual    * weights["fm_residual"]  # ★ 追加
 
         if self.training:
             self.log("train/base_loss", mean_base, prog_bar=False)
@@ -2011,6 +2047,11 @@ class NNUE(pl.LightningModule):
                 self.log("train/ema_distill_loss", mean_ema_distill, prog_bar=False)
             if bucket_distill_loss is not None:
                 self.log("train/bucket_distill_loss", mean_bucket_distill, prog_bar=False)
+            if main_aux_loss is not None:
+                self.log("train/main_aux_loss", mean_main_aux, prog_bar=False)         # ★ 追加
+            if fm_residual_loss is not None:
+                self.log("train/fm_residual_loss", mean_fm_residual, prog_bar=False)   # ★ 追加
+
 
         if self.training and (self.global_step % 500 == 0):
             valid_count = pair_metrics['total_valid_pairs']
@@ -2028,6 +2069,8 @@ class NNUE(pl.LightningModule):
                   f"Ortho: {mean_ortho:.6f} (w: {w_ortho:.6f}) | "
                   f"Ema_Distill: {mean_ema_distill:.6f} (w: {w_ema_distill:.6f}) | "
                   f"Bucket_Distill: {mean_bucket_distill:.6f} (w: {w_bucket_distill:.6f}) | "
+                  f"Main_Aux: {mean_main_aux:.6f} (w: {w_main_aux:.6f}) | "       # ★ 追加
+                  f"FM_Residual: {mean_fm_residual:.6f} (w: {w_fm_residual:.6f}) | " # ★ 追加
                   f"(Valid Pairs: {valid_count}/{max_possible})")
 
             print(f"[GAP WEIGHT DEBUG] "
@@ -2339,6 +2382,10 @@ class NNUE(pl.LightningModule):
       {'params' : [self.input.bias]  , 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
       {'params' : [self.input.v]     , 'lr' : LR * 1.5, 'weight_decay': 0.0 }, 
       {'params' : [self.pair_weights], 'lr' : LR * 1.0, 'weight_decay': 1e-5 }, 
+      {'params' : [self.main_aux_head.weight], 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
+      {'params' : [self.main_aux_head.bias]  , 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
+      {'params' : [self.fm_aux_head.weight]  , 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
+      {'params' : [self.fm_aux_head.bias]    , 'lr' : LR * 1.0, 'weight_decay': 0.0 }, 
       {'params' : [self.layer_stacks.router.weight]  , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.router.bias]    , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
       {'params' : [self.layer_stacks.l1.weight]      , 'lr' : LR * 1.0 , 'weight_decay': 0.0 },
