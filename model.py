@@ -1323,6 +1323,7 @@ class NNUE(pl.LightningModule):
             fm_couple_loss,
             ply_flat,
             material,
+            router_logits,
         )
 
         self._log_debug_gpu_info()
@@ -2610,7 +2611,7 @@ class NNUE(pl.LightningModule):
         loss_type, loss, base_loss, pairwise_loss, listwise_loss,
         pt, pf, qf, score, scorenet, active_indices, kif_group_id_flat, actual_lambda,
         pair_metrics, pt_range, router_load_loss, router_top1_loss, router_frequency_matching_loss, router_pairwise_loss, phase_penalty, ortho_loss, router_margin_loss, ema_distill_loss,
-        router_ce_loss, bucket_distill_loss, router_acc, gap_mean, gap_median, gap_max, gw_mean, gw_median, gw_gt_05, gw_gt_08, router_acc_high, weights, main_aux_loss, fm_residual_loss, fm_couple_loss, ply_flat, material
+        router_ce_loss, bucket_distill_loss, router_acc, gap_mean, gap_median, gap_max, gw_mean, gw_median, gw_gt_05, gw_gt_08, router_acc_high, weights, main_aux_loss, fm_residual_loss, fm_couple_loss, ply_flat, material, router_logits
     ):
 
         def _to_float(val):
@@ -2779,6 +2780,14 @@ class NNUE(pl.LightningModule):
 
             # ----------
 
+            # 実際選択されたバケットを取得
+            pred_bucket_indices = router_logits.argmax(dim=-1)
+
+            stats_log = self._format_bucket_stats(
+                pred_bucket_indices, ply_flat, pt, pf, qf, score, scorenet, material, num_buckets=12
+            )
+            print(stats_log)
+
             target_model = getattr(self, "layer_stacks", self)
             if hasattr(target_model, "last_routing_weights") and target_model.last_routing_weights is not None:
                 with torch.no_grad():
@@ -2908,6 +2917,65 @@ class NNUE(pl.LightningModule):
                 self.log("val_loss/value_diff_cp_mae", 0.0, prog_bar=False)
 
         self.log(loss_type, loss)
+
+    def _format_bucket_stats(self, bucket_indices, ply_flat, pt, pf, qf, score, scorenet, material, num_buckets=12):
+        """
+        バケットごとの各変数の統計(Mean ± Std, 誤差指標)をきれいな表形式文字列として生成する
+        """
+        lines = []
+        total_samples = bucket_indices.numel()
+
+        lines.append(f"\n[BUCKET DETAILED STATS (Mean ± Std)](Step {self.global_step})")
+        lines.append(
+            f" Bkt |   Count (%)  |     pt     |     pf     |     qf     |  qf-pt  | |qf-pt| |  RMSE   |    ply      |    material   |    score      |   scorenet    "
+        )
+        lines.append("-" * 149)
+
+        for b in range(num_buckets):
+            mask = (bucket_indices == b)
+            count = mask.sum().item()
+
+            if count == 0:
+                lines.append(f" B{b:02d} |     0 ( 0.0%) |                                                                                                   (N/A - 0 samples)")
+                continue
+
+            pct = (count / total_samples) * 100
+
+            b_ply = ply_flat[mask].float()
+            b_pt = pt[mask].float()
+            b_pf = pf[mask].float()
+            b_qf = qf[mask].float()
+
+            # 誤差指標の計算
+            diff = b_qf - b_pt
+            b_me = diff.mean()
+            b_mae = diff.abs().mean()
+            b_rmse = (diff ** 2).mean().sqrt()
+
+            b_sc = score[mask].float()
+            b_snet = scorenet[mask].float()
+            b_mat = material[mask].float()
+
+            # 各数値のフォーマット
+            cnt_str = f" {count:>5d}({pct:>4.1f}%) "
+            pt_str = f" {b_pt.mean():>4.2f}±{b_pt.std():>5.2f} "
+            pf_str = f" {b_pf.mean():>4.2f}±{b_pf.std():>5.2f} "
+            qf_str = f" {b_qf.mean():>4.2f}±{b_qf.std():>5.2f} "
+
+            me_str = f" {b_me:>+6.3f} "      # mean(qf - pt) [バイアス]
+            mae_str = f" {b_mae:>6.3f} "     # mean(|qf - pt|) [MAE]
+            rmse_str = f" {b_rmse:>6.3f} "   # RMSE(qf - pt) [RMSE]
+
+            ply_str = f" {b_ply.mean():>5.1f}±{b_ply.std():>5.1f} "
+            mat_str = f" {b_mat.mean():>6.0f}±{b_mat.std():>5.0f}  "
+            sc_str = f" {b_sc.mean():>6.0f}±{b_sc.std():>5.0f}  "
+            snet_str = f" {b_snet.mean():>6.0f}±{b_snet.std():>5.0f}  "
+
+            lines.append(
+                f" B{b:02d} |{cnt_str}|{pt_str}|{pf_str}|{qf_str}|{me_str}|{mae_str}|{rmse_str}|{ply_str}|{mat_str}|{sc_str}|{snet_str}"
+            )
+
+        return "\n".join(lines)
 
     def _log_debug_gpu_info(self):
         if self.training and (self.global_step % 500 == 0):
