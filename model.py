@@ -155,7 +155,8 @@ class LayerStacks(nn.Module):
             # jitter_std = 0.1
             # Router Logits の広がりに応じて動的にジッターを決定
             current_std = router_logits.std().detach().clamp(min=1e-3)
-            jitter_std = current_std * 0.01
+            #jitter_std = current_std * 0.01
+            jitter_std = current_std * 0.00
 
             noise = torch.randn_like(router_logits) * jitter_std
             logits_for_routing = router_logits + noise
@@ -1583,14 +1584,17 @@ class NNUE(pl.LightningModule):
             top1_l1 = (soft_top1_fractions - oracle_fractions).abs().sum()
             top1_l2 = (soft_top1_fractions - oracle_fractions).pow(2).mean().sqrt()
 
+            def fmt(t):
+                return "[" + " ".join(f"{x:7.4f}" for x in t.detach().cpu().numpy()) + " ]"
+
             print(f"[Router Load balancing](Step {self.global_step})")
-            print("  oracle_fractions:", oracle_fractions)
-            print("  argmax fractions:", hard_fractions)
-            print("  mean_probs:", mean_probs)
-            print("  soft_top1_fractions:", soft_top1_fractions.detach())
-            print("  top1_loss:", router_top1_loss.item())
-            print("  top1_l1:", top1_l1.item())
-            print("  top1_l2:", top1_l2.item())
+            print(f"  oracle_fractions   : {fmt(oracle_fractions)}")
+            print(f"  soft_top1_fractions: {fmt(soft_top1_fractions)}")
+            print(f"  argmax fractions   : {fmt(hard_fractions)}")
+            print(f"  mean_probs         : {fmt(mean_probs)}")
+            print(f"  top1_loss          : {router_top1_loss.item():.4e}")  # 小さい値のため指数表記
+            print(f"  top1_l1            : {top1_l1.item():.4f}")
+            print(f"  top1_l2            : {top1_l2.item():.4f}")
 
         # 2) Target prob / logit と Other max の差分計算
         target_probs = torch.gather(probs, dim=-1, index=best_bucket_indices.unsqueeze(-1)).squeeze(-1)
@@ -2347,18 +2351,13 @@ class NNUE(pl.LightningModule):
             print(f"  Pred abs         : {residual_abs:.4f}")
             print(f"  Residual corr    : {residual_corr:.4f}")
 
-            print(
-                f"  Pred abs/bucket   : "
-                f"{pred_abs_bucket.detach().cpu().numpy()}"
-            )
-            print(
-                f"  Pred std/bucket   : "
-                f"{pred_std_bucket.detach().cpu().numpy()}"
-            )
-            print(
-                f"  Corr/bucket       : "
-                f"{corr_bucket.detach().cpu().numpy()}"
-            )
+            def fmt(tensor):
+                arr = tensor.detach().cpu().numpy()
+                return "[" + " ".join(f"{x:7.4f}" for x in arr) + "]"
+
+            print(f"  Pred abs/bucket  : {fmt(pred_abs_bucket)}")
+            print(f"  Pred std/bucket  : {fmt(pred_std_bucket)}")
+            print(f"  Corr/bucket      : {fmt(corr_bucket)}")
 
     def _compute_fm_attention_coupling_loss(self, residual_pred):
         """FM-Attention Pairwise Ranking Coupling Loss.
@@ -2536,7 +2535,6 @@ class NNUE(pl.LightningModule):
                 b_gap = oracle_gaps[b_mask].mean().item() if b_mask.any() else float('nan')
                 best_gap_means.append(round(b_gap, 6))
 
-                # --- 変更点: * 100 して % 表記（小数第1位まで）にする ---
                 b_prob = (router_probs[b_mask, b].mean().item() * 100) if b_mask.any() else float('nan')
                 oracle_prob_means.append(round(b_prob, 1))
 
@@ -2579,7 +2577,7 @@ class NNUE(pl.LightningModule):
         print(f"  Oracle Counts (正解件数) : {oracle_counts.tolist()}")
         print(f"  Pred Counts   (予測件数) : {pred_counts.tolist()}")
         print(f"  Bucket Accs   (精度 % )  : {[round(a,1) for a in per_bucket_acc.tolist()]}")
-        print(f"  Oracle Target Probs (正解確率 %): {oracle_prob_means}")  # <- % 表記
+        print(f"  Oracle Target Probs (正解確率 %): {oracle_prob_means}")
         print(f"  Best Gaps     (正解時Gap): {best_gap_means}")
         print(f"  Pred Gaps     (予測時Gap): {pred_gap_means}")
         print(f"  Pred-Cond Acc (% when Pred=b): {pred_cond_acc}")
@@ -2713,7 +2711,8 @@ class NNUE(pl.LightningModule):
                 f"  FM_Residual     : {mean_fm_residual:.6f} (w: {w_fm_residual:.6f})\n"
                 f"  FM_Couple       : {mean_couple:.6f} (w: {w_couple:.6f})\n"
                 f"  Oracle Gap      : Mean={gap_mean:.6f}, Med={gap_median:.6f}, Max={gap_max:.6f}\n"
-                f"  Valid Pairs     : {valid_count}/{max_possible}"
+                f"  Valid Pairs     : {valid_count}/{max_possible}\n"
+                f"  actual_lambda   : {actual_lambda:.6f}"
             )
 
             print(f"[GAP WEIGHT DEBUG](Step {self.global_step}) "
@@ -2728,17 +2727,10 @@ class NNUE(pl.LightningModule):
             mask0 = (ply_flat == 0)
             mask1 = (ply_flat > 0)
 
-            print("ply=0 ratio:",
-                  mask0.float().mean().item())
-
-            print("ply=0 pf mean:",
-                  pf[mask0].mean().item())
-
-            print("ply=0 |pf-0.5| mean:",
-                  torch.abs(pf[mask0] - 0.5).mean().item())
-
-            print("ply>0 |pf-0.5| mean:",
-                  torch.abs(pf[mask1] - 0.5).mean().item())
+            print(f"  ply=0 ratio        : {mask0.float().mean().item():.4f}")
+            print(f"  ply=0 pf mean      : {pf[mask0].mean().item():.4f}")
+            print(f"  ply=0 |pf-0.5| mean: {torch.abs(pf[mask0] - 0.5).mean().item():.4f}")
+            print(f"  ply>0 |pf-0.5| mean: {torch.abs(pf[mask1] - 0.5).mean().item():.4f}")
 
             # --- 事前準備 ---
             material_flat = material.view(-1).float()
@@ -2936,7 +2928,7 @@ class NNUE(pl.LightningModule):
             count = mask.sum().item()
 
             if count == 0:
-                lines.append(f" B{b:02d} |     0 ( 0.0%) |                                                                                                   (N/A - 0 samples)")
+                lines.append(f" B{b:02d} |     0( 0.0%) |                                                                                                   (N/A - 0 samples)")
                 continue
 
             pct = (count / total_samples) * 100
@@ -2975,15 +2967,17 @@ class NNUE(pl.LightningModule):
                 f" B{b:02d} |{cnt_str}|{pt_str}|{pf_str}|{qf_str}|{me_str}|{mae_str}|{rmse_str}|{ply_str}|{mat_str}|{sc_str}|{snet_str}"
             )
 
+        lines.append("-" * 149)
         return "\n".join(lines)
 
     def _log_debug_gpu_info(self):
         if self.training and (self.global_step % 500 == 0):
             print(f"\n[_log_debug_gpu_info](Step {self.global_step})")
             # print(torch.cuda.memory_summary())
-            print("allocated    :", torch.cuda.memory_allocated() / 1024**3, "GB")
-            print("reserved     :", torch.cuda.memory_reserved() / 1024**3, "GB")
-            print("max allocated:", torch.cuda.max_memory_allocated() / 1024**3, "GB")
+
+            print(f"  allocated    : {torch.cuda.memory_allocated() / 1024**3:7.4f} GB")
+            print(f"  reserved     : {torch.cuda.memory_reserved() / 1024**3:7.4f} GB")
+            print(f"  max allocated: {torch.cuda.max_memory_allocated() / 1024**3:7.4f} GB")
 
             """
           import gc
@@ -3004,11 +2998,11 @@ class NNUE(pl.LightningModule):
             import gc
             gc.collect()
             torch.cuda.empty_cache()
+            print(f"  torch.cuda.empty_cache()!! (Step {self.global_step})")
 
-            print(f"torch.cuda.empty_cache()!! (Step {self.global_step})")
-            print("allocated    :", torch.cuda.memory_allocated() / 1024**3, "GB")
-            print("reserved     :", torch.cuda.memory_reserved() / 1024**3, "GB")
-            print("max allocated:", torch.cuda.max_memory_allocated() / 1024**3, "GB")
+            print(f"  allocated    : {torch.cuda.memory_allocated() / 1024**3:7.4f} GB")
+            print(f"  reserved     : {torch.cuda.memory_reserved() / 1024**3:7.4f} GB")
+            print(f"  max allocated: {torch.cuda.max_memory_allocated() / 1024**3:7.4f} GB")
 
     def print_mem(self, tag):
         if self.training and (self.global_step % 500 == 1):
