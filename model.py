@@ -21,6 +21,38 @@ L2_IN_TOTAL = 192
 NUM_LS_BUCKETS = 12
 
 
+class GradientFirewall(torch.autograd.Function):
+    """
+    Forward:
+        xをそのまま通す
+
+    Backward:
+        gradientをscale倍して返す
+
+    scale=1.0:
+        通常通りgradientを流す
+
+    scale=0.25:
+        gradientを25%だけ流す
+
+    scale=0.0:
+        それより前にはgradientを流さない
+    """
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+
+def gradient_firewall(x, scale=1.0):
+    return GradientFirewall.apply(x, scale)
+
+
 def coalesce_ft_weights(model, data):
     weight = data
     indices = model.feature_set.get_virtual_to_real_features_gather_indices()
@@ -155,7 +187,7 @@ class LayerStacks(nn.Module):
             # jitter_std = 0.1
             # Router Logits の広がりに応じて動的にジッターを決定
             current_std = router_logits.std().detach().clamp(min=1e-3)
-            #jitter_std = current_std * 0.01
+            # jitter_std = current_std * 0.01
             jitter_std = current_std * 0.00
 
             noise = torch.randn_like(router_logits) * jitter_std
@@ -438,9 +470,22 @@ class NNUE(pl.LightningModule):
         # self.fm_aux_head   = nn.Linear(32 + 32, 1)   # l1c_diff_gated_all + l1c_abs_gated_all からの予測
         self.fm_aux_head = nn.Sequential(
             nn.Linear(64, 32),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(32, 1),
         )
+
+        # ---------------------------------------------------------
+        # FTへのgradientの強度
+        # ---------------------------------------------------------
+        self.base_ft_grad_scale = 1.00
+        self.router_ft_grad_scale = 0.25
+        self.bucket_distill_ft_grad_scale = 0.25
+        self.pairwise_ft_grad_scale = 0.75
+        self.listwise_ft_grad_scale = 0.75
+        self.phase_ft_grad_scale = 0.25
+        self.main_aux_ft_grad_scale = 0.25
+        self.fm_aux_ft_grad_scale = 0.75
+        self.fm_couple_ft_grad_scale = 0.25
 
         max_hidden_weight = self.quantized_one / self.weight_scale_hidden
         max_out_weight = (self.quantized_one * self.quantized_one) / (self.nnue2score * self.weight_scale_out)
@@ -633,10 +678,28 @@ class NNUE(pl.LightningModule):
             l1_main_input, diff_input, abs_input, ls_indices=layer_stack_indices
         )
 
-        # Aux Score の計算 (学習時・デバッグ時のみでも可)
-        main_score = self.main_aux_head(l1_main_input)  # [B, 1]
-        fm_repr_all = torch.cat([l1c_diff_gated_all, l1c_abs_gated_all], dim=-1)  # [B, 12, 64]
-        residual_pred = self.fm_aux_head(fm_repr_all).squeeze(-1)  # [B, 12]
+        # Main Auxiliary Head
+        l1_main_aux = gradient_firewall(
+            l1_main_input,
+            self.main_aux_ft_grad_scale,
+        )
+
+        main_score = self.main_aux_head(l1_main_aux)
+
+        # FM Auxiliary Head
+        fm_repr_all = torch.cat(
+            [l1c_diff_gated_all, l1c_abs_gated_all],
+            dim=-1
+        )
+
+        fm_repr_aux = gradient_firewall(
+            fm_repr_all,
+            self.fm_aux_ft_grad_scale,
+        )
+
+        residual_pred = self.fm_aux_head(
+            fm_repr_aux
+        ).squeeze(-1)
 
         # --- 統計ログの呼び出し (router_indices を渡してログ出力) ---
         if self.training:
@@ -1133,13 +1196,23 @@ class NNUE(pl.LightningModule):
         # ==========================================
 
         # --- 3-1. メイン損失 ---
-        base_loss = self._compute_base_loss(pt, qf, pf, kif_group_id_flat)
+        base_loss = self._compute_base_loss(
+            pt,
+            gradient_firewall(qf, self.base_ft_grad_scale),
+            pf,
+            kif_group_id_flat,
+        )
         self.print_mem("After Base Loss")
+
+        router_logits_for_loss = gradient_firewall(
+            router_logits,
+            self.router_ft_grad_scale,
+        )
 
         # --- 3-2. EMA蒸留 ---
         ema_distill_loss = self._compute_ema_loss(
             scorenet,
-            router_logits,
+            router_logits_for_loss,
             all_final_outputs,
             us,
             them,
@@ -1151,12 +1224,16 @@ class NNUE(pl.LightningModule):
         )
 
         # --- 3-3. Router 関連損失 ---
-        router_ce_loss, r_info = self._compute_router_teacher_loss(all_final_outputs, router_logits, pt)
+        router_ce_loss, r_info = self._compute_router_teacher_loss(
+            all_final_outputs,
+            router_logits_for_loss,
+            pt,
+        )
 
         router_load_loss, router_top1_loss, router_frequency_matching_loss, router_margin_loss = self._compute_router_loss(
             best_bucket_indices=r_info['best_bucket_indices'],
             oracle_gaps=r_info['oracle_gaps'],
-            router_logits=router_logits,
+            router_logits=router_logits_for_loss,
             margin_base=0.05,
             margin_scale=0.25,
             margin_min=0.02,
@@ -1167,7 +1244,7 @@ class NNUE(pl.LightningModule):
 
         router_pairwise_loss = \
             self._compute_router_pairwise_ranking_loss(
-                router_logits=router_logits,
+                router_logits=router_logits_for_loss,
                 best_bucket_indices=r_info['best_bucket_indices'],
                 bucket_errors=r_info['bucket_errors'],
                 min_error_gap=0.005,
@@ -1178,7 +1255,10 @@ class NNUE(pl.LightningModule):
 
         # --- 3-4. Bucket Distillation ---
         bucket_distill_loss = self._compute_bucket_distill_loss(
-            all_final_outputs=all_final_outputs,
+            all_final_outputs=gradient_firewall(
+                all_final_outputs,
+                self.bucket_distill_ft_grad_scale,
+            ),
             pt=pt,
             active_indices=active_indices,
             oracle_top_k=2,
@@ -1213,7 +1293,12 @@ class NNUE(pl.LightningModule):
         self.print_mem("After Listwise Loss")
 
         # --- 3-6. 正則化・ペナルティ損失 ---
-        phase_penalty = self._compute_phase_penalty()
+        phase_penalty = self._compute_phase_penalty(
+            gradient_firewall(
+                self.layer_stacks.current_phase_for_loss,
+                self.phase_ft_grad_scale,
+            )
+        )
         self.print_mem("After Phase Penalty")
 
         ortho_loss = self._compute_ortho_loss(threshold=0.2)
@@ -1226,7 +1311,10 @@ class NNUE(pl.LightningModule):
 
         # --- 3-8. FM-Attention Coupling 損失 ---
         fm_couple_loss = self._compute_fm_attention_coupling_loss(
-            residual_pred
+            gradient_firewall(
+                residual_pred,
+                self.fm_couple_ft_grad_scale,
+            )
         )
 
         # ==========================================
@@ -1268,6 +1356,27 @@ class NNUE(pl.LightningModule):
             + (weights["fm_residual"] * fm_residual_loss)
             + (weights["fm_couple"] * fm_couple_loss)
         )
+
+        if self.training and (self.global_step % 500 == 0):
+            self._measure_ft_loss_contributions({
+                "base": base_loss,
+                "pairwise": weights["pairwise"] * pairwise_loss,
+                "listwise": weights["listwise"] * listwise_loss,
+                "phase": weights["phase"] * phase_penalty,
+                "router_load": weights["router_load"] * router_load_loss,
+                "router_top1": weights["router_top1"] * router_top1_loss,
+                "router_freq_match": weights["router_freq_match"] * router_frequency_matching_loss,
+                "router_pairwise": weights["router_pairwise"] * router_pairwise_loss,
+                "router_margin": weights["router_margin"] * router_margin_loss,
+                "router_ce": weights["router_ce"] * router_ce_loss,
+                "ortho": weights["ortho"] * ortho_loss,
+                "ema_distill": weights["ema_distill"] * ema_distill_loss,
+                "bucket_distill": weights["bucket_distill"] * bucket_distill_loss,
+                "main_aux": weights["main_aux"] * main_aux_loss,
+                "fm_residual": weights["fm_residual"] * fm_residual_loss,
+                "fm_couple": weights["fm_couple"] * fm_couple_loss,
+            })
+
         self.print_mem("After Total Loss")
 
         # ==========================================
@@ -1331,6 +1440,187 @@ class NNUE(pl.LightningModule):
         self.print_mem("step_() end")
 
         return loss
+
+    def _measure_ft_loss_contributions(self, losses):
+        if "base" not in losses:
+            return
+
+        ft_params = [self.input.weight, self.input.v]
+        weight_end = 12672
+        target_pair_names = {"base", "pairwise", "listwise", "fm_couple"}
+        saved_grads = {}
+
+        # 1. 重みも CPU に退避しておく（GPU VRAM 占有を防ぐ）
+        with torch.no_grad():
+            weights_dict = {
+                "ksdg3": self.input.weight[:weight_end].detach().cpu(),
+                "halfka": self.input.weight[weight_end:].detach().cpu(),
+                "v_factor": self.input.v.detach().cpu(),
+            }
+
+        # 2. CPU 上での Cosine Similarity 計算関数
+        def calc_cossim_cpu(g1, g2):
+            if g1 is None or g2 is None:
+                return 0.0
+            g1_f = g1.flatten()
+            g2_f = g2.flatten()
+            n1 = torch.linalg.vector_norm(g1_f)
+            n2 = torch.linalg.vector_norm(g2_f)
+            if n1 == 0 or n2 == 0:
+                return 0.0
+            return (torch.dot(g1_f, g2_f) / (n1 * n2)).item()
+
+        # 3. Base の勾配を計算し、直ちに CPU へ移して GPU テンソルを解放
+        base_loss = losses["base"]
+        if not torch.is_tensor(base_loss) or not base_loss.requires_grad:
+            return
+
+        base_grads = torch.autograd.grad(
+            base_loss, ft_params, retain_graph=True, allow_unused=True
+        )
+        base_w_grad, base_v_grad = base_grads
+
+        # 即座に CPU へ格納し、GPU 上の参照は消去
+        saved_grads["base"] = {
+            "ksdg3": (
+                base_w_grad[:weight_end].detach().cpu()
+                if base_w_grad is not None
+                else None
+            ),
+            "halfka": (
+                base_w_grad[weight_end:].detach().cpu()
+                if base_w_grad is not None
+                else None
+            ),
+            "v_factor": (
+                base_v_grad.detach().cpu() if base_v_grad is not None else None
+            ),
+        }
+
+        # GPU テンソルを即破棄
+        del base_grads, base_w_grad, base_v_grad
+
+        # 4. 各 Loss の処理
+        results = {}
+
+        for name, loss_value in losses.items():
+            if not torch.is_tensor(loss_value) or not loss_value.requires_grad:
+                continue
+
+            if name == "base":
+                g_dict_cpu = saved_grads["base"]
+            else:
+                grads = torch.autograd.grad(
+                    loss_value, ft_params, retain_graph=True, allow_unused=True
+                )
+                w_grad, v_grad = grads
+
+                # 得られた勾配を即座に CPU へ退避し、GPU テンソルは del で即破棄
+                w_grad_cpu = w_grad.detach().cpu() if w_grad is not None else None
+                v_grad_cpu = v_grad.detach().cpu() if v_grad is not None else None
+                del grads, w_grad, v_grad
+
+                g_dict_cpu = {
+                    "ksdg3": (
+                        w_grad_cpu[:weight_end] if w_grad_cpu is not None else None
+                    ),
+                    "halfka": (
+                        w_grad_cpu[weight_end:] if w_grad_cpu is not None else None
+                    ),
+                    "v_factor": v_grad_cpu,
+                }
+
+            if name in target_pair_names and name != "base":
+                saved_grads[name] = g_dict_cpu
+
+            # すべて CPU 上で統計計算（TypeError ガード付き）
+            results[name] = {}
+            for key in ("ksdg3", "halfka", "v_factor"):
+                g = g_dict_cpu[key]
+                base_g = saved_grads["base"][key]
+                w = weights_dict[key]
+
+                if g is None:
+                    # 勾配がない場合は 0 で初期化（TypeError を防止）
+                    results[name][key] = {
+                        "norm": 0.0,
+                        "mean": 0.0,
+                        "cos": 0.0,
+                        "touched_rows": 0,
+                        "relative_update": 0.0,
+                    }
+                else:
+                    g_norm = torch.linalg.vector_norm(g).item()
+                    g_mean = g.abs().mean().item()
+                    cos_sim = calc_cossim_cpu(base_g, g)
+                    touched_rows = int((g.abs().sum(dim=1) > 0).sum().item())
+                    relative_update = (g.abs() / (w.abs() + 1e-6)).mean().item()
+
+                    results[name][key] = {
+                        "norm": g_norm,
+                        "mean": g_mean,
+                        "cos": cos_sim,
+                        "touched_rows": touched_rows,
+                        "relative_update": relative_update,
+                    }
+
+        # 5. Cross Cosine Similarity 計算 (CPU上)
+        pair_cossim = {}
+        pair_definitions = [
+            ("Pairwise vs Listwise", "pairwise", "listwise"),
+            ("Pairwise vs FM Couple", "pairwise", "fm_couple"),
+            ("Listwise vs FM Couple", "listwise", "fm_couple"),
+        ]
+
+        for key in ("ksdg3", "halfka", "v_factor"):
+            pair_cossim[key] = {}
+            for label, l1, l2 in pair_definitions:
+                g1 = saved_grads.get(l1, {}).get(key)
+                g2 = saved_grads.get(l2, {}).get(key)
+                pair_cossim[key][label] = calc_cossim_cpu(g1, g2)
+
+        del saved_grads
+
+        # 6. 出力処理
+        base_res = results["base"]
+
+        def ratio(val, base_val):
+            return (val / base_val * 100) if base_val > 0 else 0.0
+
+        groups = [
+            ("KSDG3", "ksdg3"),
+            ("HalfKA", "halfka"),
+            ("V_Factor", "v_factor"),
+        ]
+
+        print(f"\n[FT Gradient Contribution](Step {self.global_step})")
+
+        for label, key in groups:
+            base_g = base_res[key]
+            print(f"\n--- {label} ---")
+            print(
+                f"{'Loss':<18} | {'Norm (%base)':>18} | {'Mean (%base)':>18} | {'CosSim':>7} | {'Touched':>7} | {'RelUpd':>9}"
+            )
+            print("-" * 88)
+
+            for name, res in results.items():
+                g = res[key]
+
+                n_r = ratio(g["norm"], base_g["norm"])
+                m_r = ratio(g["mean"], base_g["mean"])
+
+                print(
+                    f"{name:<18} | "
+                    f"{g['norm']:8.2e} ({n_r:5.1f}%) | "
+                    f"{g['mean']:8.2e} ({m_r:5.1f}%) | "
+                    f"{g['cos']:7.3f} | "
+                    f"{g['touched_rows']:7d} | "
+                    f"{g['relative_update']:9.2e}"
+                )
+
+            print("\n  [Cross Loss Cosine Similarity]")
+            for p_label, val in pair_cossim[key].items():
+                print(f"    - {p_label:<22}: {val:7.3f}")
 
     def _get_actual_lambda(self, loss_type):
         lambda_dict = {
@@ -1543,7 +1833,10 @@ class NNUE(pl.LightningModule):
             zero = torch.tensor(0.0, device=self.device)
             return zero, zero, zero, zero
 
-        probs = self.layer_stacks.last_router_probs  # [B, num_buckets]
+        probs = gradient_firewall(
+            self.layer_stacks.last_router_probs,
+            self.router_ft_grad_scale,
+        )  # [B, num_buckets]
         device = probs.device
         best_bucket_indices = best_bucket_indices.to(device)
         oracle_gaps = oracle_gaps.to(device)
@@ -2026,8 +2319,13 @@ class NNUE(pl.LightningModule):
         if sorted_data is None:
             return torch.tensor(0.0, device=device), default_metrics
 
-        pt_s, qf_s = sorted_data['pt'], sorted_data['qf']
-        score_s, scorenet_s = sorted_data['score'], sorted_data['scorenet']
+        pt_s = sorted_data['pt']
+        qf_s = gradient_firewall(sorted_data['qf'], self.pairwise_ft_grad_scale)
+        score_s = sorted_data['score']
+        scorenet_s = gradient_firewall(
+            sorted_data['scorenet'],
+            self.pairwise_ft_grad_scale,
+        )
         lsind_s, mat_s, ply_s = sorted_data['lsind'], sorted_data['material'], sorted_data['ply']
 
         total_pairwise_loss = torch.tensor(0.0, device=device)
@@ -2052,7 +2350,7 @@ class NNUE(pl.LightningModule):
             diff_abs = (pt_A - pt_B).abs()
 
             # tol = torch.where(lsind_true_A < 4, 400, torch.where(lsind_true_A < 8, 200, 100))
-            tol = 10000
+            tol = 50
             valid_pair_mask = (
                 (diff_abs > 0.003) &
                 (diff_abs <= 0.10) &
@@ -2115,7 +2413,8 @@ class NNUE(pl.LightningModule):
         stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
                         21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
 
-        pt_s, qf_s = sorted_data['pt'], sorted_data['qf']
+        pt_s = sorted_data['pt']
+        qf_s = gradient_firewall(sorted_data['qf'], self.listwise_ft_grad_scale)
         mat_s, lsind_s, ply_s = sorted_data['material'], sorted_data['lsind'], sorted_data['ply']
 
         total_listwise_loss = torch.tensor(0.0, device=device)
@@ -2139,7 +2438,7 @@ class NNUE(pl.LightningModule):
 
             lsind_ref = lsind_lists[:, 0]
             # tol = torch.where(lsind_ref < 4, 400, torch.where(lsind_ref < 8, 200, 100))
-            tol = 10000
+            tol = 50
             material_mask = (mat_lists.max(dim=1).values - mat_lists.min(dim=1).values) <= tol
 
             pt_range_current = pt_lists.max(dim=1).values - pt_lists.min(dim=1).values
@@ -2172,8 +2471,9 @@ class NNUE(pl.LightningModule):
 
         return torch.tensor(0.0, device=device), None
 
-    def _compute_phase_penalty(self):
-        phase = getattr(self.layer_stacks, 'current_phase_for_loss', None)
+    def _compute_phase_penalty(self, phase=None):
+        if phase is None:
+            phase = getattr(self.layer_stacks, 'current_phase_for_loss', None)
         if phase is None:
             return 0.0
 
@@ -2194,7 +2494,7 @@ class NNUE(pl.LightningModule):
 
     def _compute_ortho_loss(self, threshold=0.2):
         """
-        順序に依存しない Soft Orthogonality Loss。
+        Soft Orthogonality Loss。
         バケット間の類似度が threshold (デフォルト 0.2) 以下であればペナルティをかけず、
         適度な共通表現（滑らかさ）を残しながら過度な重複を防ぎます。
         """
@@ -2229,7 +2529,7 @@ class NNUE(pl.LightningModule):
         return ortho_loss
 
     def _compute_fm_residual_main_aux_loss(self, main_score, residual_pred, pt):
-        """3-7. FM Residual および Main Aux 損失の計算"""
+        """FM Residual および Main Aux 損失の計算"""
         main_score_flat = main_score.squeeze(-1)  # [B]
         pt_flat = pt.reshape(-1)                  # [B]
 
@@ -3038,7 +3338,12 @@ class NNUE(pl.LightningModule):
             self.bucket_stats['loss_sum'].zero_()
             self.bucket_stats['count'].zero_()
 
+    def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
+        self._ft_stat_before_optimizer_step(optimizer)
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        self._ft_stat_after_optimizer_step()
+
         if self.global_step % 100 == 0:
             with torch.no_grad():
                 gate_d = self.layer_stacks.last_gate_d
@@ -3085,6 +3390,472 @@ class NNUE(pl.LightningModule):
                 # Student (self) の重みを Teacher (self.ema_model) に EMA更新
                 for p_student, p_ema in zip(self.parameters(), self.ema_model.parameters()):
                     p_ema.data.mul_(decay).add_(p_student.data, alpha=1.0 - decay)
+
+    def _ft_stat_make_group_cache(
+        self,
+        name,
+        weight,
+        grad,
+        row_start,
+        row_end,
+        max_sample_rows=256,
+    ):
+        """
+        1つのFeature Tableについて、
+        optimizer.step()前の統計を計算し、
+        update測定用のsample rowを保存する。
+
+        name:
+            "KSDG3", "HalfKA", "V_Factor"
+
+        weight:
+            [num_rows, dim]
+
+        grad:
+            [num_rows, dim]
+
+        row_start, row_end:
+            対象rowの範囲 [row_start, row_end)
+        """
+
+        if grad is None:
+            return {
+                "name": name,
+                "num_touched": 0,
+                "sample_rows": torch.empty(
+                    0,
+                    dtype=torch.long,
+                    device=weight.device,
+                ),
+                "old_values": None,
+                "grad_norm": 0.0,
+                "weight_norm": 0.0,
+            }
+
+        # ---------------------------------------------------------
+        # 対象範囲
+        # ---------------------------------------------------------
+        weight_part = weight[row_start:row_end]
+        grad_part = grad[row_start:row_end]
+
+        # ---------------------------------------------------------
+        # 1. touched rows
+        # ---------------------------------------------------------
+        # 1要素でも非zero gradientならtouched
+        row_touched = grad_part.abs().sum(dim=1) > 0
+
+        touched_rows_local = torch.nonzero(
+            row_touched,
+            as_tuple=False
+        ).flatten()
+
+        num_touched = touched_rows_local.numel()
+
+        # local index → global row index
+        touched_rows_global = touched_rows_local + row_start
+
+        # touched rowの割合
+        num_rows = row_end - row_start
+        touched_ratio = num_touched / num_rows
+
+        # ---------------------------------------------------------
+        # 2. gradient norm
+        # ---------------------------------------------------------
+        grad_norm = grad_part.norm().item()
+
+        # ---------------------------------------------------------
+        # 3. weight norm
+        # ---------------------------------------------------------
+        weight_norm = weight_part.norm().item()
+
+        # ---------------------------------------------------------
+        # 4. update測定用sample
+        # ---------------------------------------------------------
+        if num_touched > max_sample_rows:
+            perm = torch.randperm(
+                num_touched,
+                device=touched_rows_global.device,
+            )[:max_sample_rows]
+
+            sample_rows = touched_rows_global[perm]
+        else:
+            sample_rows = touched_rows_global
+
+        # optimizer step前の値
+        if sample_rows.numel() > 0:
+            old_values = weight[sample_rows].detach().clone()
+        else:
+            old_values = None
+
+        return {
+            "name": name,
+            "row_start": row_start,
+            "row_end": row_end,
+            "num_touched": num_touched,
+            "touched_ratio": touched_ratio,
+            "sample_rows": sample_rows,
+            "old_values": old_values,
+            "grad_norm": grad_norm,
+            "weight_norm": weight_norm,
+        }
+
+    def _ft_stat_calc_update(self, weight, cache):
+        """
+        optimizer.step()後のupdate統計を計算する。
+        """
+
+        sample_rows = cache["sample_rows"]
+        old_values = cache["old_values"]
+
+        if sample_rows.numel() == 0:
+            return {
+                "update_mean_abs": 0.0,
+                "update_rms": 0.0,
+                "update_max_abs": 0.0,
+                "relative_update": 0.0,
+                "row_rel_mean": 0.0,
+                "row_rel_med": 0.0,
+                "row_rel_p90": 0.0,
+                "row_rel_p99": 0.0,
+            }
+
+        # optimizer step後
+        new_values = weight.detach()[sample_rows]
+
+        update = new_values - old_values
+
+        # ---------------------------------------------------------
+        # 全要素単位
+        # ---------------------------------------------------------
+        update_abs = update.abs()
+
+        mean_abs_update = update_abs.mean().item()
+
+        rms_update = (
+            update.pow(2).mean().sqrt().item()
+        )
+
+        max_abs_update = update_abs.max().item()
+
+        # 要素単位 relative update
+        relative_update = (
+            update_abs /
+            (old_values.abs() + 1e-6)
+        ).mean().item()
+
+        # ---------------------------------------------------------
+        # row単位 relative update
+        # ---------------------------------------------------------
+        old_row_norm = old_values.norm(dim=1)
+        update_row_norm = update.norm(dim=1)
+
+        row_relative_update = (
+            update_row_norm /
+            (old_row_norm + 1e-6)
+        )
+
+        row_relative_update_mean = (
+            row_relative_update.mean().item()
+        )
+
+        row_relative_update_median = (
+            row_relative_update.median().item()
+        )
+
+        row_relative_update_p90 = (
+            torch.quantile(
+                row_relative_update,
+                0.90
+            ).item()
+        )
+
+        row_relative_update_p99 = (
+            torch.quantile(
+                row_relative_update,
+                0.99
+            ).item()
+        )
+
+        return {
+            "update_mean_abs": mean_abs_update,
+            "update_rms": rms_update,
+            "update_max_abs": max_abs_update,
+            "relative_update": relative_update,
+            "row_rel_mean": row_relative_update_mean,
+            "row_rel_med": row_relative_update_median,
+            "row_rel_p90": row_relative_update_p90,
+            "row_rel_p99": row_relative_update_p99,
+        }
+
+    def _ft_stat_before_optimizer_step(self, optimizer):
+        """
+        巨大Feature Tableの学習状況を記録。
+
+        対象:
+          1. input.weight KSDG3
+             rows [0, 12672)
+
+          2. input.weight HalfKA
+             rows [12672, 203670)
+
+          3. input.v
+             rows [0, 203670)
+
+        各グループについて:
+          - touched rows
+          - gradient norm
+          - weight norm
+          - optimizer step前のsample row
+        """
+
+        # ---------------------------------------------------------
+        # 基本設定
+        # ---------------------------------------------------------
+        INPUT_WEIGHT = self.input.weight
+        INPUT_V = self.input.v
+
+        NUM_FEATURES = INPUT_WEIGHT.shape[0]
+
+        KSDG3_END = 12672
+        HALFKA_START = 12672
+        HALFKA_END = NUM_FEATURES
+
+        # ---------------------------------------------------------
+        # gradientが無い場合
+        # ---------------------------------------------------------
+        weight_grad = INPUT_WEIGHT.grad
+        v_grad = INPUT_V.grad
+
+        if weight_grad is None and v_grad is None:
+            self._ft_stat_cache = None
+            return
+
+        # ---------------------------------------------------------
+        # 3グループを保存
+        # ---------------------------------------------------------
+        caches = {}
+
+        # =============================================
+        # 1. KSDG3
+        # =============================================
+        if weight_grad is not None:
+            caches["KSDG3"] = self._ft_stat_make_group_cache(
+                name="KSDG3",
+                weight=INPUT_WEIGHT,
+                grad=weight_grad,
+                row_start=0,
+                row_end=KSDG3_END,
+            )
+
+            # =============================================
+            # 2. HalfKA
+            # =============================================
+            caches["HalfKA"] = self._ft_stat_make_group_cache(
+                name="HalfKA",
+                weight=INPUT_WEIGHT,
+                grad=weight_grad,
+                row_start=HALFKA_START,
+                row_end=HALFKA_END,
+            )
+        else:
+            caches["KSDG3"] = None
+            caches["HalfKA"] = None
+
+        # =============================================
+        # 3. V_Factor
+        # =============================================
+        if v_grad is not None:
+            caches["V_Factor"] = self._ft_stat_make_group_cache(
+                name="V_Factor",
+                weight=INPUT_V,
+                grad=v_grad,
+                row_start=0,
+                row_end=NUM_FEATURES,
+            )
+        else:
+            caches["V_Factor"] = None
+
+        # ---------------------------------------------------------
+        # cache保存
+        # ---------------------------------------------------------
+        self._ft_stat_cache = caches
+
+    def _ft_stat_after_optimizer_step(self):
+        """
+        optimizer.step()後に、
+        KSDG3 / HalfKA / V_Factor のupdate統計を計算して表示。
+        """
+
+        caches = getattr(self, "_ft_stat_cache", None)
+
+        if caches is None:
+            return
+
+        INPUT_WEIGHT = self.input.weight
+        INPUT_V = self.input.v
+
+        # ---------------------------------------------------------
+        # 各groupのupdateを計算
+        # ---------------------------------------------------------
+        stats = {}
+
+        if caches.get("KSDG3") is not None:
+            stats["KSDG3"] = self._ft_stat_calc_update(
+                INPUT_WEIGHT,
+                caches["KSDG3"],
+            )
+
+        if caches.get("HalfKA") is not None:
+            stats["HalfKA"] = self._ft_stat_calc_update(
+                INPUT_WEIGHT,
+                caches["HalfKA"],
+            )
+
+        if caches.get("V_Factor") is not None:
+            stats["V_Factor"] = self._ft_stat_calc_update(
+                INPUT_V,
+                caches["V_Factor"],
+            )
+
+        # ---------------------------------------------------------
+        # print
+        # ---------------------------------------------------------
+        if self.global_step % 500 == 0:
+
+            print(
+                "\n"
+                f"[FT Stats] step={self.global_step}"
+            )
+
+            for name in ["KSDG3", "HalfKA", "V_Factor"]:
+
+                cache = caches.get(name)
+                stat = stats.get(name)
+
+                if cache is None or stat is None:
+                    print(
+                        f"  {name:<8}: NO GRAD"
+                    )
+                    continue
+
+                print(
+                    f"  {name:<8}: "
+                    f"touched={cache['num_touched']:6d} "
+                    f"ratio={cache['touched_ratio'] * 100:6.2f}% "
+                    f"grad={cache['grad_norm']:10.4e} "
+                    f"weight={cache['weight_norm']:10.4e} "
+                    f"upd={stat['update_mean_abs']:10.4e} "
+                    f"rms={stat['update_rms']:10.4e} "
+                    f"max={stat['update_max_abs']:10.4e} "
+                    f"rel={stat['relative_update']:10.4e} "
+                    f"row_mean={stat['row_rel_mean']:10.4e} "
+                    f"row_med={stat['row_rel_med']:10.4e} "
+                    f"p90={stat['row_rel_p90']:10.4e} "
+                    f"p99={stat['row_rel_p99']:10.4e}"
+                )
+
+        # ---------------------------------------------------------
+        # Lightning log
+        # ---------------------------------------------------------
+        for name in ["KSDG3", "HalfKA", "V_Factor"]:
+
+            cache = caches.get(name)
+            stat = stats.get(name)
+
+            if cache is None or stat is None:
+                continue
+
+            prefix = f"ft/{name}"
+
+            self.log(
+                f"{prefix}/touched_rows",
+                float(cache["num_touched"]),
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/grad_norm",
+                cache["grad_norm"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/weight_norm",
+                cache["weight_norm"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/update_mean_abs",
+                stat["update_mean_abs"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/update_rms",
+                stat["update_rms"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/update_max_abs",
+                stat["update_max_abs"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/relative_update",
+                stat["relative_update"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/row_rel_mean",
+                stat["row_rel_mean"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/row_rel_med",
+                stat["row_rel_med"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/row_rel_p90",
+                stat["row_rel_p90"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+            self.log(
+                f"{prefix}/row_rel_p99",
+                stat["row_rel_p99"],
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+            )
+
+        self._ft_stat_cache = None
 
     def on_fit_start(self):
         if not hasattr(self, 'ema_model') or self.ema_model is None:
