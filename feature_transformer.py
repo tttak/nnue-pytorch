@@ -532,9 +532,12 @@ class DoubleFeatureTransformerSlice(nn.Module):
         # クランプしてインデックス外れを防止
         idx0 = torch.clamp(feature_indices_0, 0, self.num_inputs - 1)
         idx1 = torch.clamp(feature_indices_1, 0, self.num_inputs - 1)
-        
-        v_feat0 = self.v[idx0]
-        v_feat1 = self.v[idx1]
+
+        # -1 は padding なので、clamp 後の self.v[0] を FM に混入させない
+        valid0 = (feature_indices_0 >= 0).unsqueeze(-1)
+        valid1 = (feature_indices_1 >= 0).unsqueeze(-1)
+        v_feat0 = self.v[idx0] * valid0
+        v_feat1 = self.v[idx1] * valid1
 
         return t_self, t_opp, v_feat0, v_feat1
 

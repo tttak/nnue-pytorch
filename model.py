@@ -1261,7 +1261,7 @@ class NNUE(pl.LightningModule):
             ),
             pt=pt,
             active_indices=active_indices,
-            oracle_top_k=2,
+            oracle_top_k=3,
         )
         self.print_mem("After Bucket Distill Loss")
 
@@ -1579,6 +1579,11 @@ class NNUE(pl.LightningModule):
                 g2 = saved_grads.get(l2, {}).get(key)
                 pair_cossim[key][label] = calc_cossim_cpu(g1, g2)
 
+        # ---------------------------------------------------------
+        # 5.5 V_Factor 行単位解析
+        # ---------------------------------------------------------
+        self._analyze_v_factor_rows(saved_grads, weights_dict)
+
         del saved_grads
 
         # 6. 出力処理
@@ -1621,6 +1626,86 @@ class NNUE(pl.LightningModule):
             print("\n  [Cross Loss Cosine Similarity]")
             for p_label, val in pair_cossim[key].items():
                 print(f"    - {p_label:<22}: {val:7.3f}")
+
+    def _analyze_v_factor_rows(self, saved_grads, weights_dict):
+        """V_Factor の row 単位勾配と loss 間の衝突を解析する。"""
+        base_v = saved_grads.get("base", {}).get("v_factor")
+        pair_v = saved_grads.get("pairwise", {}).get("v_factor")
+        list_v = saved_grads.get("listwise", {}).get("v_factor")
+
+        if base_v is None or pair_v is None or list_v is None:
+            return
+
+        v_weight = weights_dict["v_factor"]
+        eps = 1e-12
+        base_norm = torch.linalg.vector_norm(base_v, dim=1)
+        pair_norm = torch.linalg.vector_norm(pair_v, dim=1)
+        list_norm = torch.linalg.vector_norm(list_v, dim=1)
+        dot_base_pair = (base_v * pair_v).sum(dim=1)
+        dot_base_list = (base_v * list_v).sum(dim=1)
+        cos_base_pair = dot_base_pair / (base_norm * pair_norm + eps)
+        cos_base_list = dot_base_list / (base_norm * list_norm + eps)
+        rel_upd = (base_v.abs() / (v_weight.abs() + 1e-6)).mean(dim=1)
+
+        top_n = min(10, base_v.shape[0])
+        top_indices = torch.topk(rel_upd, k=top_n, largest=True).indices
+
+        print(f"\n[V_Factor Row-wise Analysis] Top {top_n} by Base RelUpd")
+        print(
+            f"{'Row':>7} | {'BaseNorm':>11} | {'PairNorm':>11} | {'ListNorm':>11} | "
+            f"{'Cos B-P':>8} | {'Cos B-L':>8} | {'RelUpd':>10}"
+        )
+        print("-" * 90)
+        for idx in top_indices.tolist():
+            print(
+                f"{idx:7d} | {base_norm[idx].item():11.3e} | "
+                f"{pair_norm[idx].item():11.3e} | {list_norm[idx].item():11.3e} | "
+                f"{cos_base_pair[idx].item():8.3f} | {cos_base_list[idx].item():8.3f} | "
+                f"{rel_upd[idx].item():10.3e}"
+            )
+
+        conflict_pair = rel_upd * (-cos_base_pair).clamp(min=0.0)
+        conflict_list = rel_upd * (-cos_base_list).clamp(min=0.0)
+        conflict_both = conflict_pair * (-cos_base_list).clamp(min=0.0)
+
+        conflict_mask = (cos_base_pair < -0.5) & (cos_base_list < -0.5)
+        conflict_indices = torch.nonzero(conflict_mask, as_tuple=False).flatten()
+        print("\n[V_Factor Conflict Rows]")
+        print(f"  count = {conflict_indices.numel()} / {base_v.shape[0]}")
+
+        for title, score, columns in [
+            ("Pairwise Conflict", conflict_pair, "Cos B-P"),
+            ("Listwise Conflict", conflict_list, "Cos B-L"),
+            ("Pair+List Conflict", conflict_both, "Cos B-P"),
+        ]:
+            indices = torch.topk(score, k=top_n, largest=True).indices
+            print(f"\n[V_Factor {title}] Top {top_n}")
+            print(
+                f"{'Row':>7} | {'RelUpd':>10} | {columns:>8} | "
+                f"{'Cos B-L':>8} | {'Score':>10}"
+            )
+            print("-" * 65)
+            for idx in indices.tolist():
+                print(
+                    f"{idx:7d} | {rel_upd[idx].item():10.3e} | "
+                    f"{cos_base_pair[idx].item():8.3f} | "
+                    f"{cos_base_list[idx].item():8.3f} | "
+                    f"{score[idx].item():10.3e}"
+                )
+
+        del (
+            base_norm,
+            pair_norm,
+            list_norm,
+            dot_base_pair,
+            dot_base_list,
+            cos_base_pair,
+            cos_base_list,
+            rel_upd,
+            conflict_pair,
+            conflict_list,
+            conflict_both,
+        )
 
     def _get_actual_lambda(self, loss_type):
         lambda_dict = {
@@ -2255,9 +2340,18 @@ class NNUE(pl.LightningModule):
                 else:
                     bucket_stats.append(f"B{i:02d}: count=0    error=0.000")
 
+            selected_count = mask.sum(dim=1)
+
+            avg_distill_buckets = selected_count.float().mean().item()
+            max_distill_buckets = selected_count.max().item()
+
             print(f"[BUCKET DISTILL](Step {self.global_step})")
             print(f"Loss: {distill_loss.item():.5f}")
-            print(f"Valid: {valid_count} / {batch_size}")
+            print(
+                f"Valid: {valid_count} / {batch_size} | "
+                f"Avg buckets: {avg_distill_buckets:.2f} | "
+                f"Max: {max_distill_buckets}"
+            )
             print("Target Bucket Detail:")
             # 見やすく4バケットずつ改行して表示
             for b in range(0, num_buckets, 4):
