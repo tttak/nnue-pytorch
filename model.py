@@ -285,6 +285,7 @@ class LayerStacks(nn.Module):
 
         l1_main_sqr_all = torch.clamp(l1_val_all, 0.0, 1.0).pow(2.0) * (127/128)  # [B, 12, 31]
         l1_main_raw_all = torch.clamp(l1_val_all, 0.0, 1.0)                      # [B, 12, 31]
+        l1_main_bp_all = torch.clamp(l1_main_bp_all, 0.0, 1.0)
 
         q_all = self.q_proj(l1_main_raw_all)                                     # [B, 12, q_dim]
         fm_cat_all = torch.cat([l1_diff_l2_all, l1_abs_raw_all], dim=-1)         # [B, 12, 64]
@@ -3766,8 +3767,24 @@ class NNUE(pl.LightningModule):
                 row_start=0,
                 row_end=NUM_FEATURES,
             )
+
+            # -------------------------------------------------
+            # V[0] の optimizer step 前のweightを保存
+            # -------------------------------------------------
+            self._v_factor_row0_before = INPUT_V[0].detach().clone()
+
+            # -------------------------------------------------
+            # V[0] の gradient normを保存
+            # -------------------------------------------------
+            v0_grad = INPUT_V.grad[0].detach()
+            self._v_factor_row0_grad_norm = (
+                torch.linalg.vector_norm(v0_grad).item()
+            )
+
         else:
             caches["V_Factor"] = None
+            self._v_factor_row0_before = None
+            self._v_factor_row0_grad_norm = None
 
         # ---------------------------------------------------------
         # cache保存
@@ -3812,6 +3829,50 @@ class NNUE(pl.LightningModule):
             )
 
         # ---------------------------------------------------------
+        # V[0] の update 統計
+        # ---------------------------------------------------------
+        v0_stat = None
+
+        if caches.get("V_Factor") is not None:
+            v0_before = getattr(
+                self,
+                "_v_factor_row0_before",
+                None,
+            )
+
+            if v0_before is not None:
+                v0_after = INPUT_V[0].detach()
+
+                v0_update = v0_after - v0_before
+
+                v0_old_norm = v0_before.norm()
+                v0_update_norm = v0_update.norm()
+
+                v0_rel_upd = (
+                    v0_update_norm /
+                    (v0_old_norm + 1e-6)
+                )
+
+                v0_grad_norm = getattr(
+                    self,
+                    "_v_factor_row0_grad_norm",
+                    0.0,
+                )
+            
+                v0_grad_ratio = (
+                    v0_grad_norm /
+                    (caches["V_Factor"]["grad_norm"] + 1e-12)
+                )
+
+                v0_stat = {
+                    "grad_norm": v0_grad_norm,
+                    "grad_ratio": v0_grad_ratio,
+                    "weight_norm": v0_old_norm.item(),
+                    "update": v0_update_norm.item(),
+                    "rel_upd": v0_rel_upd.item(),
+                }
+
+        # ---------------------------------------------------------
         # print
         # ---------------------------------------------------------
         if self.global_step % 500 == 0:
@@ -3846,6 +3907,27 @@ class NNUE(pl.LightningModule):
                     f"row_med={stat['row_rel_med']:10.4e} "
                     f"p90={stat['row_rel_p90']:10.4e} "
                     f"p99={stat['row_rel_p99']:10.4e}"
+                )
+
+            if v0_stat is not None:
+                vstat = stats["V_Factor"]
+
+                row_mean = vstat["row_rel_mean"]
+                row_med = vstat["row_rel_med"]
+                row_p90 = vstat["row_rel_p90"]
+                row_p99 = vstat["row_rel_p99"]
+
+                print(
+                    f"  V_Factor Row 0:"
+                    f" grad_norm={v0_stat['grad_norm']:10.4e}"
+                    f" grad_ratio={v0_stat['grad_ratio'] * 100:6.2f}%"
+                    f" weight_norm={v0_stat['weight_norm']:10.4e}"
+                    f" update={v0_stat['update']:10.4e}"
+                    f" rel_upd={v0_stat['rel_upd']:10.4e}"
+                    f" /mean={v0_stat['rel_upd'] / (row_mean + 1e-12):6.2f}"
+                    f" /med={v0_stat['rel_upd'] / (row_med + 1e-12):6.2f}"
+                    f" /p90={v0_stat['rel_upd'] / (row_p90 + 1e-12):6.2f}"
+                    f" /p99={v0_stat['rel_upd'] / (row_p99 + 1e-12):6.2f}"
                 )
 
         # ---------------------------------------------------------
