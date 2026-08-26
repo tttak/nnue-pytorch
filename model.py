@@ -285,7 +285,7 @@ class LayerStacks(nn.Module):
 
         l1_main_sqr_all = torch.clamp(l1_val_all, 0.0, 1.0).pow(2.0) * (127/128)  # [B, 12, 31]
         l1_main_raw_all = torch.clamp(l1_val_all, 0.0, 1.0)                      # [B, 12, 31]
-        l1_main_bp_all = torch.clamp(l1_main_bp_all, 0.0, 1.0)
+        #l1_main_bp_all = torch.clamp(l1_main_bp_all, 0.0, 1.0)
 
         q_all = self.q_proj(l1_main_raw_all)                                     # [B, 12, q_dim]
         fm_cat_all = torch.cat([l1_diff_l2_all, l1_abs_raw_all], dim=-1)         # [B, 12, 64]
