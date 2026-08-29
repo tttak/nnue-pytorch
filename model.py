@@ -222,10 +222,27 @@ class LayerStacks(nn.Module):
         self.last_router_probs_log = self.last_router_probs.detach()
         self.last_routing_weights = routing_weights.detach()
 
-        # 4. PhaseGate 埋め込み用の bucket_info (0.0 ~ 1.0)
-        bucket_scale = torch.linspace(0.0, 1.0, self.count, device=l1_main.device)
-        bucket_info = (routing_weights * bucket_scale).sum(dim=-1, keepdim=True)  # [B, 1]
-
+        # 4. PhaseGate 埋め込み用の bucket_info
+        # ls_indices: [B]、値は 0 ～ self.count-1
+        # 例: count=12 → 0,1,...,11
+        if ls_indices is not None:
+            bucket_info = (
+                ls_indices.to(device=l1_main.device, dtype=l1_main.dtype) /
+                float(max(1, self.count - 1))
+            ).unsqueeze(-1)  # [B, 1]
+            #print(f"bucket_info={bucket_info}")
+        else:
+            # 従来方式（Routerによる動的算出）
+            bucket_scale = torch.linspace(
+                0.0, 1.0,
+                self.count,
+                device=l1_main.device,
+                dtype=l1_main.dtype
+            )
+            bucket_info = (
+                routing_weights * bucket_scale
+            ).sum(dim=-1, keepdim=True)
+        
         # --- PHASE 1: PhaseGate (適応的重み付け) の計算 ---
         p_abs_modified = p_abs_base.clone()
         p_abs_modified[:, 127:128] = bucket_info
