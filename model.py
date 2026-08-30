@@ -6,9 +6,18 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import sys
-from feature_transformer import DoubleFeatureTransformerSlice
+
+# from feature_transformer import DoubleFeatureTransformerSlice
+from feature_transformer import (
+    DoubleFeatureTransformerSlice,
+    set_grouped_bw_timing,
+    get_grouped_bw_timing,
+    get_fm_grouped_bw_timing,
+    clear_grouped_bw_timing,
+)
 
 import bitsandbytes as bnb
+# import time
 
 # --- 定数定義 ---
 L1_MAIN = 1280
@@ -19,6 +28,30 @@ L3 = 96
 
 L2_IN_TOTAL = 192
 NUM_LS_BUCKETS = 12
+
+
+class CUDATiming:
+    def __init__(self):
+        self.events = {}
+
+    def create(self, name):
+        self.events[name] = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+
+    def start(self, name):
+        self.events[name][0].record()
+
+    def stop(self, name):
+        self.events[name][1].record()
+
+    def elapsed(self, name):
+        start, end = self.events[name]
+        return start.elapsed_time(end)
+
+    def synchronize(self):
+        torch.cuda.synchronize()
 
 
 class GradientFirewall(torch.autograd.Function):
@@ -230,7 +263,7 @@ class LayerStacks(nn.Module):
                 ls_indices.to(device=l1_main.device, dtype=l1_main.dtype) /
                 float(max(1, self.count - 1))
             ).unsqueeze(-1)  # [B, 1]
-            #print(f"bucket_info={bucket_info}")
+            # print(f"bucket_info={bucket_info}")
         else:
             # 従来方式（Routerによる動的算出）
             bucket_scale = torch.linspace(
@@ -242,7 +275,7 @@ class LayerStacks(nn.Module):
             bucket_info = (
                 routing_weights * bucket_scale
             ).sum(dim=-1, keepdim=True)
-        
+
         # --- PHASE 1: PhaseGate (適応的重み付け) の計算 ---
         p_abs_modified = p_abs_base.clone()
         p_abs_modified[:, 127:128] = bucket_info
@@ -302,7 +335,7 @@ class LayerStacks(nn.Module):
 
         l1_main_sqr_all = torch.clamp(l1_val_all, 0.0, 1.0).pow(2.0) * (127/128)  # [B, 12, 31]
         l1_main_raw_all = torch.clamp(l1_val_all, 0.0, 1.0)                      # [B, 12, 31]
-        #l1_main_bp_all = torch.clamp(l1_main_bp_all, 0.0, 1.0)
+        # l1_main_bp_all = torch.clamp(l1_main_bp_all, 0.0, 1.0)
 
         q_all = self.q_proj(l1_main_raw_all)                                     # [B, 12, q_dim]
         fm_cat_all = torch.cat([l1_diff_l2_all, l1_abs_raw_all], dim=-1)         # [B, 12, 64]
@@ -524,6 +557,29 @@ class NNUE(pl.LightningModule):
         ]
 
         self._zero_virtual_feature_weights()
+
+        self.enable_cuda_timing = True
+
+        self.cuda_timing = CUDATiming()
+
+        # 100 batch分を保持する
+        self.step_loss_timing = []
+        self.backward_timing = []
+        self.full_batch_timing = []
+
+        self.grouped_prepare_timing = []
+        self.grouped_sort_timing = []
+        self.grouped_reduce_timing = []
+        self.grouped_write_timing = []
+
+        self.cuda_time_count = 0
+        self._timing_this_batch = False
+
+        self.enable_torch_profiler = True
+        self._torch_profiler = None
+        self._torch_profiler_start_batch = 350
+        self._torch_profiler_num_batches = 2
+        self._torch_profiler_finished_epoch = None
 
     def _zero_virtual_feature_weights(self):
         weights = self.input.weight
@@ -1176,15 +1232,16 @@ class NNUE(pl.LightningModule):
         self.print_mem("Before Student Forward")
 
         # Studentモデル推論
-        scorenet, router_logits, all_final_outputs, main_score, residual_pred = self(
-            us,
-            them,
-            white_indices,
-            white_values,
-            black_indices,
-            black_values,
-            layer_stack_indices,
-        )
+        with torch.profiler.record_function("NNUE/student_forward"):
+            scorenet, router_logits, all_final_outputs, main_score, residual_pred = self(
+                us,
+                them,
+                white_indices,
+                white_values,
+                black_indices,
+                black_values,
+                layer_stack_indices,
+            )
         self.print_mem("After Student Forward")  # 活性化値（中間テンソル）の保持量を計測
 
         scorenet = scorenet * self.nnue2score
@@ -1197,29 +1254,31 @@ class NNUE(pl.LightningModule):
         # ==========================================
         # Phase 2: スコアから勝率(qf, pf, pt)への変換
         # ==========================================
-        # 選ばれたバケットの予測勝率 (Student)
-        q = (scorenet - self.offset1) / self.in_scaling
-        qm = (-scorenet - self.offset2) / self.in_scaling
-        qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
+        with torch.profiler.record_function("NNUE/target_prepare"):
+            # 選ばれたバケットの予測勝率 (Student)
+            q = (scorenet - self.offset1) / self.in_scaling
+            qm = (-scorenet - self.offset2) / self.in_scaling
+            qf = 0.5 * (1.0 + q.sigmoid() - qm.sigmoid())
 
-        # 教師データの目標勝率 (Target)
-        p = (score - self.offset1) / self.out_scaling
-        pm = (-score - self.offset2) / self.out_scaling
-        pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
+            # 教師データの目標勝率 (Target)
+            p = (score - self.offset1) / self.out_scaling
+            pm = (-score - self.offset2) / self.out_scaling
+            pf = 0.5 * (1.0 + p.sigmoid() - pm.sigmoid())
 
-        pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
+            pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
 
         # ==========================================
         # Phase 3: 各種 Loss の計算
         # ==========================================
 
         # --- 3-1. メイン損失 ---
-        base_loss = self._compute_base_loss(
-            pt,
-            gradient_firewall(qf, self.base_ft_grad_scale),
-            pf,
-            kif_group_id_flat,
-        )
+        with torch.profiler.record_function("NNUE/base_loss"):
+            base_loss = self._compute_base_loss(
+                pt,
+                gradient_firewall(qf, self.base_ft_grad_scale),
+                pf,
+                kif_group_id_flat,
+            )
         self.print_mem("After Base Loss")
 
         router_logits_for_loss = gradient_firewall(
@@ -1228,98 +1287,117 @@ class NNUE(pl.LightningModule):
         )
 
         # --- 3-2. EMA蒸留 ---
-        ema_distill_loss = self._compute_ema_loss(
-            scorenet,
-            router_logits_for_loss,
-            all_final_outputs,
-            us,
-            them,
-            white_indices,
-            white_values,
-            black_indices,
-            black_values,
-            active_indices,
-        )
-
-        # --- 3-3. Router 関連損失 ---
-        router_ce_loss, r_info = self._compute_router_teacher_loss(
-            all_final_outputs,
-            router_logits_for_loss,
-            pt,
-        )
-
-        router_load_loss, router_top1_loss, router_frequency_matching_loss, router_margin_loss = self._compute_router_loss(
-            best_bucket_indices=r_info['best_bucket_indices'],
-            oracle_gaps=r_info['oracle_gaps'],
-            router_logits=router_logits_for_loss,
-            margin_base=0.05,
-            margin_scale=0.25,
-            margin_min=0.02,
-            margin_max=0.25,
-            soft_incorrect_weight=0.2,
-            use_logit_margin=False
-        )
-
-        router_pairwise_loss = \
-            self._compute_router_pairwise_ranking_loss(
-                router_logits=router_logits_for_loss,
-                best_bucket_indices=r_info['best_bucket_indices'],
-                bucket_errors=r_info['bucket_errors'],
-                min_error_gap=0.005,
-                temperature=0.003,
-                margin=0.5,
-                max_pairs=4,
+        with torch.profiler.record_function("NNUE/ema_loss"):
+            ema_distill_loss = self._compute_ema_loss(
+                scorenet,
+                router_logits_for_loss,
+                all_final_outputs,
+                us,
+                them,
+                white_indices,
+                white_values,
+                black_indices,
+                black_values,
+                active_indices,
             )
 
-        # --- 3-4. Bucket Distillation ---
-        bucket_distill_loss = self._compute_bucket_distill_loss(
-            all_final_outputs=gradient_firewall(
+        # --- 3-3. Router 関連損失 ---
+        with torch.profiler.record_function("NNUE/router_loss"):
+            router_ce_loss, r_info = self._compute_router_teacher_loss(
                 all_final_outputs,
-                self.bucket_distill_ft_grad_scale,
-            ),
-            pt=pt,
-            active_indices=active_indices,
-            oracle_top_k=3,
-        )
+                router_logits_for_loss,
+                pt,
+            )
+
+            router_load_loss, router_top1_loss, router_frequency_matching_loss, router_margin_loss = self._compute_router_loss(
+                best_bucket_indices=r_info['best_bucket_indices'],
+                oracle_gaps=r_info['oracle_gaps'],
+                router_logits=router_logits_for_loss,
+                margin_base=0.05,
+                margin_scale=0.25,
+                margin_min=0.02,
+                margin_max=0.25,
+                soft_incorrect_weight=0.2,
+                use_logit_margin=False
+            )
+
+            router_pairwise_loss = \
+                self._compute_router_pairwise_ranking_loss(
+                    router_logits=router_logits_for_loss,
+                    best_bucket_indices=r_info['best_bucket_indices'],
+                    bucket_errors=r_info['bucket_errors'],
+                    min_error_gap=0.005,
+                    temperature=0.003,
+                    margin=0.5,
+                    max_pairs=4,
+                )
+
+        # --- 3-4. Bucket Distillation ---
+        with torch.profiler.record_function("NNUE/bucket_distill"):
+            bucket_distill_loss = self._compute_bucket_distill_loss(
+                all_final_outputs=gradient_firewall(
+                    all_final_outputs,
+                    self.bucket_distill_ft_grad_scale,
+                ),
+                pt=pt,
+                active_indices=active_indices,
+                oracle_top_k=3,
+            )
         self.print_mem("After Bucket Distill Loss")
 
         # --- 3-5. ランキング損失 (Pairwise / Listwise) ---
-        pairwise_mask = kif_group_id_flat == 3
-        n_pairwise = pairwise_mask.sum().item()
+        with torch.profiler.record_function("NNUE/ranking_prepare"):
+            pairwise_mask = kif_group_id_flat == 3
+            pairwise_indices = torch.nonzero(
+                pairwise_mask,
+                as_tuple=False,
+            ).flatten()
+            n_pairwise = pairwise_indices.numel()
 
-        sorted_data = self._prepare_sorted_data(
-            pairwise_mask,
-            n_pairwise,
-            pt,
-            qf,
-            score,
-            scorenet,
-            active_indices,
-            material,
-            ply,
-        )
+            sorted_data = self._prepare_sorted_data(
+                pairwise_indices,
+                pt,
+                qf,
+                score,
+                scorenet,
+                active_indices,
+                material,
+                ply,
+            )
         self.print_mem("After Prepare Sorted Data")
 
-        pairwise_loss, pair_metrics = self._compute_pairwise_loss(
-            sorted_data, n_pairwise, pt.device
+        collect_pair_metrics = (
+            (self.training and self.global_step % 500 == 0)
+            or (not self.training and loss_type == 'val_loss_actual_lambda')
         )
+
+        with torch.profiler.record_function("NNUE/pairwise_loss"):
+            pairwise_loss, pair_metrics = self._compute_pairwise_loss(
+                sorted_data,
+                n_pairwise,
+                pt.device,
+                collect_metrics=collect_pair_metrics,
+            )
         self.print_mem("After Pairwise Loss")
 
-        listwise_loss, pt_range = self._compute_listwise_loss(
-            sorted_data, n_pairwise, pt.device
-        )
+        with torch.profiler.record_function("NNUE/listwise_loss"):
+            listwise_loss, pt_range = self._compute_listwise_loss(
+                sorted_data, n_pairwise, pt.device
+            )
         self.print_mem("After Listwise Loss")
 
         # --- 3-6. 正則化・ペナルティ損失 ---
-        phase_penalty = self._compute_phase_penalty(
-            gradient_firewall(
-                self.layer_stacks.current_phase_for_loss,
-                self.phase_ft_grad_scale,
+        with torch.profiler.record_function("NNUE/phase_loss"):
+            phase_penalty = self._compute_phase_penalty(
+                gradient_firewall(
+                    self.layer_stacks.current_phase_for_loss,
+                    self.phase_ft_grad_scale,
+                )
             )
-        )
         self.print_mem("After Phase Penalty")
 
-        ortho_loss = self._compute_ortho_loss(threshold=0.2)
+        with torch.profiler.record_function("NNUE/ortho_loss"):
+            ortho_loss = self._compute_ortho_loss(threshold=0.2)
         self.print_mem("After Ortho Loss")
 
         # --- 3-7. FM Residual / Main Aux 損失 ---
@@ -1328,12 +1406,13 @@ class NNUE(pl.LightningModule):
         )
 
         # --- 3-8. FM-Attention Coupling 損失 ---
-        fm_couple_loss = self._compute_fm_attention_coupling_loss(
-            gradient_firewall(
-                residual_pred,
-                self.fm_couple_ft_grad_scale,
+        with torch.profiler.record_function("NNUE/fm_couple"):
+            fm_couple_loss = self._compute_fm_attention_coupling_loss(
+                gradient_firewall(
+                    residual_pred,
+                    self.fm_couple_ft_grad_scale,
+                )
             )
-        )
 
         # ==========================================
         # Phase 4: Total Loss の計算
@@ -1356,24 +1435,25 @@ class NNUE(pl.LightningModule):
             "fm_couple": 0.0010,
         }
 
-        loss = (
-            base_loss
-            + (weights["pairwise"] * pairwise_loss)
-            + (weights["listwise"] * listwise_loss)
-            + (weights["phase"] * phase_penalty)
-            + (weights["router_load"] * router_load_loss)
-            + (weights["router_top1"] * router_top1_loss)
-            + (weights["router_freq_match"] * router_frequency_matching_loss)
-            + (weights["router_pairwise"] * router_pairwise_loss)
-            + (weights["router_margin"] * router_margin_loss)
-            + (weights["router_ce"] * router_ce_loss)
-            + (weights["ortho"] * ortho_loss)
-            + (weights["ema_distill"] * ema_distill_loss)
-            + (weights["bucket_distill"] * bucket_distill_loss)
-            + (weights["main_aux"] * main_aux_loss)
-            + (weights["fm_residual"] * fm_residual_loss)
-            + (weights["fm_couple"] * fm_couple_loss)
-        )
+        with torch.profiler.record_function("NNUE/total_loss"):
+            loss = (
+                base_loss
+                + (weights["pairwise"] * pairwise_loss)
+                + (weights["listwise"] * listwise_loss)
+                + (weights["phase"] * phase_penalty)
+                + (weights["router_load"] * router_load_loss)
+                + (weights["router_top1"] * router_top1_loss)
+                + (weights["router_freq_match"] * router_frequency_matching_loss)
+                + (weights["router_pairwise"] * router_pairwise_loss)
+                + (weights["router_margin"] * router_margin_loss)
+                + (weights["router_ce"] * router_ce_loss)
+                + (weights["ortho"] * ortho_loss)
+                + (weights["ema_distill"] * ema_distill_loss)
+                + (weights["bucket_distill"] * bucket_distill_loss)
+                + (weights["main_aux"] * main_aux_loss)
+                + (weights["fm_residual"] * fm_residual_loss)
+                + (weights["fm_couple"] * fm_couple_loss)
+            )
 
         if self.training and (self.global_step % 500 == 0):
             self._measure_ft_loss_contributions({
@@ -1408,53 +1488,54 @@ class NNUE(pl.LightningModule):
                 router_logits,
             )
 
-        self._update_bucket_stats(pt, qf, active_indices, loss_type)
+        with torch.profiler.record_function("NNUE/metrics_and_logging"):
+            self._update_bucket_stats(pt, qf, active_indices, loss_type)
 
-        self._log_debug_info(
-            loss_type,
-            loss,
-            base_loss,
-            pairwise_loss,
-            listwise_loss,
-            pt,
-            pf,
-            qf,
-            score,
-            scorenet,
-            active_indices,
-            kif_group_id_flat,
-            actual_lambda,
-            pair_metrics,
-            pt_range,
-            router_load_loss,
-            router_top1_loss,
-            router_frequency_matching_loss,
-            router_pairwise_loss,
-            phase_penalty,
-            ortho_loss,
-            router_margin_loss,
-            ema_distill_loss,
-            router_ce_loss,
-            bucket_distill_loss,
-            r_info["router_acc"],
-            r_info["gap_mean"],
-            r_info["gap_median"],
-            r_info["gap_max"],
-            r_info["gw_mean"],
-            r_info["gw_median"],
-            r_info["gw_gt_05"],
-            r_info["gw_gt_08"],
-            r_info["router_acc_high"],
-            weights,
-            main_aux_loss,
-            fm_residual_loss,
-            fm_couple_loss,
-            ply_flat,
-            material,
-            router_logits,
-        )
+            self._log_debug_info(
+                loss_type,
+                loss,
+                base_loss,
+                pairwise_loss,
+                listwise_loss,
+                pt,
+                pf,
+                qf,
+                score,
+                scorenet,
+                active_indices,
+                kif_group_id_flat,
+                actual_lambda,
+                pair_metrics,
+                pt_range,
+                router_load_loss,
+                router_top1_loss,
+                router_frequency_matching_loss,
+                router_pairwise_loss,
+                phase_penalty,
+                ortho_loss,
+                router_margin_loss,
+                ema_distill_loss,
+                router_ce_loss,
+                bucket_distill_loss,
+                r_info["router_acc"],
+                r_info["gap_mean"],
+                r_info["gap_median"],
+                r_info["gap_max"],
+                r_info["gw_mean"],
+                r_info["gw_median"],
+                r_info["gw_gt_05"],
+                r_info["gw_gt_08"],
+                r_info["router_acc_high"],
+                weights,
+                main_aux_loss,
+                fm_residual_loss,
+                fm_couple_loss,
+                ply_flat,
+                material,
+                router_logits,
+            )
 
-        self._log_debug_gpu_info()
+            self._log_debug_gpu_info()
         self.print_mem("step_() end")
 
         return loss
@@ -1768,10 +1849,16 @@ class NNUE(pl.LightningModule):
         )
 
         if base_loss_mask.any():
-            return (
-                loss_elements.view(-1)[base_loss_mask]
-                * weights_flat[base_loss_mask]
-            ).sum() / weights_flat[base_loss_mask].sum()
+            weighted_loss = loss_elements.view(-1) * weights_flat
+            loss_sum = weighted_loss.masked_fill(
+                ~base_loss_mask,
+                0.0,
+            ).sum()
+            weight_sum = weights_flat.masked_fill(
+                ~base_loss_mask,
+                0.0,
+            ).sum()
+            return loss_sum / weight_sum
 
         return torch.tensor(0.0, device=pt.device)
 
@@ -2336,11 +2423,15 @@ class NNUE(pl.LightningModule):
             distill_loss = all_final_outputs.sum() * 0.0
             valid_count = 0
         else:
-            distill_loss = F.smooth_l1_loss(
-                all_qf[mask],
-                pt_target.expand_as(all_qf)[mask],
+            distill_loss_all = F.smooth_l1_loss(
+                all_qf,
+                pt_target.expand_as(all_qf),
                 beta=0.01,
-                reduction="mean",
+                reduction="none",
+            )
+            distill_loss = (
+                distill_loss_all.masked_fill(~mask, 0.0).sum()
+                / mask.sum()
             )
             # 少なくとも1つの未選択Oracleバケットが割り当たったサンプル数
             valid_count = mask.any(dim=1).sum().item()
@@ -2377,17 +2468,25 @@ class NNUE(pl.LightningModule):
 
         return distill_loss
 
-    def _prepare_sorted_data(self, pairwise_mask, n_pairwise, pt, qf, score, scorenet, active_indices, material, ply):
-        if n_pairwise <= 1:
+    def _prepare_sorted_data(self, pairwise_indices, pt, qf, score, scorenet, active_indices, material, ply):
+        if pairwise_indices.numel() <= 1:
             return None
 
-        pt_p = pt.view(-1)[pairwise_mask]
-        qf_p = qf.view(-1)[pairwise_mask]
-        score_p = score.view(-1)[pairwise_mask]
-        scorenet_p = scorenet.view(-1)[pairwise_mask]
-        lsind_p = active_indices.view(-1)[pairwise_mask]
-        material_p = material.view(-1)[pairwise_mask]
-        ply_p = ply.view(-1)[pairwise_mask]
+        pt_p = pt.view(-1).index_select(0, pairwise_indices)
+        qf_flat = qf.view(-1)
+        with torch.profiler.record_function(
+            "NNUE/index_select_prepare_pairwise_qf"
+        ):
+            qf_p = qf_flat.index_select(0, pairwise_indices)
+        score_p = score.view(-1).index_select(0, pairwise_indices)
+        scorenet_flat = scorenet.view(-1)
+        with torch.profiler.record_function(
+            "NNUE/index_select_prepare_pairwise_scorenet"
+        ):
+            scorenet_p = scorenet_flat.index_select(0, pairwise_indices)
+        lsind_p = active_indices.view(-1).index_select(0, pairwise_indices)
+        material_p = material.view(-1).index_select(0, pairwise_indices)
+        ply_p = ply.view(-1).index_select(0, pairwise_indices)
 
         # 10手刻みのバケット
         ply_bin = torch.div(ply_p, 10, rounding_mode='floor')
@@ -2408,25 +2507,49 @@ class NNUE(pl.LightningModule):
         idx_ply = torch.argsort(ply_bin[idx_step2], descending=False, stable=True)
         sorted_indices = idx_step2[idx_ply]
 
+        pt_sorted = pt_p[sorted_indices]
+        with torch.profiler.record_function("NNUE/index_prepare_sorted_qf"):
+            qf_sorted = qf_p[sorted_indices]
+        score_sorted = score_p[sorted_indices]
+        with torch.profiler.record_function(
+            "NNUE/index_prepare_sorted_scorenet"
+        ):
+            scorenet_sorted = scorenet_p[sorted_indices]
+        lsind_sorted = lsind_p[sorted_indices]
+        material_sorted = material_p[sorted_indices]
+        ply_sorted = ply_p[sorted_indices]
+
         return {
-            'pt': pt_p[sorted_indices],
-            'qf': qf_p[sorted_indices],
-            'score': score_p[sorted_indices],
-            'scorenet': scorenet_p[sorted_indices],
-            'lsind': lsind_p[sorted_indices],
-            'material': material_p[sorted_indices],
-            'ply': ply_p[sorted_indices],
+            'pt': pt_sorted,
+            'qf': qf_sorted,
+            'score': score_sorted,
+            'scorenet': scorenet_sorted,
+            'lsind': lsind_sorted,
+            'material': material_sorted,
+            'ply': ply_sorted,
         }
 
-    def _compute_pairwise_loss(self, sorted_data, n_pairwise, device):
+    def _compute_pairwise_loss(
+        self,
+        sorted_data,
+        n_pairwise,
+        device,
+        collect_metrics=False,
+    ):
         default_metrics = {
             'total_valid_pairs': 0, 'all_pred_diffs': [], 'all_target_directions': [],
             'all_value_gaps': [], 'all_num_equals': 0, 'all_valid_lsinds': [], 'all_diff_abs': [],
             'max_possible_pairs': 0
         }
 
-        window_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-                        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
+        # window_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        #                21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
+
+        window_sizes = [
+            1, 2, 3, 4, 5,
+            8, 12, 16, 24, 30,
+            50, 100, 200, 500, 1000, 2000
+        ]
 
         if sorted_data is None:
             return torch.tensor(0.0, device=device), default_metrics
@@ -2472,7 +2595,6 @@ class NNUE(pl.LightningModule):
 
             if valid_pair_mask.any():
                 target_direction = torch.sign(pt_A - pt_B)
-                num_equal = (target_direction[valid_pair_mask] == 0).sum().item()
 
                 pred_diff = qf_A - qf_B
                 pair_weight_curve = torch.sigmoid((diff_abs - 0.005) * 150) * torch.sigmoid((0.05 - diff_abs) * 120)
@@ -2488,16 +2610,24 @@ class NNUE(pl.LightningModule):
                 equal_penalty = pred_diff.pow(2) * 1.0
                 pairwise_loss_all = torch.where(target_direction != 0, raw_pairwise, equal_penalty)
 
-                total_pairwise_loss += pairwise_loss_all[valid_pair_mask].sum()
+                total_pairwise_loss += pairwise_loss_all.masked_fill(
+                    ~valid_pair_mask,
+                    0.0,
+                ).sum()
                 valid_cnt = valid_pair_mask.sum().item()
                 total_valid_pairs += valid_cnt
 
-                all_pred_diffs.append(pred_diff[valid_pair_mask].detach())
-                all_target_directions.append(target_direction[valid_pair_mask].detach())
-                all_num_equals += num_equal
-                all_value_gaps.append(((cp_pred_A - cp_pred_B) - (cp_true_A - cp_true_B)).abs()[valid_pair_mask].detach())
-                all_valid_lsinds.append(lsind_true_A[valid_pair_mask].detach())
-                all_diff_abs.append(diff_abs[valid_pair_mask].detach())
+                if collect_metrics:
+                    num_equal = (
+                        target_direction[valid_pair_mask] == 0
+                    ).sum().item()
+
+                    all_pred_diffs.append(pred_diff[valid_pair_mask].detach())
+                    all_target_directions.append(target_direction[valid_pair_mask].detach())
+                    all_num_equals += num_equal
+                    all_value_gaps.append(((cp_pred_A - cp_pred_B) - (cp_true_A - cp_true_B)).abs()[valid_pair_mask].detach())
+                    all_valid_lsinds.append(lsind_true_A[valid_pair_mask].detach())
+                    all_diff_abs.append(diff_abs[valid_pair_mask].detach())
 
         pairwise_loss = (total_pairwise_loss / total_valid_pairs) if total_valid_pairs > 0 else torch.tensor(0.0, device=device)
 
@@ -2522,8 +2652,14 @@ class NNUE(pl.LightningModule):
         temperature = 0.15
 
         # stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8]
-        stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
-                        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
+        # stride_sizes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        #                21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 50, 100, 200, 300, 500, 1000, 2000]
+
+        stride_sizes = [
+            1, 2, 4, 8,
+            12, 16, 24, 30,
+            50, 100, 200, 500, 1000, 2000
+        ]
 
         pt_s = sorted_data['pt']
         qf_s = gradient_firewall(sorted_data['qf'], self.listwise_ft_grad_scale)
@@ -2565,10 +2701,20 @@ class NNUE(pl.LightningModule):
             valid_group_mask = material_mask & range_mask & ply_mask  # 追加
 
             if valid_group_mask.any():
-                pt_filtered = pt_lists[valid_group_mask]
-                qf_filtered = qf_lists[valid_group_mask]
+                valid_indices = torch.nonzero(
+                    valid_group_mask,
+                    as_tuple=False,
+                ).flatten()
 
-                all_listwise_ranges.append(pt_range_current[valid_group_mask].detach())
+                pt_filtered = pt_lists.index_select(0, valid_indices)
+                with torch.profiler.record_function(
+                    "NNUE/index_select_listwise_qf_valid_group"
+                ):
+                    qf_filtered = qf_lists.index_select(0, valid_indices)
+
+                all_listwise_ranges.append(
+                    pt_range_current.index_select(0, valid_indices).detach()
+                )
 
                 true_dist = torch.softmax(pt_filtered / temperature, dim=-1)
                 pred_log_dist = torch.log_softmax(qf_filtered / temperature, dim=-1)
@@ -2642,35 +2788,38 @@ class NNUE(pl.LightningModule):
 
     def _compute_fm_residual_main_aux_loss(self, main_score, residual_pred, pt):
         """FM Residual および Main Aux 損失の計算"""
-        main_score_flat = main_score.squeeze(-1)  # [B]
-        pt_flat = pt.reshape(-1)                  # [B]
+        with torch.profiler.record_function("NNUE/main_aux"):
+            main_score_flat = main_score.squeeze(-1)  # [B]
+            pt_flat = pt.reshape(-1)                  # [B]
 
-        main_aux_loss = F.smooth_l1_loss(
-            main_score_flat,
-            pt_flat,
-            beta=0.1
-        )
+            main_aux_loss = F.smooth_l1_loss(
+                main_score_flat,
+                pt_flat,
+                beta=0.1
+            )
 
-        residual_target = (
-            pt_flat - main_score_flat.detach()
-        ).unsqueeze(1)  # [B, 1]
+        with torch.profiler.record_function("NNUE/fm_aux"):
+            residual_target = (
+                pt_flat - main_score_flat.detach()
+            ).unsqueeze(1)  # [B, 1]
 
-        residual_target_all = residual_target.expand(
-            -1, self.num_ls_buckets
-        )  # [B, 12]
+            residual_target_all = residual_target.expand(
+                -1, self.num_ls_buckets
+            )  # [B, 12]
 
-        fm_residual_loss = F.smooth_l1_loss(
-            residual_pred,
-            residual_target_all,
-            beta=0.1
-        )
+            fm_residual_loss = F.smooth_l1_loss(
+                residual_pred,
+                residual_target_all,
+                beta=0.1
+            )
 
         if self.training:
-            self._print_aux_debug(
-                main_score_flat.detach(),
-                residual_pred.detach(),
-                pt_flat
-            )
+            with torch.profiler.record_function("NNUE/aux_metrics"):
+                self._print_aux_debug(
+                    main_score_flat.detach(),
+                    residual_pred.detach(),
+                    pt_flat
+                )
 
         return main_aux_loss, fm_residual_loss
 
@@ -3422,7 +3571,24 @@ class NNUE(pl.LightningModule):
             print(f"Allocated Memory: {mb:.2f} MB [{tag}]")
 
     def training_step(self, batch, batch_idx):
-        return self.step_(batch, batch_idx, 'train_loss')
+
+        if self.enable_cuda_timing and batch_idx > 20:
+
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+
+            start.record()
+
+            ret = self.step_(batch, batch_idx, "train_loss")
+
+            end.record()
+
+            self.step_loss_timing.append((start, end))
+
+        else:
+            ret = self.step_(batch, batch_idx, "train_loss")
+
+        return ret
 
     def validation_step(self, batch, batch_idx):
         self.step_(batch, batch_idx, 'val_loss_actual_lambda')
@@ -3450,8 +3616,75 @@ class NNUE(pl.LightningModule):
             self.bucket_stats['loss_sum'].zero_()
             self.bucket_stats['count'].zero_()
 
+    def on_before_backward(self, loss):
+
+        if not self.enable_cuda_timing:
+            return
+
+        # warm-up中は測らない
+        if self.global_step <= 20:
+            return
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+
+        self.backward_timing.append((start, end))
+
+        self._current_backward_end = end
+
+    def on_after_backward(self):
+
+        if not self.enable_cuda_timing:
+            return
+
+        if self.global_step <= 20:
+            return
+
+        self._current_backward_end.record()
+        set_grouped_bw_timing(False)
+
     def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
         self._ft_stat_before_optimizer_step(optimizer)
+
+    def on_train_batch_start(self, batch, batch_idx):
+
+        if (
+            self.enable_torch_profiler
+            and batch_idx == self._torch_profiler_start_batch
+            and self._torch_profiler_finished_epoch != self.current_epoch
+        ):
+            self._torch_profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=True,
+            )
+            self._torch_profiler.__enter__()
+
+        self._timing_this_batch = (
+            self.enable_cuda_timing
+            and batch_idx > 20
+        )
+
+        set_grouped_bw_timing(self._timing_this_batch)
+
+        if not self._timing_this_batch:
+            return
+
+        if self.cuda_time_count == 0:
+            clear_grouped_bw_timing()
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        start.record()
+
+        self.full_batch_timing.append((start, end))
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self._ft_stat_after_optimizer_step()
@@ -3502,6 +3735,391 @@ class NNUE(pl.LightningModule):
                 # Student (self) の重みを Teacher (self.ema_model) に EMA更新
                 for p_student, p_ema in zip(self.parameters(), self.ema_model.parameters()):
                     p_ema.data.mul_(decay).add_(p_student.data, alpha=1.0 - decay)
+
+        if self._torch_profiler is not None:
+            self._torch_profiler.step()
+
+            profiler_end_batch = (
+                self._torch_profiler_start_batch
+                + self._torch_profiler_num_batches
+                - 1
+            )
+
+            if batch_idx == profiler_end_batch:
+                profiler = self._torch_profiler
+                self._torch_profiler = None
+                self._torch_profiler_finished_epoch = self.current_epoch
+                profiler.__exit__(None, None, None)
+
+                print("\n[Torch Profiler: CUDA TOP 50]")
+                print(
+                    profiler.key_averages(
+                        group_by_stack_n=5,
+                    ).table(
+                        sort_by="self_cuda_time_total",
+                        row_limit=50,
+                    )
+                )
+
+                print("\n[Torch Profiler: CUDA TOTAL TOP 80]")
+                print(
+                    profiler.key_averages().table(
+                        sort_by="cuda_time_total",
+                        row_limit=80,
+                    )
+                )
+
+                index_events = [
+                    evt
+                    for evt in profiler.key_averages()
+                    if evt.key.startswith("NNUE/index_")
+                ]
+                index_events.sort(key=lambda evt: evt.key)
+
+                print("\n[Torch Profiler: INDEX INSTRUMENTATION]")
+                for evt in index_events:
+                    print(f"\n{evt.key}")
+                    print(f"  calls             : {evt.count}")
+                    print(
+                        f"  Self CPU total    : "
+                        f"{evt.self_cpu_time_total / 1000.0:.3f} ms"
+                    )
+                    print(
+                        f"  CPU total         : "
+                        f"{evt.cpu_time_total / 1000.0:.3f} ms"
+                    )
+                    print(
+                        f"  Self device total : "
+                        f"{evt.self_device_time_total / 1000.0:.3f} ms"
+                    )
+                    print(
+                        f"  Device total      : "
+                        f"{evt.device_time_total / 1000.0:.3f} ms"
+                    )
+
+                index_backward_sources = {
+                    "NNUE/index_fm_v_idx0_grad": "FM idx0",
+                    "NNUE/index_fm_v_idx1_grad": "FM idx1",
+                    "NNUE/index_prepare_sorted_qf": "sorted qf",
+                    "NNUE/index_prepare_sorted_scorenet": "sorted scorenet",
+                }
+                index_backward_stats = {
+                    source: {
+                        "forward_calls": 0,
+                        "forward_index_calls": 0,
+                        "sequences": [],
+                        "backward_calls": 0,
+                        "backward_device_time": 0.0,
+                        "index_put_calls": 0,
+                        "index_put_device_time": 0.0,
+                    }
+                    for source in index_backward_sources
+                }
+
+                profiler_events = profiler.events()
+
+                for evt in profiler_events:
+                    if evt.name in index_backward_stats:
+                        index_backward_stats[evt.name]["forward_calls"] += 1
+
+                sequence_to_source = {}
+                for evt in profiler_events:
+                    if evt.name != "aten::index" or evt.sequence_nr < 0:
+                        continue
+
+                    parent = evt.cpu_parent
+                    source = None
+                    while parent is not None:
+                        if parent.name in index_backward_stats:
+                            source = parent.name
+                            break
+                        parent = parent.cpu_parent
+
+                    if source is None:
+                        continue
+
+                    sequence_to_source[evt.sequence_nr] = source
+                    stats = index_backward_stats[source]
+                    stats["forward_index_calls"] += 1
+                    stats["sequences"].append(evt.sequence_nr)
+
+                unmatched_index_backward = 0
+                for evt in profiler_events:
+                    if evt.name != "IndexBackward0":
+                        continue
+
+                    source = sequence_to_source.get(evt.sequence_nr)
+                    if source is None:
+                        unmatched_index_backward += 1
+                        continue
+
+                    stats = index_backward_stats[source]
+                    stats["backward_calls"] += 1
+                    stats["backward_device_time"] += evt.device_time_total
+
+                for evt in profiler_events:
+                    if evt.name != "aten::_index_put_impl_":
+                        continue
+
+                    parent = evt.cpu_parent
+                    backward_sequence = None
+                    while parent is not None:
+                        if parent.name == "IndexBackward0":
+                            backward_sequence = parent.sequence_nr
+                            break
+                        parent = parent.cpu_parent
+
+                    source = sequence_to_source.get(backward_sequence)
+                    if source is None:
+                        continue
+
+                    stats = index_backward_stats[source]
+                    stats["index_put_calls"] += 1
+                    stats["index_put_device_time"] += evt.device_time_total
+
+                print("\n[Torch Profiler: INDEX BACKWARD CORRELATION]")
+                for source, display_name in index_backward_sources.items():
+                    stats = index_backward_stats[source]
+                    sequence_text = ", ".join(
+                        str(sequence)
+                        for sequence in stats["sequences"]
+                    )
+                    print(f"\n{display_name}")
+                    print(
+                        f"  Forward range calls       : "
+                        f"{stats['forward_calls']}"
+                    )
+                    print(
+                        f"  Forward aten::index calls : "
+                        f"{stats['forward_index_calls']}"
+                    )
+                    print(f"  Sequence numbers          : {sequence_text}")
+                    print(
+                        f"  IndexBackward0 calls      : "
+                        f"{stats['backward_calls']}"
+                    )
+                    print(
+                        f"  IndexBackward0 CUDA total : "
+                        f"{stats['backward_device_time'] / 1000.0:.3f} ms"
+                    )
+                    print(
+                        f"  _index_put_impl_ calls    : "
+                        f"{stats['index_put_calls']}"
+                    )
+                    print(
+                        f"  _index_put_impl_ CUDA total: "
+                        f"{stats['index_put_device_time'] / 1000.0:.3f} ms"
+                    )
+
+                correlated_backward_calls = sum(
+                    stats["backward_calls"]
+                    for stats in index_backward_stats.values()
+                )
+                correlated_backward_device_time = sum(
+                    stats["backward_device_time"]
+                    for stats in index_backward_stats.values()
+                )
+                correlated_index_put_calls = sum(
+                    stats["index_put_calls"]
+                    for stats in index_backward_stats.values()
+                )
+                correlated_index_put_device_time = sum(
+                    stats["index_put_device_time"]
+                    for stats in index_backward_stats.values()
+                )
+
+                print("\nCorrelated total")
+                print(
+                    f"  IndexBackward0 calls      : "
+                    f"{correlated_backward_calls}"
+                )
+                print(
+                    f"  IndexBackward0 CUDA total : "
+                    f"{correlated_backward_device_time / 1000.0:.3f} ms"
+                )
+                print(
+                    f"  _index_put_impl_ calls    : "
+                    f"{correlated_index_put_calls}"
+                )
+                print(
+                    f"  _index_put_impl_ CUDA total: "
+                    f"{correlated_index_put_device_time / 1000.0:.3f} ms"
+                )
+                print(
+                    f"\n  Unmatched IndexBackward0  : "
+                    f"{unmatched_index_backward}"
+                )
+
+        # ============================================================
+        # CUDA timing
+        # ============================================================
+
+        if not self.enable_cuda_timing:
+            return
+
+        if batch_idx <= 20:
+            return
+
+        # ------------------------------------------------------------
+        # full_batch END
+        # ------------------------------------------------------------
+
+        start, end = self.full_batch_timing[-1]
+        end.record()
+
+        self.cuda_time_count += 1
+
+        # ------------------------------------------------------------
+        # 100 batch溜まるまでGPU同期しない
+        # ------------------------------------------------------------
+
+        if self.cuda_time_count < 100:
+            return
+
+        # ------------------------------------------------------------
+        # ここで初めてGPU同期
+        # ------------------------------------------------------------
+
+        torch.cuda.synchronize()
+
+        grouped_timing = get_grouped_bw_timing()
+        fm_grouped_timing = get_fm_grouped_bw_timing()
+
+        def calc_timing(events, num_batches):
+            if not events:
+                return 0.0, 0.0
+
+            values = [
+                start.elapsed_time(end)
+                for start, end in events
+            ]
+
+            total = sum(values)
+
+            avg_per_call = total / len(values)
+            avg_per_batch = total / num_batches
+
+            return avg_per_call, avg_per_batch
+
+        prepare_call, prepare_batch = calc_timing(
+            grouped_timing["prepare"],
+            self.cuda_time_count,
+        )
+
+        sort_call, sort_batch = calc_timing(
+            grouped_timing["sort"],
+            self.cuda_time_count,
+        )
+
+        group_meta_call, group_meta_batch = calc_timing(
+            grouped_timing["group_meta"],
+            self.cuda_time_count,
+        )
+
+        kernel_call, kernel_batch = calc_timing(
+            grouped_timing["grouped_kernel"],
+            self.cuda_time_count,
+        )
+
+        fm_prepare_call, fm_prepare_batch = calc_timing(
+            fm_grouped_timing["prepare"],
+            self.cuda_time_count,
+        )
+
+        fm_sort_call, fm_sort_batch = calc_timing(
+            fm_grouped_timing["sort"],
+            self.cuda_time_count,
+        )
+
+        fm_group_meta_call, fm_group_meta_batch = calc_timing(
+            fm_grouped_timing["group_meta"],
+            self.cuda_time_count,
+        )
+
+        fm_kernel_call, fm_kernel_batch = calc_timing(
+            fm_grouped_timing["grouped_kernel"],
+            self.cuda_time_count,
+        )
+
+        grouped_total_batch = (
+            prepare_batch
+            + sort_batch
+            + group_meta_batch
+            + kernel_batch
+        )
+
+        # ------------------------------------------------------------
+        # step_loss
+        # ------------------------------------------------------------
+
+        step_loss_values = [
+            start.elapsed_time(end)
+            for start, end in self.step_loss_timing
+        ]
+
+        step_loss_avg = (
+            sum(step_loss_values) /
+            len(step_loss_values)
+        )
+
+        # ------------------------------------------------------------
+        # backward
+        # ------------------------------------------------------------
+
+        backward_values = [
+            start.elapsed_time(end)
+            for start, end in self.backward_timing
+        ]
+
+        backward_avg = (
+            sum(backward_values) /
+            len(backward_values)
+        )
+
+        # ------------------------------------------------------------
+        # full_batch
+        # ------------------------------------------------------------
+
+        full_batch_values = [
+            start.elapsed_time(end)
+            for start, end in self.full_batch_timing
+        ]
+
+        full_batch_avg = (
+            sum(full_batch_values) /
+            len(full_batch_values)
+        )
+
+        # ------------------------------------------------------------
+        # print
+        # ------------------------------------------------------------
+        known = step_loss_avg + backward_avg
+        other_avg = full_batch_avg - known
+
+        print("\n[CUDA Timing: 100 batch average]")
+        print(f"  {'step_loss':<18}: {step_loss_avg:8.3f} ms")
+        print(f"  {'backward':<18}: {backward_avg:8.3f} ms")
+        print(f"    {'prepare':<16}: {prepare_batch:8.3f} ms")
+        print(f"    {'sort':<16}: {sort_batch:8.3f} ms")
+        print(f"    {'group_meta':<16}: {group_meta_batch:8.3f} ms")
+        print(f"    {'grouped_kernel':<16}: {kernel_batch:8.3f} ms")
+        print(f"    {'FM grouped prepare':<20}: {fm_prepare_batch:8.3f} ms")
+        print(f"    {'FM grouped sort':<20}: {fm_sort_batch:8.3f} ms")
+        print(f"    {'FM grouped group_meta':<20}: {fm_group_meta_batch:8.3f} ms")
+        print(f"    {'FM grouped kernel':<20}: {fm_kernel_batch:8.3f} ms")
+        print(f"  {'other':<18}: {other_avg:8.3f} ms")
+        print(f"  {'full_batch':<18}: {full_batch_avg:8.3f} ms")
+
+        # ------------------------------------------------------------
+        # reset
+        # ------------------------------------------------------------
+
+        self.step_loss_timing.clear()
+        self.backward_timing.clear()
+        self.full_batch_timing.clear()
+        clear_grouped_bw_timing()
+
+        self.cuda_time_count = 0
 
     def _ft_stat_make_group_cache(
         self,
@@ -3875,7 +4493,7 @@ class NNUE(pl.LightningModule):
                     "_v_factor_row0_grad_norm",
                     0.0,
                 )
-            
+
                 v0_grad_ratio = (
                     v0_grad_norm /
                     (caches["V_Factor"]["grad_norm"] + 1e-12)
