@@ -206,6 +206,7 @@ class NNUEWriter():
     # pw_raw: [4, 640, 3] (0:序盤, 1:中盤1, 2:中盤2, 3:終盤)
     pw_raw = model.pair_weights.data 
 
+    # nn.binから学習parameterを復元するための4 phaseデータ
     # Softmax は dim=2 (Mul/Diff/Sum の次元) でかける
     pw_softmax = torch.softmax(pw_raw, dim=2) 
 
@@ -234,6 +235,44 @@ class NNUEWriter():
     print(f"FT Pair Weight (4-Phase x 3-terms) bytes: {pw_exported.nbytes}")
     print(f"Shape: {pw_exported.shape} (Phase, Type[M/D/S], 640)")
 
+    # C++推論用の12 bucketデータ。
+    # model.pyのforwardと同じく、4 phaseのraw logitsを先に補間してから
+    # Mul/Diff/Sum次元にsoftmaxを適用する。
+    bucket_indices = torch.arange(
+        12,
+        device=pw_raw.device,
+        dtype=pw_raw.dtype,
+    ).view(12, 1, 1)
+    pf = bucket_indices / 11.0
+    p3 = pf * 3.0
+    w0 = torch.clamp(1.0 - p3, min=0.0)
+    w1 = torch.clamp(1.0 - torch.abs(p3 - 1.0), min=0.0)
+    w2 = torch.clamp(1.0 - torch.abs(p3 - 2.0), min=0.0)
+    w3 = torch.clamp(p3 - 2.0, min=0.0)
+
+    pw_bucket_logits = (
+        w0 * pw_raw[0]
+        + w1 * pw_raw[1]
+        + w2 * pw_raw[2]
+        + w3 * pw_raw[3]
+    )
+    pw_bucket_softmax = torch.softmax(pw_bucket_logits, dim=2)
+    pw_bucket_quantized = pw_bucket_softmax.mul(W_SCALE).round().to(torch.int16)
+
+    # 各bucket・各channelのMul/Diff/Sum合計を16384に補正する。
+    for b in range(12):
+        diffs = 16384 - pw_bucket_quantized[b].sum(dim=1, dtype=torch.int32)
+        for i in range(640):
+            if diffs[i] != 0:
+                max_idx = torch.argmax(pw_bucket_quantized[b, i])
+                pw_bucket_quantized[b, i, max_idx] += diffs[i].item()
+
+    # [12, 640, 3] -> [12, 3, 640]
+    pw_bucket_exported = pw_bucket_quantized.permute(0, 2, 1).contiguous()
+
+    print(f"FT Pair Weight (12-Bucket x 3-terms) bytes: {pw_bucket_exported.nbytes}")
+    print(f"Shape: {pw_bucket_exported.shape} (Bucket, Type[M/D/S], 640)")
+
     # --- ヒストグラム表示 ---
     for p in range(4):
         phase_names = ["OPEN", "MID1", "MID2", "END"]
@@ -246,8 +285,9 @@ class NNUEWriter():
     self.write_tensor(bias_quantized.flatten().numpy(), ft_compression)
     self.write_tensor(weight_quantized.flatten().numpy(), ft_compression)
     self.write_tensor(v_quantized.flatten().numpy(), ft_compression)
-    # 4段階になった pair_weights を書き出し
+    # 4 phase復元用、12 bucket推論用の順で書き出す
     self.write_tensor(pw_exported.flatten().cpu().numpy(), ft_compression)
+    self.write_tensor(pw_bucket_exported.flatten().cpu().numpy(), ft_compression)
 
   def write_fc_layer(self, model, layer, is_output=False):
     # FC layers are stored as int8 weights, and int32 biases
@@ -505,6 +545,11 @@ class NNUEReader():
     # tensor関数の引数に [4, 3, 640] を指定
     pw_exported = self.tensor(np.int16, [4, 3, 640]).divide(W_SCALE)
     print(f"read_feature_transformer pair_weights END")
+
+    # C++推論用の12 bucketデータ。PyTorchモデルの復元には使用しないが、
+    # 後続のrouter/network weightを正しい位置から読むために読み飛ばす。
+    self.tensor(np.int16, [12, 3, 640])
+    print(f"read_feature_transformer inference_pair_weights END")
     
     # 2. モデルの Parameter 形状 [4, 640, 3] に戻す
     # [4, 3, 640] -> [4, 640, 3] へ軸を入れ替え
