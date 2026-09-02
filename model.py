@@ -1298,7 +1298,7 @@ class NNUE(pl.LightningModule):
                 white_values,
                 black_indices,
                 black_values,
-                active_indices,
+                layer_stack_indices,
             )
 
         # --- 3-3. Router 関連損失 ---
