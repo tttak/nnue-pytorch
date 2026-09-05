@@ -598,11 +598,11 @@ class NNUEReader():
     return v
 
 def main():
-  parser = argparse.ArgumentParser(description="Converts files between ckpt and nnue format.")
-  parser.add_argument("source", help="Source file (can be .ckpt, .pt or .nnue)")
-  parser.add_argument("target", help="Target file (can be .pt or .nnue)")
-  parser.add_argument("--description", default=None, type=str, dest='description', help="The description string to include in the network. Only works when serializing into a .nnue file.")
-  parser.add_argument("--ft_compression", default='leb128', type=str, dest='ft_compression', help="Compression method to use for FT weights and biases. Either 'none' or 'leb128'. Only allowed if saving to .nnue.")
+  parser = argparse.ArgumentParser(description="Converts files between ckpt and NNUE network formats.")
+  parser.add_argument("source", help="Source file (can be .ckpt, .pt, .nnue or .bin)")
+  parser.add_argument("target", help="Target file (can be .pt, .nnue or .bin)")
+  parser.add_argument("--description", default=None, type=str, dest='description', help="The description string to include in the network. Only works when serializing into a .nnue or .bin file.")
+  parser.add_argument("--ft_compression", default='leb128', type=str, dest='ft_compression', help="Compression method to use for FT weights and biases. Either 'none' or 'leb128'. Only allowed if saving to .nnue or .bin.")
   parser.add_argument("--ft_perm", default=None, type=str, dest='ft_perm', help="Path to a file that defines the permutation to use on the feature transformer.")
   parser.add_argument("--ft_optimize", action='store_true', dest='ft_optimize', help="Whether to perform full feature transformer optimization (ftperm.py) on the resulting network. This process is very time consuming.")
   parser.add_argument("--ft_optimize_data", default=None, type=str, dest='ft_optimize_data', help="Path to the dataset to use for FT optimization.")
@@ -619,7 +619,7 @@ def main():
     nnue.eval()
   elif args.source.endswith('.pt'):
       nnue = torch.load(args.source)
-  elif args.source.endswith('.nnue'):
+  elif args.source.endswith(('.nnue', '.bin')):
     with open(args.source, 'rb') as f:
       reader = NNUEReader(f, feature_set)
       nnue = reader.model
@@ -630,9 +630,9 @@ def main():
     raise Exception('Invalid network input format.')
   """
 
-  if args.ft_compression != 'none' and not args.target.endswith('.nnue'):
+  if args.ft_compression != 'none' and not args.target.endswith(('.nnue', '.bin')):
     args.ft_compression = 'none'
-    # raise Exception('Compression only allowed for .nnue target.')
+    # raise Exception('Compression only allowed for .nnue or .bin target.')
 
   if args.ft_compression not in ['none', 'leb128']:
     raise Exception('Invalid compression method.')
@@ -657,7 +657,7 @@ def main():
     raise Exception('Cannot convert into .ckpt')
   elif args.target.endswith('.pt'):
     torch.save(nnue, args.target)
-  elif args.target.endswith('.nnue'):
+  elif args.target.endswith(('.nnue', '.bin')):
     os.makedirs(os.path.dirname(args.target), exist_ok=True)
     writer = NNUEWriter(nnue, args.description, ft_compression=args.ft_compression)
     with open(args.target, 'wb') as f:
