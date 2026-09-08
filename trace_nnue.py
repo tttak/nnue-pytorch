@@ -827,25 +827,28 @@ def make_integer_reference(entries, nnue):
             127,
         )
 
-    fc1_input = torch.cat(
-        (
-            scale_channel(main_squared, channel_scales[0]),
-            scale_channel(main_raw, channel_scales[1]),
-            scale_channel(lca_output, channel_scales[2]),
-            scale_channel(abs_output, channel_scales[3]),
-            scale_channel(abs_squared_output, channel_scales[4]),
-            scale_channel(cross_output, channel_scales[5]),
-            torch.zeros(2, dtype=torch.int64),
-        ),
-        dim=0,
-    )
+    fc1_parts = [
+        scale_channel(main_squared, channel_scales[0]),
+        scale_channel(main_raw, channel_scales[1]),
+        scale_channel(lca_output, channel_scales[2]),
+        scale_channel(abs_output, channel_scales[3]),
+    ]
+    if not nnue.remove_abs_sqr_l2:
+        fc1_parts.append(scale_channel(abs_squared_output, channel_scales[4]))
+    fc1_parts.extend((
+        scale_channel(cross_output, channel_scales[5]),
+        torch.zeros(2, dtype=torch.int64),
+    ))
+    fc1_input = torch.cat(tuple(fc1_parts), dim=0)
 
     fc1_start = fm_bucket * 96
     fc1_end = fc1_start + 96
     fc1_bias, fc1_weight = quantize_hidden_fc_parameters_like_serialize(
         nnue,
         nnue.layer_stacks.l2.bias.data[fc1_start:fc1_end],
-        nnue.layer_stacks.l2.weight.data[fc1_start:fc1_end, :192],
+        nnue.layer_stacks.l2.weight.data[
+            fc1_start:fc1_end, :nnue.layer_stacks.l2_in_total
+        ],
     )
     fc1_preact = wrap_to_signed_int32(
         fc1_bias.to(torch.int64)
@@ -1826,23 +1829,26 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
     ).squeeze(0)
     cross_output = torch.clamp(cross_preact, 0.0, 1.0)
 
-    fc1_input = torch.cat(
-        (
-            main_squared * channel_scales[0],
-            main_raw * channel_scales[1],
-            diff_post_lca * channel_scales[2],
-            abs_output * channel_scales[3],
-            abs_squared * channel_scales[4],
-            cross_output * channel_scales[5],
-            torch.zeros(2, dtype=main_raw.dtype, device=main_raw.device),
-        ),
-        dim=0,
-    ).clamp(0.0, 1.0)
+    fc1_parts = [
+        main_squared * channel_scales[0],
+        main_raw * channel_scales[1],
+        diff_post_lca * channel_scales[2],
+        abs_output * channel_scales[3],
+    ]
+    if not nnue.remove_abs_sqr_l2:
+        fc1_parts.append(abs_squared * channel_scales[4])
+    fc1_parts.extend((
+        cross_output * channel_scales[5],
+        torch.zeros(2, dtype=main_raw.dtype, device=main_raw.device),
+    ))
+    fc1_input = torch.cat(tuple(fc1_parts), dim=0).clamp(0.0, 1.0)
     fc1_start = bucket * 96
     fc1_end = fc1_start + 96
     fc1_preact = F.linear(
         fc1_input.unsqueeze(0),
-        nnue.layer_stacks.l2.weight[fc1_start:fc1_end, :192],
+        nnue.layer_stacks.l2.weight[
+            fc1_start:fc1_end, :nnue.layer_stacks.l2_in_total
+        ],
         nnue.layer_stacks.l2.bias[fc1_start:fc1_end],
     ).squeeze(0)
     fc1_output = torch.clamp(fc1_preact, 0.0, 1.0)
@@ -1913,7 +1919,9 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
     )
     report_comparison(
         "FC1 input: C++ / 127 vs PyTorch",
-        get_trace_integers(entries, "deep.fc1.input", 192),
+        get_trace_integers(
+            entries, "deep.fc1.input", nnue.layer_stacks.l2_in_total
+        ),
         CPP_FT_SCALE,
         fc1_input,
     )
@@ -2068,7 +2076,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Compare a native PyTorch NNUE checkpoint with NNUE_TRACE_V1"
     )
-    parser.add_argument("--checkpoint", required=True, help="Native .ckpt file")
+    parser.add_argument(
+        "--checkpoint", required=True,
+        help="Native .ckpt or architecture-tagged recovery .pt file")
     parser.add_argument("--trace", required=True, help="NNUE_TRACE_V1 TSV file")
     parser.add_argument(
         "--features",
@@ -2095,11 +2105,28 @@ def main():
         torch.cuda.set_device(device)
 
     feature_set = features.get_feature_set_from_name(args.features)
-    nnue = M.NNUE.load_from_checkpoint(
-        args.checkpoint,
-        feature_set=feature_set,
-        map_location="cpu",
-    )
+    if args.checkpoint.lower().endswith(".pt"):
+        saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        architecture = saved.get("architecture", {}) if isinstance(saved, dict) else {}
+        l2_input_physical = architecture.get("l2_input_physical")
+        if not isinstance(saved, dict) or "state_dict" not in saved:
+            raise ValueError("Recovery .pt must contain state_dict and architecture")
+        if l2_input_physical not in (
+            M.L2_IN_TOTAL, M.L2_IN_TOTAL_WITHOUT_ABS_SQR
+        ):
+            raise ValueError(f"Unsupported .pt L2 architecture: {l2_input_physical}")
+        nnue = M.NNUE(
+            feature_set,
+            remove_abs_sqr_l2=(
+                l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR),
+        )
+        nnue.load_state_dict(saved["state_dict"], strict=True)
+    else:
+        nnue = M.NNUE.load_from_checkpoint(
+            args.checkpoint,
+            feature_set=feature_set,
+            map_location="cpu",
+        )
     nnue.eval()
     if nnue.input.num_inputs != feature_set.num_features:
         raise ValueError(

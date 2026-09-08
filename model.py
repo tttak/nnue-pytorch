@@ -27,6 +27,7 @@ L2 = 31
 L3 = 96
 
 L2_IN_TOTAL = 192
+L2_IN_TOTAL_WITHOUT_ABS_SQR = 160
 NUM_LS_BUCKETS = 12
 
 
@@ -102,9 +103,13 @@ def get_parameters(layers):
 
 
 class LayerStacks(nn.Module):
-    def __init__(self, count):
+    def __init__(self, count, remove_abs_sqr_l2=True):
         super(LayerStacks, self).__init__()
         self.count = count
+        self.remove_abs_sqr_l2 = remove_abs_sqr_l2
+        self.l2_in_total = (
+            L2_IN_TOTAL_WITHOUT_ABS_SQR if remove_abs_sqr_l2 else L2_IN_TOTAL
+        )
 
         # --- router層
         self.router = nn.Linear(384, count)
@@ -122,7 +127,7 @@ class LayerStacks(nn.Module):
         self.fm_abs = nn.Linear(128, TOTAL_FM_GLU_OUT)
 
         # --- l2, output
-        self.l2 = nn.Linear(L2_IN_TOTAL, L3 * count)
+        self.l2 = nn.Linear(self.l2_in_total, L3 * count)
         self.output = nn.Linear(L3, 1 * count)
 
         # --- blend
@@ -321,7 +326,9 @@ class LayerStacks(nn.Module):
 
         l1_diff_l2_all = torch.clamp(l1c_diff_gated_all * 0.2 + 0.5, 0.0, 1.0)  # [B, 12, 32]
         l1_abs_raw_all = torch.clamp(l1c_abs_gated_all * 0.05 + 0.6, 0.0, 1.0)  # [B, 12, 32]
-        l1_abs_sqr_all = l1_abs_raw_all.pow(2.0)                               # [B, 12, 32]
+        l1_abs_sqr_all = (
+            None if self.remove_abs_sqr_l2 else l1_abs_raw_all.pow(2.0)
+        )                                                                       # [B, 12, 32] or unused
 
         # --- PHASE 3: MainPath & Attention 制御 (全12バケット完全独立) ---
         l1c_main_all = self.l1(l1_main).reshape(-1, self.count, 32)  # [B, 12, 32]
@@ -373,19 +380,24 @@ class LayerStacks(nn.Module):
         l2_main_raw_weighted_all = l1_main_raw_all * (0.5 + p1 * 0.5) * 1.5
         l2_diff_weighted_all = l1_diff_l2_all * (0.5 + p2 * 0.5) * 1.0
         l1_abs_raw_weighted_all = l1_abs_raw_all * (0.5 + p3 * 0.5) * 0.7
-        l1_abs_sqr_weighted_all = l1_abs_sqr_all * (0.5 + p4 * 0.5) * 0.88
+        l1_abs_sqr_weighted_all = (
+            None
+            if self.remove_abs_sqr_l2
+            else l1_abs_sqr_all * (0.5 + p4 * 0.5) * 0.88
+        )
         l2_cross_weighted_all = cross_feat_all * (0.5 + p5 * 0.5) * 1.5
 
         l2_padding_all = torch.zeros((l1_main.shape[0], self.count, 2), device=l1_main.device)
-        l2_input_all = torch.cat([
+        l2_parts = [
             l2_main_sqr_weighted_all,
             l2_main_raw_weighted_all,
             l2_diff_weighted_all,
             l1_abs_raw_weighted_all,
-            l1_abs_sqr_weighted_all,
-            l2_cross_weighted_all,
-            l2_padding_all
-        ], dim=-1)  # Shape: [B, 12, L2_IN_DIM]
+        ]
+        if not self.remove_abs_sqr_l2:
+            l2_parts.append(l1_abs_sqr_weighted_all)
+        l2_parts.extend([l2_cross_weighted_all, l2_padding_all])
+        l2_input_all = torch.cat(l2_parts, dim=-1)  # [B, 12, 192 or 160]
 
         l2_input_all = torch.clamp(l2_input_all, 0.0, 1.0)
 
@@ -455,7 +467,7 @@ class LayerStacks(nn.Module):
                 l1 = nn.Linear(L1_MAIN, 32)
                 diff_b = nn.Linear(128, 64)
                 abs_b = nn.Linear(128, 64)
-                l2 = nn.Linear(L2_IN_TOTAL, L3)
+                l2 = nn.Linear(self.l2_in_total, L3)
                 output = nn.Linear(L3, 1)
                 cross_p = nn.Linear(self.cross_dim * 2, 32)
 
@@ -477,7 +489,7 @@ class LayerStacks(nn.Module):
                 cross_p.weight.data = self.cross_proj.weight.data[s_c:e_c, :]
                 cross_p.bias.data = self.cross_proj.bias.data[s_c:e_c]
 
-                l2.weight.data = self.l2.weight.data[i*L3:(i+1)*L3, :L2_IN_TOTAL]
+                l2.weight.data = self.l2.weight.data[i*L3:(i+1)*L3, :self.l2_in_total]
                 l2.bias.data = self.l2.bias.data[i*L3:(i+1)*L3]
 
                 output.weight.data = self.output.weight.data[i:i+1, :]
@@ -488,7 +500,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True):
         super(NNUE, self).__init__()
         self.num_ls_buckets = NUM_LS_BUCKETS
 
@@ -496,7 +508,10 @@ class NNUE(pl.LightningModule):
         self.pair_weights = nn.Parameter(torch.zeros(4, 640, 3))
 
         self.feature_set = feature_set
-        self.layer_stacks = LayerStacks(self.num_ls_buckets)
+        self.remove_abs_sqr_l2 = remove_abs_sqr_l2
+        self.layer_stacks = LayerStacks(
+            self.num_ls_buckets, remove_abs_sqr_l2=remove_abs_sqr_l2
+        )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
         self.gamma = gamma
@@ -876,8 +891,12 @@ class NNUE(pl.LightningModule):
             main_sqr_part = l2_input[:, 0:31].abs().mean().item()
             main_raw_part = l2_input[:, 31:62].abs().mean().item()
             fm_diff_part = l2_input[:, 62:94].abs().mean().item()
-            fm_abs_part = l2_input[:, 94:158].abs().mean().item()
-            cross_feat = l2_input[:, 158:190].abs().mean().item()
+            if self.remove_abs_sqr_l2:
+                fm_abs_part = l2_input[:, 94:126].abs().mean().item()
+                cross_feat = l2_input[:, 126:158].abs().mean().item()
+            else:
+                fm_abs_part = l2_input[:, 94:158].abs().mean().item()
+                cross_feat = l2_input[:, 158:190].abs().mean().item()
 
             print(f" L2 In | Main(Sqr): {main_sqr_part:.4f} | Main(Raw): {main_raw_part:.4f} | FM(Diff): {fm_diff_part:.4f} | FM(Abs): {fm_abs_part:.4f}  | cross_feat: {cross_feat:.4f}")
 
@@ -896,8 +915,11 @@ class NNUE(pl.LightningModule):
             log_stats("Main(Raw)",    l2_input[:, 31:62])
             log_stats("FM(Diff)",     l2_input[:, 62:94])
             log_stats("FM(Abs_Raw)",  l2_input[:, 94:126])
-            log_stats("FM(Abs_Sqr)",  l2_input[:, 126:158])
-            log_stats("cross_feat",   l2_input[:, 158:190])
+            if self.remove_abs_sqr_l2:
+                log_stats("cross_feat", l2_input[:, 126:158])
+            else:
+                log_stats("FM(Abs_Sqr)", l2_input[:, 126:158])
+                log_stats("cross_feat",  l2_input[:, 158:190])
 
             if self.input.v.grad is not None:
                 v_grad_mean = self.input.v.grad.abs().mean().item()
@@ -4684,7 +4706,8 @@ class NNUE(pl.LightningModule):
                 offset=self.offset,
                 offset1=self.offset1,
                 offset2=self.offset2,
-                adjust_loss=self.adjust_loss
+                adjust_loss=self.adjust_loss,
+                remove_abs_sqr_l2=self.remove_abs_sqr_l2,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視

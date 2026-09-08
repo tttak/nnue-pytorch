@@ -59,6 +59,10 @@ def decode_leb_128_array(arr, n):
 # hardcoded for now
 VERSION = 0x7AF32F16
 DEFAULT_DESCRIPTION = "HalfKA-KSDG3_FM-1280"
+COMPACT_DESCRIPTION = "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr"
+COMPACT_FC_HASH_XOR = 0x00600000
+SFNN_OUTER_HASH = 0x3C203B32
+SFNN_FEATURE_TRANSFORMER_HASH = 0x5F134AB8
 
 class NNUEWriter():
   """
@@ -66,7 +70,9 @@ class NNUEWriter():
   """
   def __init__(self, model, description=None, ft_compression='none'):
     if description is None:
-        description = DEFAULT_DESCRIPTION
+        description = (COMPACT_DESCRIPTION
+                       if getattr(model, 'remove_abs_sqr_l2', False)
+                       else DEFAULT_DESCRIPTION)
 
     self.buf = bytearray()
 
@@ -75,7 +81,7 @@ class NNUEWriter():
     # but it might be necessary in the future.
     fc_hash = self.fc_hash(model)
     self.write_header(model, fc_hash, description)
-    self.int32(model.feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    self.int32(SFNN_FEATURE_TRANSFORMER_HASH)
     self.write_feature_transformer(model, ft_compression)
 
     # --- [追加] Router Layer は共通で1個だけ書き出す (ループの外) ---
@@ -153,11 +159,17 @@ class NNUEWriter():
       if out_dims != 1:
         layer_hash = (layer_hash + 0x538D24C7) & 0xFFFFFFFF
       prev_hash = layer_hash
+    # The legacy hash algorithm does not include input dimensions.  Preserve
+    # its exact 192-input result, while assigning a distinct serialized
+    # architecture hash to the 160-input NoAbsSqr model.
+    if getattr(model, 'remove_abs_sqr_l2', False):
+      layer_hash ^= COMPACT_FC_HASH_XOR
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
     self.int32(VERSION) # version
-    self.int32(fc_hash ^ model.feature_set.hash ^ (M.L1*2)) # halfkp network hash
+    # SFNNwoPSQT uses a fixed outer architecture hash in the C++ loader.
+    self.int32(SFNN_OUTER_HASH)
     encoded_description = description.encode('utf-8')
     self.int32(len(encoded_description)) # Network definition
     self.buf.extend(encoded_description)
@@ -359,11 +371,28 @@ class NNUEReader():
   def __init__(self, f, feature_set):
     self.f = f
     self.feature_set = feature_set
-    self.model = M.NNUE(feature_set)
-    fc_hash = NNUEWriter.fc_hash(self.model)
 
-    self.read_header(feature_set, fc_hash)
-    self.read_int32(feature_set.hash ^ (M.L1*2)) # Feature transformer hash
+    # Read enough of the header to select the physical fc_1 input shape before
+    # allocating the PyTorch model.  192-input files retain their old hash;
+    # compact files carry the input-dimension discriminator above.
+    version = self.read_int32()
+    network_hash = self.read_int32()
+    desc_len = self.read_int32()
+    self.description = self.f.read(desc_len).decode('utf-8')
+    if version != VERSION:
+      raise Exception('Unsupported NNUE version: 0x%08x' % version)
+
+    remove_abs_sqr_l2 = COMPACT_DESCRIPTION in self.description
+    self.model = M.NNUE(
+        feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2)
+    fc_hash = NNUEWriter.fc_hash(self.model)
+    expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
+    # Accept legacy serializer output as well as the C++ SFNN fixed hash.
+    if network_hash not in (SFNN_OUTER_HASH, expected_network_hash):
+      raise Exception(
+          'NNUE architecture hash mismatch: expected 0x%08x, got 0x%08x'
+          % (expected_network_hash, network_hash))
+    self.read_int32(SFNN_FEATURE_TRANSFORMER_HASH)
     self.read_feature_transformer(self.model.input)
 
     self.model.layer_stacks.l1_fact.weight.data.fill_(0.0)
@@ -397,7 +426,7 @@ class NNUEReader():
       # cross_proj用
       cross_p_tmp = nn.Linear(self.model.layer_stacks.cross_dim * 2, 32, bias=True)
 
-      l2_tmp      = nn.Linear(M.L2_IN_TOTAL, M.L3)
+      l2_tmp      = nn.Linear(self.model.layer_stacks.l2_in_total, M.L3)
       output_tmp  = nn.Linear(M.L3, 1)
 
       # --- 2. バイナリからの読み込み ---
@@ -515,6 +544,8 @@ class NNUEReader():
     if compression == 'none':
       d = np.fromfile(self.f, dtype, reduce(operator.mul, shape, 1))
       d = torch.from_numpy(d.astype(np.float32))
+    else:
+      d = self.read_leb_128_array(dtype, shape)
     d = d.reshape(shape)
 
     print(f"Current file position: {self.f.tell()} bytes")
@@ -618,7 +649,26 @@ def main():
     nnue = M.NNUE.load_from_checkpoint(args.source, feature_set=feature_set)
     nnue.eval()
   elif args.source.endswith('.pt'):
-      nnue = torch.load(args.source)
+      saved = torch.load(args.source, map_location='cpu', weights_only=False)
+      if isinstance(saved, M.NNUE):
+        nnue = saved
+      elif isinstance(saved, dict) and 'state_dict' in saved:
+        architecture = saved.get('architecture', {})
+        l2_input_physical = architecture.get('l2_input_physical')
+        if l2_input_physical not in (M.L2_IN_TOTAL,
+                                     M.L2_IN_TOTAL_WITHOUT_ABS_SQR):
+          raise Exception(
+              'Unsupported or missing .pt L2 architecture: %r'
+              % (l2_input_physical,))
+        nnue = M.NNUE(
+            feature_set,
+            remove_abs_sqr_l2=(
+                l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR))
+        nnue.load_state_dict(saved['state_dict'], strict=True)
+      else:
+        raise Exception(
+            '.pt source must contain an NNUE model or a state_dict package')
+      nnue.eval()
   elif args.source.endswith(('.nnue', '.bin')):
     with open(args.source, 'rb') as f:
       reader = NNUEReader(f, feature_set)
