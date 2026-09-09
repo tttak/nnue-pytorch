@@ -9,6 +9,9 @@ import pytorch_lightning as pl
 import features
 import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import torch
@@ -17,6 +20,127 @@ from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
 import pytorch_lightning.callbacks
+
+
+class GracefulInterruptController:
+  """Turn the first SIGINT into KeyboardInterrupt and force-exit on repeats."""
+
+  def __init__(self):
+    self.graceful_interrupt_in_progress = False
+    self._previous_sigint_handler = None
+    self._previous_sigbreak_handler = None
+    self._force_exit_watchdog = None
+
+  def install(self) -> None:
+    self._previous_sigint_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, self._handle_sigint)
+    if os.name == 'nt':
+      self._previous_sigbreak_handler = signal.getsignal(signal.SIGBREAK)
+      signal.signal(signal.SIGBREAK, self._handle_sigint)
+
+  def restore(self) -> None:
+    if self._previous_sigint_handler is not None:
+      signal.signal(signal.SIGINT, self._previous_sigint_handler)
+      self._previous_sigint_handler = None
+    if self._previous_sigbreak_handler is not None:
+      signal.signal(signal.SIGBREAK, self._previous_sigbreak_handler)
+      self._previous_sigbreak_handler = None
+
+  def begin_graceful_interrupt(self) -> None:
+    self.graceful_interrupt_in_progress = True
+
+  def start_force_exit_watchdog(self) -> None:
+    """Let a second Ctrl+C kill us even while checkpoint code holds the GIL."""
+    if self._force_exit_watchdog is not None:
+      return
+
+    # This separate process shares the console but not the checkpoint writer's
+    # GIL.  It starts only after the first Ctrl+C, so the next SIGINT it sees is
+    # necessarily the user's second Ctrl+C.
+    watchdog_code = r'''
+import ctypes
+import os
+import signal
+import sys
+import time
+
+parent_pid = int(sys.argv[1])
+parent_process = None
+if os.name == 'nt':
+  parent_process = ctypes.windll.kernel32.OpenProcess(
+      0x0001 | 0x00100000, False, parent_pid)  # TERMINATE | SYNCHRONIZE
+  if not parent_process:
+    raise OSError('Cannot open parent process for Ctrl+C watchdog')
+
+def force_exit(signum, frame):
+  try:
+    os.write(2, b'Second Ctrl+C detected. Exiting immediately without saving checkpoint.\n')
+    if os.name == 'nt':
+      ctypes.windll.kernel32.TerminateProcess(parent_process, 130)
+    else:
+      os.kill(parent_pid, signal.SIGKILL)
+  finally:
+    os._exit(130)
+
+signal.signal(signal.SIGINT, force_exit)
+if os.name == 'nt':
+  signal.signal(signal.SIGBREAK, force_exit)
+print('READY', flush=True)
+while True:
+  if os.name == 'nt':
+    if ctypes.windll.kernel32.WaitForSingleObject(parent_process, 1000) == 0:
+      ctypes.windll.kernel32.CloseHandle(parent_process)
+      os._exit(0)
+  else:
+    try:
+      os.kill(parent_pid, 0)
+    except ProcessLookupError:
+      os._exit(0)
+    time.sleep(1)
+'''
+    self._force_exit_watchdog = subprocess.Popen(
+        [sys.executable, '-c', watchdog_code, str(os.getpid())],
+        stdout=subprocess.PIPE,
+        stderr=None,
+        text=True)
+    ready = self._force_exit_watchdog.stdout.readline().strip()
+    if ready != 'READY':
+      self.stop_force_exit_watchdog()
+      raise RuntimeError('Failed to start the second-Ctrl+C watchdog')
+
+  def stop_force_exit_watchdog(self) -> None:
+    watchdog = self._force_exit_watchdog
+    self._force_exit_watchdog = None
+    if watchdog is None:
+      return
+    if watchdog.poll() is None:
+      watchdog.terminate()
+      try:
+        watchdog.wait(timeout=5)
+      except subprocess.TimeoutExpired:
+        watchdog.kill()
+        watchdog.wait()
+    if watchdog.stdout is not None:
+      watchdog.stdout.close()
+
+  def _handle_sigint(self, signum, frame) -> None:
+    if self.graceful_interrupt_in_progress:
+      # Avoid buffered print()/logging here: the second Ctrl+C must not wait on
+      # a checkpoint writer or another lock held by the interrupted process.
+      try:
+        # During checkpointing the independent watchdog prints this message;
+        # do not duplicate it if both handlers receive the same console event.
+        if self._force_exit_watchdog is None:
+          os.write(
+              2,
+              b'Second Ctrl+C detected. Exiting immediately without saving checkpoint.\n')
+      finally:
+        os._exit(130)
+
+    # Record the first signal before raising, so another Ctrl+C can abort even
+    # while Lightning is unwinding into Callback.on_exception().
+    self.begin_graceful_interrupt()
+    signal.default_int_handler(signum, frame)
 
 
 class TextLogPrintTee:
@@ -131,9 +255,11 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
       self,
       every_n_epochs: int,
       log_dir: str,
+      interrupt_controller: GracefulInterruptController | None = None,
   ):
     self.every_n_epochs = every_n_epochs
     self.log_dir = log_dir
+    self.interrupt_controller = interrupt_controller
     self.final_checkpoint_saved = False
     self.keyboard_interrupt_handled = False
 
@@ -143,11 +269,30 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
     ckpt_file_path = os.path.join(self.log_dir, f'{trainer.current_epoch}.ckpt')
     trainer.save_checkpoint(ckpt_file_path)
 
-  def save_final_checkpoint(self, trainer: 'pl.Trainer') -> str:
-    """Save final.ckpt once, for normal completion or an interrupted fit."""
+  def save_final_checkpoint(
+      self,
+      trainer: 'pl.Trainer',
+      interruptible: bool = False,
+  ) -> str:
+    """Atomically save final.ckpt once, for normal completion or interruption."""
     ckpt_file_path = os.path.join(self.log_dir, 'final.ckpt')
     if not self.final_checkpoint_saved:
-      trainer.save_checkpoint(ckpt_file_path)
+      # Keep a previously completed final.ckpt intact until the replacement is
+      # fully written.  A forced second Ctrl+C may leave this exact .tmp file,
+      # but can never expose it as final.ckpt.
+      temporary_path = ckpt_file_path + '.tmp'
+      use_watchdog = interruptible and self.interrupt_controller is not None
+      if use_watchdog:
+        # Serialization can delay Python's own signal handler.  The watchdog
+        # is a separate process in the same console and can terminate this
+        # process immediately when the user presses Ctrl+C again.
+        self.interrupt_controller.start_force_exit_watchdog()
+      try:
+        trainer.save_checkpoint(temporary_path)
+      finally:
+        if use_watchdog:
+          self.interrupt_controller.stop_force_exit_watchdog()
+      os.replace(temporary_path, ckpt_file_path)
       self.final_checkpoint_saved = True
     return ckpt_file_path
 
@@ -162,7 +307,9 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
     # the Trainer is still intact.  Do not checkpoint arbitrary failures.
     if not isinstance(exception, KeyboardInterrupt):
       return
-    ckpt_file_path = self.save_final_checkpoint(trainer)
+    if self.interrupt_controller is not None:
+      self.interrupt_controller.begin_graceful_interrupt()
+    ckpt_file_path = self.save_final_checkpoint(trainer, interruptible=True)
     # Treat Lightning's trailing SystemExit as a graceful interrupt only after
     # final.ckpt was written successfully.
     self.keyboard_interrupt_handled = True
@@ -416,7 +563,11 @@ def main():
   if text_log_tee is not None:
     text_log_tee.bind_lightning_version(tb_logger.version)
     print(f"Text log: {text_log_tee.path}", flush=True)
-  checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
+  interrupt_controller = GracefulInterruptController()
+  checkpoint_callback = NetworkSaveCheckpoint(
+      every_n_epochs=args.network_save_period,
+      log_dir=tb_logger.log_dir,
+      interrupt_controller=interrupt_controller)
   trainer_device_args = (
       {"accelerator": "gpu", "devices": args.gpus}
       if args.gpus > 0
@@ -439,15 +590,19 @@ def main():
     train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror)
 
   torch.set_float32_matmul_precision('high')
+  interrupt_controller.install()
   try:
-    trainer.fit(nnue, train, val)
-  except SystemExit:
-    # Lightning 2.6 calls on_exception(KeyboardInterrupt), performs its own
-    # graceful teardown, then raises SystemExit(1).  Once our callback has
-    # successfully saved final.ckpt, translate only that known interrupt into
-    # a normal process exit.  Other SystemExit causes must retain their code.
-    if not checkpoint_callback.keyboard_interrupt_handled:
-      raise
+    try:
+      trainer.fit(nnue, train, val)
+    except SystemExit:
+      # Lightning 2.6 calls on_exception(KeyboardInterrupt), performs its own
+      # graceful teardown, then raises SystemExit(1).  Once our callback has
+      # successfully saved final.ckpt, translate only that known interrupt into
+      # a normal process exit.  Other SystemExit causes must retain their code.
+      if not checkpoint_callback.keyboard_interrupt_handled:
+        raise
+  finally:
+    interrupt_controller.restore()
 
   print(f'tb_logger.log_dir={tb_logger.log_dir}')
   checkpoint_callback.save_final_checkpoint(trainer)
