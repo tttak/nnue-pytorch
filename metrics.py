@@ -30,14 +30,16 @@ def main():
   args = parser.parse_args()
 
   if args.model.endswith(".pt"):
-    nnue = torch.load(args.model, map_location=torch.device('cpu'))
+    # .pt files contain a complete NNUE Python object, not just a state_dict.
+    nnue = torch.load(
+        args.model, map_location=torch.device('cpu'), weights_only=False)
   else:
     nnue = M.NNUE.load_from_checkpoint(args.model)
 
   val_infinite = nnue_dataset.SparseBatchDataset(halfkp.NAME, args.dataset, 8000)
   data = nnue_dataset.FixedNumBatchesDataset(val_infinite, 16)
 
-  trainer = pl.Trainer(progress_bar_refresh_rate=0)
+  trainer = pl.Trainer(enable_progress_bar=False)
   for i in range(21):
     nnue.lambda_ = i / 20.0
     loss = trainer.test(nnue, data, verbose=False)

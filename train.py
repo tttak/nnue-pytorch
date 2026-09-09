@@ -148,7 +148,18 @@ def main():
   parser.add_argument("train2", help="Training data (.bin or .binpack)")
   parser.add_argument("train3", help="Training data (.bin or .binpack)")
   parser.add_argument("val", help="Validation data (.bin or .binpack)")
-  parser = pl.Trainer.add_argparse_args(parser)
+  # Lightning 2.x no longer exposes Trainer.add_argparse_args().  Keep the
+  # command-line options used by the existing training scripts and translate
+  # them to the current Trainer API below.
+  parser.add_argument("--gpus", default=0, type=int,
+                      help="Number of CUDA devices (0 selects CPU).")
+  parser.add_argument("--max_epochs", "--max-epochs", default=None, type=int,
+                      dest="max_epochs", help="Maximum number of training epochs.")
+  parser.add_argument("--default_root_dir", "--default-root-dir", default=None,
+                      dest="default_root_dir", help="Lightning root directory.")
+  parser.add_argument("--log_every_n_steps", "--log-every-n-steps", default=50,
+                      type=int, dest="log_every_n_steps",
+                      help="How often Lightning logs training metrics.")
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--start-lambda", default=None, type=float, dest='start_lambda', help="lambda to use at first epoch.")
@@ -243,7 +254,11 @@ def main():
                     adjust_loss=args.adjust_loss)
 
       # 2. CPU 上で重みファイルをロード
-      checkpoint = torch.load(args.resume_from_model, map_location='cpu')
+      # A .pt resume source may contain a complete NNUE Python object rather
+      # than only tensor weights.  PyTorch 2.6+ defaults torch.load() to
+      # weights_only=True, so opt into object loading at this boundary only.
+      checkpoint = torch.load(
+          args.resume_from_model, map_location='cpu', weights_only=False)
       model_dict = nnue.state_dict()
 
       # checkpoint が NNUE オブジェクトそのものだった場合
@@ -352,6 +367,9 @@ def main():
   pl.seed_everything(args.seed)
   print("Seed {}".format(args.seed))
 
+  if args.gpus < 0:
+    raise ValueError(f"--gpus must be 0 or greater (got {args.gpus})")
+
   batch_size = args.batch_size
   if batch_size <= 0:
     batch_size = 128 if args.gpus == 0 else 8192
@@ -372,9 +390,19 @@ def main():
     text_log_tee.bind_lightning_version(tb_logger.version)
     print(f"Text log: {text_log_tee.path}", flush=True)
   checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
-  trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
+  trainer_device_args = (
+      {"accelerator": "gpu", "devices": args.gpus}
+      if args.gpus > 0
+      else {"accelerator": "cpu", "devices": 1})
+  trainer = pl.Trainer(
+      callbacks=[checkpoint_callback],
+      logger=tb_logger,
+      max_epochs=args.max_epochs,
+      default_root_dir=args.default_root_dir,
+      log_every_n_steps=args.log_every_n_steps,
+      **trainer_device_args)
 
-  main_device = trainer.root_device if trainer.strategy.root_device.index is None else 'cuda:' + str(trainer.strategy.root_device.index)
+  main_device = str(trainer.strategy.root_device)
 
   if args.py_data:
     print('Using python data loader')

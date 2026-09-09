@@ -596,6 +596,17 @@ class NNUE(pl.LightningModule):
         self._torch_profiler_num_batches = 2
         self._torch_profiler_finished_epoch = None
 
+        # Detailed diagnostics are intentionally sparse.  Setting this to 1
+        # reproduces the former every-batch TensorBoard/statistics behavior for
+        # A/B measurement without changing any loss or gradient expression.
+        self.diagnostic_log_interval = 500
+
+    def _collect_detailed_diagnostics_this_step(self):
+        return (
+            not self.training
+            or self.global_step % self.diagnostic_log_interval == 0
+        )
+
     def _zero_virtual_feature_weights(self):
         weights = self.input.weight
         v_weights = self.input.v
@@ -1996,9 +2007,9 @@ class NNUE(pl.LightningModule):
         # 辞書の初期化時にデフォルト値を設定しておく
         metrics = {
             'router_acc': router_acc,
-            'gap_mean': oracle_gaps.mean().item(),
-            'gap_median': oracle_gaps.median().item(),
-            'gap_max': oracle_gaps.max().item(),
+            'gap_mean': 0.0,
+            'gap_median': 0.0,
+            'gap_max': 0.0,
             'best_bucket_indices': best_bucket_indices,
             'pred_bucket_indices': pred_bucket_indices,
             'oracle_gaps': oracle_gaps,
@@ -2012,9 +2023,14 @@ class NNUE(pl.LightningModule):
             'router_acc_high': 0.0,
         }
 
-        # 100ステップ毎のみ実際の値を上書き計算
-        if self.training and (self.global_step % 100 == 0):
+        # None of these reductions participates in a loss.  Keep them on the
+        # same sparse schedule as the detailed report to avoid CUDA syncs on
+        # ordinary training batches.
+        if self._collect_detailed_diagnostics_this_step():
             with torch.no_grad():
+                metrics['gap_mean'] = oracle_gaps.mean().item()
+                metrics['gap_median'] = oracle_gaps.median().item()
+                metrics['gap_max'] = oracle_gaps.max().item()
                 metrics['gw_mean'] = gap_weight.mean().item()
                 metrics['gw_median'] = gap_weight.median().item()
                 metrics['gw_gt_05'] = (gap_weight > 0.5).float().mean().item() * 100
@@ -2326,34 +2342,36 @@ class NNUE(pl.LightningModule):
         pairwise_loss = weighted_sum / weight_sum
 
         # ---------------------------------------------------------
-        # Debug metrics
+        # Debug metrics (not part of pairwise_loss)
         # ---------------------------------------------------------
-        with torch.no_grad():
-            valid_pair_count = valid_mask.sum()
+        collect_diagnostics = self._collect_detailed_diagnostics_this_step()
+        if collect_diagnostics:
+            with torch.no_grad():
+                valid_pair_count = valid_mask.sum()
 
-            if valid_pair_count > 0:
-                pair_acc = (
-                    (logit_diff > 0) & valid_mask
-                ).float().sum() / valid_pair_count
+                if valid_pair_count > 0:
+                    pair_acc = (
+                        (logit_diff > 0) & valid_mask
+                    ).float().sum() / valid_pair_count
 
-                margin_acc = (
-                    (logit_diff >= margin) & valid_mask
-                ).float().sum() / valid_pair_count
+                    margin_acc = (
+                        (logit_diff >= margin) & valid_mask
+                    ).float().sum() / valid_pair_count
 
-                mean_logit_diff = (
-                    logit_diff[valid_mask].mean()
-                )
+                    mean_logit_diff = (
+                        logit_diff[valid_mask].mean()
+                    )
 
-                mean_error_diff = (
-                    error_diff[valid_mask].mean()
-                )
-            else:
-                pair_acc = torch.tensor(0.0, device=device)
-                margin_acc = torch.tensor(0.0, device=device)
-                mean_logit_diff = torch.tensor(0.0, device=device)
-                mean_error_diff = torch.tensor(0.0, device=device)
+                    mean_error_diff = (
+                        error_diff[valid_mask].mean()
+                    )
+                else:
+                    pair_acc = torch.tensor(0.0, device=device)
+                    margin_acc = torch.tensor(0.0, device=device)
+                    mean_logit_diff = torch.tensor(0.0, device=device)
+                    mean_error_diff = torch.tensor(0.0, device=device)
 
-        if self.training and (self.global_step % 500 == 0):
+        if collect_diagnostics and (self.global_step % 500 == 0):
             print(f"[Router Pairwise](Step {self.global_step})")
             print(
                 f"  Pairwise Loss: {pairwise_loss.item():.6f}"
@@ -2455,11 +2473,12 @@ class NNUE(pl.LightningModule):
                 distill_loss_all.masked_fill(~mask, 0.0).sum()
                 / mask.sum()
             )
-            # 少なくとも1つの未選択Oracleバケットが割り当たったサンプル数
-            valid_count = mask.any(dim=1).sum().item()
 
         # ログ表示
         if self.training and (self.global_step % 500 == 0):
+            # 少なくとも1つの未選択Oracleバケットが割り当たったサンプル数。
+            # This value is display-only, so materialize it only for display.
+            valid_count = mask.any(dim=1).sum().item()
             bucket_stats = []
             for i in range(num_buckets):
                 m_i = mask[:, i]
@@ -2835,7 +2854,7 @@ class NNUE(pl.LightningModule):
                 beta=0.1
             )
 
-        if self.training:
+        if self._collect_detailed_diagnostics_this_step():
             with torch.profiler.record_function("NNUE/aux_metrics"):
                 self._print_aux_debug(
                     main_score_flat.detach(),
@@ -3011,45 +3030,47 @@ class NNUE(pl.LightningModule):
             pair_loss.sum(dim=(1, 2)) * 0.5
         ).mean()
 
-        # --------------------------------------------------
-        # メトリクス
-        # --------------------------------------------------
-        with torch.no_grad():
+        collect_diagnostics = self._collect_detailed_diagnostics_this_step()
 
-            att_top = att.argmax(dim=1)
-            pred_top = pred_abs.argmax(dim=1)
+        # These reductions are diagnostic-only.  In particular, agreement and
+        # correlation do not participate in loss_couple_raw or its gradient.
+        if collect_diagnostics:
+            with torch.no_grad():
 
-            agreement = (
-                att_top == pred_top
-            ).float().mean()
+                att_top = att.argmax(dim=1)
+                pred_top = pred_abs.argmax(dim=1)
 
-            att_mean = att.mean(dim=1, keepdim=True)
-            pred_mean = pred_abs.mean(dim=1, keepdim=True)
+                agreement = (
+                    att_top == pred_top
+                ).float().mean()
 
-            att_centered = att - att_mean
-            pred_centered = pred_abs - pred_mean
+                att_mean = att.mean(dim=1, keepdim=True)
+                pred_mean = pred_abs.mean(dim=1, keepdim=True)
 
-            corr_num = (
-                att_centered * pred_centered
-            ).sum(dim=1)
+                att_centered = att - att_mean
+                pred_centered = pred_abs - pred_mean
 
-            corr_den = (
-                att_centered.pow(2).sum(dim=1).sqrt()
-                * pred_centered.pow(2).sum(dim=1).sqrt()
-                + 1e-6
-            )
+                corr_num = (
+                    att_centered * pred_centered
+                ).sum(dim=1)
 
-            corr = (
-                corr_num / corr_den
-            ).mean()
+                corr_den = (
+                    att_centered.pow(2).sum(dim=1).sqrt()
+                    * pred_centered.pow(2).sum(dim=1).sqrt()
+                    + 1e-6
+                )
 
-            res_mean = pred_abs.mean()
-            res_std = pred_abs.std()
+                corr = (
+                    corr_num / corr_den
+                ).mean()
+
+                res_mean = pred_abs.mean()
+                res_std = pred_abs.std()
 
         # --------------------------------------------------
         # TensorBoard
         # --------------------------------------------------
-        if self.training:
+        if collect_diagnostics:
             self.log(
                 "train2/fm_couple_loss",
                 loss_couple_raw,
@@ -3083,16 +3104,29 @@ class NNUE(pl.LightningModule):
         # --------------------------------------------------
         # Debug
         # --------------------------------------------------
-        if self.training and (
+        if collect_diagnostics and (
             self.global_step % 500 == 0
         ):
+            (
+                debug_loss,
+                debug_agreement,
+                debug_corr,
+                debug_res_mean,
+                debug_res_std,
+            ) = torch.stack([
+                loss_couple_raw.detach().float(),
+                agreement.detach().float(),
+                corr.detach().float(),
+                res_mean.detach().float(),
+                res_std.detach().float(),
+            ]).cpu().tolist()
             print(
                 f"\n[DEBUG FM Pairwise](Step {self.global_step}) "
-                f"Loss: {loss_couple_raw.item():.6f} | "
-                f"Agr: {agreement.item():.2%} | "
-                f"Corr: {corr.item():.4f} | "
-                f"Mean: {res_mean.item():.6f} | "
-                f"Std: {res_std.item():.6f}"
+                f"Loss: {debug_loss:.6f} | "
+                f"Agr: {debug_agreement:.2%} | "
+                f"Corr: {debug_corr:.4f} | "
+                f"Mean: {debug_res_mean:.6f} | "
+                f"Std: {debug_res_std:.6f}"
             )
 
         return loss_couple_raw
@@ -3195,31 +3229,66 @@ class NNUE(pl.LightningModule):
         router_ce_loss, bucket_distill_loss, router_acc, gap_mean, gap_median, gap_max, gw_mean, gw_median, gw_gt_05, gw_gt_08, router_acc_high, weights, main_aux_loss, fm_residual_loss, fm_couple_loss, ply_flat, material, router_logits
     ):
 
-        def _to_float(val):
-            if val is None:
-                return 0.0
-            if hasattr(val, "item"):
-                return val.item()
-            return float(val)
+        # train_loss is the only metric needed every step (progress bar and
+        # scheduler/logger integration).  All remaining values below are
+        # diagnostic and many require a synchronizing Tensor.item().
+        if self.training and not self._collect_detailed_diagnostics_this_step():
+            self.log(loss_type, loss, prog_bar=(loss_type == 'train_loss'))
+            return
 
-        mean_base = _to_float(base_loss)
-        mean_pair = _to_float(pairwise_loss)
-        mean_list = _to_float(listwise_loss)
-        mean_router = _to_float(router_load_loss)
-        mean_top1 = _to_float(router_top1_loss)
-        mean_router_freq_match = _to_float(router_frequency_matching_loss)
-        mean_router_pairwise = _to_float(router_pairwise_loss)
-        mean_margin = _to_float(router_margin_loss)
-        mean_ce = _to_float(router_ce_loss)
-        mean_acc = _to_float(router_acc)
-        mean_phase = _to_float(phase_penalty)
-        mean_ortho = _to_float(ortho_loss)
-        mean_ema_distill = _to_float(ema_distill_loss)
-        mean_bucket_distill = _to_float(bucket_distill_loss)
-        mean_main_aux = _to_float(main_aux_loss)
-        mean_fm_residual = _to_float(fm_residual_loss)
-        mean_couple = _to_float(fm_couple_loss)
-        mean_total = _to_float(loss)
+        # Pull the scalar diagnostic values back with one synchronization.
+        # The former per-value .item() calls serialized the CUDA stream once
+        # for every metric even though all values are consumed together.
+        diagnostic_values = [
+            base_loss,
+            pairwise_loss,
+            listwise_loss,
+            router_load_loss,
+            router_top1_loss,
+            router_frequency_matching_loss,
+            router_pairwise_loss,
+            router_margin_loss,
+            router_ce_loss,
+            router_acc,
+            phase_penalty,
+            ortho_loss,
+            ema_distill_loss,
+            bucket_distill_loss,
+            main_aux_loss,
+            fm_residual_loss,
+            fm_couple_loss,
+            loss,
+        ]
+        scalar_device = loss.device
+        diagnostic_tensor = torch.stack([
+            value.detach().float().reshape(())
+            if torch.is_tensor(value)
+            else torch.tensor(
+                0.0 if value is None else float(value),
+                device=scalar_device,
+            )
+            for value in diagnostic_values
+        ])
+        (
+            mean_base,
+            mean_pair,
+            mean_list,
+            mean_router,
+            mean_top1,
+            mean_router_freq_match,
+            mean_router_pairwise,
+            mean_margin,
+            mean_ce,
+            mean_acc,
+            mean_phase,
+            mean_ortho,
+            mean_ema_distill,
+            mean_bucket_distill,
+            mean_main_aux,
+            mean_fm_residual,
+            mean_couple,
+            mean_total,
+        ) = diagnostic_tensor.cpu().tolist()
 
         w_base = mean_base
         w_pair = mean_pair * weights["pairwise"]
@@ -3491,7 +3560,10 @@ class NNUE(pl.LightningModule):
                 self.log("val_loss/pair_acc", 0.0, prog_bar=False)
                 self.log("val_loss/value_diff_cp_mae", 0.0, prog_bar=False)
 
-        self.log(loss_type, loss)
+        # Lightning 2.x no longer displays a returned training loss in the
+        # progress bar automatically.  Reuse the existing metric (and logger
+        # write) instead of logging a duplicate loss under another name.
+        self.log(loss_type, loss, prog_bar=(loss_type == 'train_loss'))
 
     def _format_bucket_stats(self, bucket_indices, ply_flat, pt, pf, qf, score, scorenet, material, num_buckets=12):
         """
@@ -3667,7 +3739,7 @@ class NNUE(pl.LightningModule):
         self._current_backward_end.record()
         set_grouped_bw_timing(False)
 
-    def on_before_optimizer_step(self, optimizer, optimizer_idx=0):
+    def on_before_optimizer_step(self, optimizer):
         self._ft_stat_before_optimizer_step(optimizer)
 
     def on_train_batch_start(self, batch, batch_idx):
@@ -4795,7 +4867,7 @@ class NNUE(pl.LightningModule):
 
         # --- SECTION 3: スケジューラの設定 ---
         scheduler = {
-            'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True, threshold=1e-8),
+            'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, threshold=1e-8),
             'monitor': 'val_loss_lambda1.0',
             'interval': 'epoch',
             'frequency': 1
