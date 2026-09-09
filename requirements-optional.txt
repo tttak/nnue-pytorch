@@ -1,0 +1,16 @@
+# Optional legacy analysis helpers. These are not needed for training,
+# serialization, visualization, or the custom CUDA FeatureTransformer.
+
+# perf_sigmoid_fitter.py
+scipy
+
+# loss_graph.py is a legacy TensorFlow helper. TensorFlow is intentionally not
+# installed by this file because native-Windows GPU support and NumPy support
+# differ from the supported PyTorch/CUDA environment. Prefer do_plots.py.
+
+# YaneuraOu/script analysis and benchmark helpers
+pandas
+PyYAML
+pexpect
+statsmodels
+cpuid
