@@ -1,16 +1,111 @@
 import argparse
+import atexit
+import builtins
+from datetime import datetime
 import model as M
 import nnue_dataset
 import nnue_bin_dataset
 import pytorch_lightning as pl
 import features
 import os
+from pathlib import Path
+import tempfile
+import threading
 import torch
 from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
 import pytorch_lightning.callbacks
+
+
+class TextLogPrintTee:
+  """Duplicate implicit-destination print() calls to a UTF-8 text log.
+
+  Calls which explicitly provide ``file=`` retain normal print semantics and
+  are deliberately not copied.  In particular, tqdm/Lightning progress output
+  written to its terminal stream stays out of the text log.
+  """
+
+  def __init__(self, requested_path, started_at):
+    self.requested_path = Path(requested_path).expanduser().resolve()
+    self.started_at = started_at
+    self.path = None
+    # Capture diagnostics printed before TensorBoardLogger selects its version.
+    # The buffer spills to a temporary file if checkpoint-loading diagnostics
+    # become large, then is copied into the final line-buffered log.
+    self._stream = tempfile.SpooledTemporaryFile(
+        max_size=1024 * 1024, mode="w+", encoding="utf-8", newline="")
+    self._original_print = builtins.print
+    self._lock = threading.RLock()
+    self._closed = False
+
+    def tee_print(*args, **kwargs):
+      # An explicit destination belongs to the caller.  Do not redirect or
+      # duplicate it, even when the caller explicitly uses file=sys.stdout.
+      if "file" in kwargs:
+        return self._original_print(*args, **kwargs)
+
+      with self._lock:
+        self._original_print(*args, **kwargs)
+        log_kwargs = dict(kwargs)
+        log_kwargs["file"] = self._stream
+        self._original_print(*args, **log_kwargs)
+
+    self._tee_print = tee_print
+    builtins.print = self._tee_print
+    atexit.register(self.close)
+
+  def bind_lightning_version(self, lightning_version):
+    """Select an overwrite-safe final path and flush deferred output into it."""
+    with self._lock:
+      if self._closed:
+        raise RuntimeError("cannot bind a closed text log")
+      if self.path is not None:
+        return self.path
+
+      requested = self.requested_path
+      requested.parent.mkdir(parents=True, exist_ok=True)
+      timestamp = self.started_at.strftime("%Y%m%d_%H%M%S")
+      version = str(lightning_version)
+      base_name = f"{requested.stem}_v{version}_{timestamp}"
+
+      serial = 0
+      while True:
+        collision_suffix = "" if serial == 0 else f"_{serial:02d}"
+        candidate = requested.with_name(
+            f"{base_name}{collision_suffix}{requested.suffix}")
+        try:
+          final_stream = open(
+              candidate, "x", encoding="utf-8", buffering=1, newline="")
+          break
+        except FileExistsError:
+          serial += 1
+
+      deferred_stream = self._stream
+      deferred_stream.flush()
+      deferred_stream.seek(0)
+      while True:
+        block = deferred_stream.read(1024 * 1024)
+        if not block:
+          break
+        final_stream.write(block)
+      final_stream.flush()
+      deferred_stream.close()
+
+      self._stream = final_stream
+      self.path = str(candidate)
+      return self.path
+
+  def close(self):
+    with self._lock:
+      if self._closed:
+        return
+      if builtins.print is self._tee_print:
+        builtins.print = self._original_print
+      self._stream.flush()
+      self._stream.close()
+      self._closed = True
 
 def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror):
   # Epoch and validation sizes are arbitrary
@@ -47,6 +142,7 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
     trainer.save_checkpoint(ckpt_file_path)
 
 def main():
+  started_at = datetime.now()
   parser = argparse.ArgumentParser(description="Trains the network.")
   parser.add_argument("train1", help="Training data (.bin or .binpack)")
   parser.add_argument("train2", help="Training data (.bin or .binpack)")
@@ -78,9 +174,13 @@ def main():
   parser.add_argument("--skiprate", default=1.5, type=float, dest='skiprate', help="skiprate")
   parser.add_argument("--mirror", default=0.00, type=float, dest='mirror', help="mirror")
   parser.add_argument("--network-save-period", type=int, default=1000000000, dest='network_save_period', help="Number of epochs between network snapshots. None to disable.")
+  parser.add_argument("--text-log", dest="text_log", help="Duplicate ordinary print() output to this UTF-8 text file; progress bars remain terminal-only.")
 
   features.add_argparse_args(parser)
   args = parser.parse_args()
+
+  text_log_tee = (
+      TextLogPrintTee(args.text_log, started_at) if args.text_log else None)
 
   if not os.path.exists(args.train1):
     raise Exception('{0} does not exist'.format(args.train1))
@@ -268,6 +368,9 @@ def main():
   print('Using log dir {}'.format(logdir), flush=True)
 
   tb_logger = pl_loggers.TensorBoardLogger(logdir)
+  if text_log_tee is not None:
+    text_log_tee.bind_lightning_version(tb_logger.version)
+    print(f"Text log: {text_log_tee.path}", flush=True)
   checkpoint_callback = NetworkSaveCheckpoint(every_n_epochs=args.network_save_period, log_dir=tb_logger.log_dir)
   trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback], logger=tb_logger)
 
@@ -286,6 +389,8 @@ def main():
   print(f'tb_logger.log_dir={tb_logger.log_dir}')
   ckpt_file_path = os.path.join(tb_logger.log_dir, 'final.ckpt')
   trainer.save_checkpoint(ckpt_file_path)
+  if text_log_tee is not None:
+    text_log_tee.close()
 
 if __name__ == '__main__':
   main()
