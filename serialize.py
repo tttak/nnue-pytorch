@@ -14,6 +14,12 @@ import numpy as np
 from numba import njit
 import os
 
+def to_numpy(value):
+  """Return a NumPy view/copy suitable for serialization and diagnostics."""
+  if isinstance(value, torch.Tensor):
+    return value.detach().cpu().numpy()
+  return np.asarray(value)
+
 def ascii_hist(name, x, bins=6):
   N,X = np.histogram(x, bins=bins)
   total = 1.0*len(x)
@@ -289,17 +295,17 @@ class NNUEWriter():
     for p in range(4):
         phase_names = ["OPEN", "MID1", "MID2", "END"]
         print(f"--- Phase {p}: {phase_names[p]} ---")
-        ascii_hist(f'P{p} MUL :', pw_softmax[p, :, 0].cpu().numpy())
-        ascii_hist(f'P{p} DIFF:', pw_softmax[p, :, 1].cpu().numpy())
-        ascii_hist(f'P{p} SUM :', pw_softmax[p, :, 2].cpu().numpy())
+        ascii_hist(f'P{p} MUL :', to_numpy(pw_softmax[p, :, 0]))
+        ascii_hist(f'P{p} DIFF:', to_numpy(pw_softmax[p, :, 1]))
+        ascii_hist(f'P{p} SUM :', to_numpy(pw_softmax[p, :, 2]))
 
     # --- 書き出し ---
-    self.write_tensor(bias_quantized.flatten().numpy(), ft_compression)
-    self.write_tensor(weight_quantized.flatten().numpy(), ft_compression)
-    self.write_tensor(v_quantized.flatten().numpy(), ft_compression)
+    self.write_tensor(to_numpy(bias_quantized.flatten()), ft_compression)
+    self.write_tensor(to_numpy(weight_quantized.flatten()), ft_compression)
+    self.write_tensor(to_numpy(v_quantized.flatten()), ft_compression)
     # 4 phase復元用、12 bucket推論用の順で書き出す
-    self.write_tensor(pw_exported.flatten().cpu().numpy(), ft_compression)
-    self.write_tensor(pw_bucket_exported.flatten().cpu().numpy(), ft_compression)
+    self.write_tensor(to_numpy(pw_exported.flatten()), ft_compression)
+    self.write_tensor(to_numpy(pw_bucket_exported.flatten()), ft_compression)
 
   def write_fc_layer(self, model, layer, is_output=False):
     # FC layers are stored as int8 weights, and int32 biases
@@ -330,33 +336,39 @@ class NNUEWriter():
         padded_output = num_output + (32 - (num_output % 32))
 
         # Biasを0でパディング
-        new_b = torch.zeros(padded_output, dtype=torch.int32)
+        new_b = torch.zeros(
+            padded_output, dtype=torch.int32, device=bias.device)
         new_b[:num_output] = bias
         bias = new_b
 
         # Weightの行を0でパディング
-        new_w = torch.zeros(padded_output, weight.shape[1], dtype=torch.int8)
+        new_w = torch.zeros(
+            padded_output,
+            weight.shape[1],
+            dtype=torch.int8,
+            device=weight.device)
         new_w[:num_output, :] = weight
         weight = new_w
         print(f"Padding Output: {num_output} -> {padded_output}")
 
-    ascii_hist('fc bias:', bias.numpy())
+    ascii_hist('fc bias:', to_numpy(bias))
     print("layer has {}/{} clipped weights. Exceeding by {} the maximum {}.".format(clipped, total_elements, clipped_max, kMaxWeight))
-    ascii_hist('fc weight:', weight.numpy())
+    ascii_hist('fc weight:', to_numpy(weight))
 
     # FC inputs are padded to 32 elements by spec.
     num_input = weight.shape[1]
     if num_input % 32 != 0:
       num_input += 32 - (num_input % 32)
-      new_w = torch.zeros(weight.shape[0], num_input, dtype=torch.int8)
+      new_w = torch.zeros(
+          weight.shape[0], num_input, dtype=torch.int8, device=weight.device)
       new_w[:, :weight.shape[1]] = weight
       weight = new_w
 
     print(f"FC Bias bytes: {bias.nbytes} (Shape: {bias.shape})")
     print(f"FC Weight bytes: {weight.nbytes} (Shape: {weight.shape})")
 
-    self.buf.extend(bias.flatten().numpy().tobytes())
-    self.buf.extend(weight.flatten().numpy().tobytes())
+    self.buf.extend(to_numpy(bias.flatten()).tobytes())
+    self.buf.extend(to_numpy(weight.flatten()).tobytes())
 
 
   def int32(self, v):
