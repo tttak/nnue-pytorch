@@ -134,12 +134,39 @@ class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
   ):
     self.every_n_epochs = every_n_epochs
     self.log_dir = log_dir
+    self.final_checkpoint_saved = False
+    self.keyboard_interrupt_handled = False
 
   def on_validation_end(self, trainer: 'pl.Trainer', pl_module: 'pl.LightningModule') -> None:
     if self.every_n_epochs != 1 and (trainer.current_epoch == 0 or trainer.current_epoch % self.every_n_epochs != 0):
       return
     ckpt_file_path = os.path.join(self.log_dir, f'{trainer.current_epoch}.ckpt')
     trainer.save_checkpoint(ckpt_file_path)
+
+  def save_final_checkpoint(self, trainer: 'pl.Trainer') -> str:
+    """Save final.ckpt once, for normal completion or an interrupted fit."""
+    ckpt_file_path = os.path.join(self.log_dir, 'final.ckpt')
+    if not self.final_checkpoint_saved:
+      trainer.save_checkpoint(ckpt_file_path)
+      self.final_checkpoint_saved = True
+    return ckpt_file_path
+
+  def on_exception(
+      self,
+      trainer: 'pl.Trainer',
+      pl_module: 'pl.LightningModule',
+      exception: BaseException,
+  ) -> None:
+    # Lightning 2.x consumes KeyboardInterrupt inside Trainer.fit(), invokes
+    # this official hook, tears down, and then raises SystemExit(1).  Save while
+    # the Trainer is still intact.  Do not checkpoint arbitrary failures.
+    if not isinstance(exception, KeyboardInterrupt):
+      return
+    ckpt_file_path = self.save_final_checkpoint(trainer)
+    # Treat Lightning's trailing SystemExit as a graceful interrupt only after
+    # final.ckpt was written successfully.
+    self.keyboard_interrupt_handled = True
+    print(f'KeyboardInterrupt checkpoint saved: {ckpt_file_path}', flush=True)
 
 def main():
   started_at = datetime.now()
@@ -412,11 +439,18 @@ def main():
     train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror)
 
   torch.set_float32_matmul_precision('high')
-  trainer.fit(nnue, train, val)
+  try:
+    trainer.fit(nnue, train, val)
+  except SystemExit:
+    # Lightning 2.6 calls on_exception(KeyboardInterrupt), performs its own
+    # graceful teardown, then raises SystemExit(1).  Once our callback has
+    # successfully saved final.ckpt, translate only that known interrupt into
+    # a normal process exit.  Other SystemExit causes must retain their code.
+    if not checkpoint_callback.keyboard_interrupt_handled:
+      raise
 
   print(f'tb_logger.log_dir={tb_logger.log_dir}')
-  ckpt_file_path = os.path.join(tb_logger.log_dir, 'final.ckpt')
-  trainer.save_checkpoint(ckpt_file_path)
+  checkpoint_callback.save_final_checkpoint(trainer)
   if text_log_tee is not None:
     text_log_tee.close()
 
