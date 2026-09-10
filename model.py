@@ -34,6 +34,23 @@ PHASE_CHANNELS_LEGACY = 6
 PHASE_CHANNELS_NO_ABS_SQR = 5
 PHASE5_KEEP_ROWS = (0, 1, 2, 3, 5)
 
+PHASE_CHANNEL_NAMES = {
+    PHASE_CHANNELS_NO_ABS_SQR:
+        ("MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "Cross"),
+    PHASE_CHANNELS_LEGACY:
+        ("MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"),
+}
+
+
+def phase_channel_names(channel_count):
+    """Return serialized/forward Phase channel names for Phase5 or Phase6."""
+    try:
+        return PHASE_CHANNEL_NAMES[channel_count]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported Phase channel count for diagnostics: {channel_count}"
+        ) from exc
+
 
 def migrate_phase_proj_state_dict_to_five(state_dict, prefix="layer_stacks.phase_proj."):
     """Losslessly remove the unused FM AbsSqr Phase row from a 160-input model."""
@@ -355,11 +372,7 @@ class LayerStacks(nn.Module):
         phase = 0.1 + 0.9 * torch.sigmoid(phase_logit)
 
         p_detached = phase.detach()
-        phase_names = (
-            ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "Cross"]
-            if self.phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR
-            else ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"]
-        )
+        phase_names = phase_channel_names(self.phase_output_dimensions)
         channel_stats = []
         if self.training and (self.step_counter % 100 == 0):
             for i in range(self.phase_output_dimensions):
@@ -1231,7 +1244,8 @@ class NNUE(pl.LightningModule):
             print(f"Abs (Filtered by Abs-Gate) Open: {open_to_abs:.2f}% (sharp:{sharpness_a:.3f})")
             print(f"Main (Filtered by Diff-Gate) Open: {open_to_main:.2f}% (sharp:{sharpness_d:.3f})")
 
-            print(f"--- 6-Channel Phase Gate Status (Adaptive Control) ---")
+            phase_count = self.layer_stacks.phase_output_dimensions
+            print(f"--- {phase_count}-Channel Phase Gate Status (Adaptive Control) ---")
             print(f"{'Name':<8} | {'Mean':<5} | {'Std':<5} | {'Range':<11} | {'Low%':<5} | {'High%':<5}")
             print("-" * 62)
 
@@ -1311,10 +1325,24 @@ class NNUE(pl.LightningModule):
                 print(f"B{i:02d} | {s_ratio:5.1f}% | {avg_cp:+7.1f}({abs_cp:6.1f}) | {w1[s1:e1].abs().mean():.3f} | {md_w:.3f}|{md_g:.1e} | {ma_w:.3f}|{ma_g:.1e} | {open_abs:5.1f}% | {open_main:5.1f}% | {w2[s2:e2].abs().mean():.3f}   | {fm_r:5.1f}% | {current_alpha:5.1f}%")
             print("-" * 110)
 
-            print("\n[Bucket-wise Phase Gate Analysis (6-Channel Router-based)]")
-            print("-" * 110)
-            print(f"{'B_ID':<4} | {'MSqr':<5} | {'MRaw':<5} | {'Diff':<5} | {'AbsR':<5} | {'AbsS':<5} | {'Cross':<5} | {'Low%':<5} | {'High%':<6} | {'Samples%':<8} | {'AttScore(mean/std)':<18} | {'ValBaseLoss':<8} ")
-            print("-" * 110)
+            phase_count = self.layer_stacks.phase_output_dimensions
+            phase_names = phase_channel_names(phase_count)
+            phase_labels = {
+                "MainSqr": "MSqr",
+                "MainRaw": "MRaw",
+                "FM_Diff": "Diff",
+                "FM_AbsR": "AbsR",
+                "FM_AbsS": "AbsS",
+                "Cross": "Cross",
+            }
+            print(f"\n[Bucket-wise Phase Gate Analysis ({phase_count}-Channel Router-based)]")
+            separator_width = 110 if phase_count == PHASE_CHANNELS_NO_ABS_SQR else 118
+            print("-" * separator_width)
+            channel_header = " | ".join(
+                f"{phase_labels[name]:<5}" for name in phase_names
+            )
+            print(f"{'B_ID':<4} | {channel_header} | {'Low%':<5} | {'High%':<6} | {'Samples%':<8} | {'AttScore(mean/std)':<18} | {'ValBaseLoss':<8} ")
+            print("-" * separator_width)
 
             total_samples = layer_stack_indices.size(0)
 
@@ -1325,13 +1353,20 @@ class NNUE(pl.LightningModule):
                     continue
 
                 p_batch = self.layer_stacks.last_phase[mask]
+                if p_batch.shape[-1] != phase_count:
+                    raise RuntimeError(
+                        "Phase diagnostic shape mismatch: "
+                        f"configured {phase_count}, captured {p_batch.shape[-1]}"
+                    )
                 p_means = p_batch.mean(dim=0)
 
                 low_r = (p_batch < 0.2).float().mean().item() * 100
                 high_r = (p_batch > 0.8).float().mean().item() * 100
                 s_ratio = (count / total_samples) * 100
 
-                m_sq, m_ra, f_di, f_ar, f_as, crs = p_means.tolist()
+                phase_values = " | ".join(
+                    f"{value:.3f}" for value in p_means.tolist()
+                )
 
                 att = self.layer_stacks.last_att_score[mask]
 
@@ -1340,8 +1375,8 @@ class NNUE(pl.LightningModule):
                 else:
                     loss_val = self.last_bucket_losses[i] if self.last_bucket_losses is not None else 0.0
 
-                print(f"B{i:02d}  | {m_sq:.3f} | {m_ra:.3f} | {f_di:.3f} | {f_ar:.3f} | {f_as:.3f} | {crs:.3f} | {low_r:>4.1f}% | {high_r:>5.1f}% | {s_ratio:>7.1f}% | {att.mean().item():.3f} / {att.std().item():.3f} | {loss_val:>7.5f} ")
-            print("-" * 110)
+                print(f"B{i:02d}  | {phase_values} | {low_r:>4.1f}% | {high_r:>5.1f}% | {s_ratio:>7.1f}% | {att.mean().item():.3f} / {att.std().item():.3f} | {loss_val:>7.5f} ")
+            print("-" * separator_width)
 
     def step_(self, batch, batch_idx, loss_type):
         self.print_mem("step_() start")
