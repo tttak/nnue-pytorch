@@ -67,6 +67,8 @@ VERSION = 0x7AF32F16
 DEFAULT_DESCRIPTION = "HalfKA-KSDG3_FM-1280"
 COMPACT_DESCRIPTION = "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr"
 COMPACT_FC_HASH_XOR = 0x00600000
+PHASE5_DESCRIPTION = "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5"
+PHASE5_FC_HASH_XOR = 0x00050000
 SFNN_OUTER_HASH = 0x3C203B32
 SFNN_FEATURE_TRANSFORMER_HASH = 0x5F134AB8
 
@@ -76,9 +78,13 @@ class NNUEWriter():
   """
   def __init__(self, model, description=None, ft_compression='none'):
     if description is None:
-        description = (COMPACT_DESCRIPTION
-                       if getattr(model, 'remove_abs_sqr_l2', False)
-                       else DEFAULT_DESCRIPTION)
+        description = (
+            PHASE5_DESCRIPTION
+            if getattr(model, 'phase_output_dimensions', 6) == 5
+            else COMPACT_DESCRIPTION
+            if getattr(model, 'remove_abs_sqr_l2', False)
+            else DEFAULT_DESCRIPTION
+        )
 
     self.buf = bytearray()
 
@@ -170,6 +176,8 @@ class NNUEWriter():
     # architecture hash to the 160-input NoAbsSqr model.
     if getattr(model, 'remove_abs_sqr_l2', False):
       layer_hash ^= COMPACT_FC_HASH_XOR
+    if getattr(model, 'phase_output_dimensions', 6) == 5:
+      layer_hash ^= PHASE5_FC_HASH_XOR
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
@@ -395,8 +403,14 @@ class NNUEReader():
       raise Exception('Unsupported NNUE version: 0x%08x' % version)
 
     remove_abs_sqr_l2 = COMPACT_DESCRIPTION in self.description
+    phase_output_dimensions = (
+        M.PHASE_CHANNELS_NO_ABS_SQR
+        if PHASE5_DESCRIPTION in self.description
+        else M.PHASE_CHANNELS_LEGACY
+    )
     self.model = M.NNUE(
-        feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2)
+        feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2,
+        phase_output_dimensions=phase_output_dimensions)
     fc_hash = NNUEWriter.fc_hash(self.model)
     expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
     # Accept legacy serializer output as well as the C++ SFNN fixed hash.
@@ -431,8 +445,7 @@ class NNUEReader():
       lca_v_tmp   = nn.Linear(64, 32) # Value
 
       # Phase Gate 用
-      # パディングで6は32になる
-      #phase_p_tmp = nn.Linear(384, 6)
+      # Phase5/Phase6 are both padded to 32 physical output rows on disk.
       phase_p_tmp = nn.Linear(384, 32)
 
       # cross_proj用
@@ -503,8 +516,9 @@ class NNUEReader():
       self.model.layer_stacks.lca_temp.data      = torch.tensor(lca_temp_val)
 
       # Phase Gate パラメータの分配 (全バケット共通だが、最新の値をセット)
-      self.model.layer_stacks.phase_proj.weight.data = phase_p_tmp.weight.data[:6, :]
-      self.model.layer_stacks.phase_proj.bias.data   = phase_p_tmp.bias.data[:6]
+      phase_dims = self.model.layer_stacks.phase_output_dimensions
+      self.model.layer_stacks.phase_proj.weight.data = phase_p_tmp.weight.data[:phase_dims, :]
+      self.model.layer_stacks.phase_proj.bias.data   = phase_p_tmp.bias.data[:phase_dims]
 
       # Blend Parameter (alpha)
       eps = 1e-6
@@ -676,7 +690,10 @@ def main():
             feature_set,
             remove_abs_sqr_l2=(
                 l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR))
-        nnue.load_state_dict(saved['state_dict'], strict=True)
+        state_dict = saved['state_dict']
+        if l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR:
+          M.migrate_phase_proj_state_dict_to_five(state_dict)
+        nnue.load_state_dict(state_dict, strict=True)
       else:
         raise Exception(
             '.pt source must contain an NNUE model or a state_dict package')
@@ -695,6 +712,16 @@ def main():
   if args.ft_compression != 'none' and not args.target.endswith(('.nnue', '.bin')):
     args.ft_compression = 'none'
     # raise Exception('Compression only allowed for .nnue or .bin target.')
+
+  # The compact production architecture has no FM AbsSqr L2 consumer.  When
+  # exporting an older Phase6 160-input checkpoint/object, move old Cross row
+  # 5 to row 4 and discard only the provably unused old AbsSqr row 4.
+  if (args.target.endswith(('.nnue', '.bin'))
+      and getattr(nnue, 'remove_abs_sqr_l2', False)
+      and getattr(nnue.layer_stacks.phase_proj, 'out_features', 6) == 6):
+    M.migrate_model_phase_to_five(nnue)
+    if args.description in (None, COMPACT_DESCRIPTION):
+      args.description = PHASE5_DESCRIPTION
 
   if args.ft_compression not in ['none', 'leb128']:
     raise Exception('Invalid compression method.')

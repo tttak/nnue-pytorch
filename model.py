@@ -28,7 +28,51 @@ L3 = 96
 
 L2_IN_TOTAL = 192
 L2_IN_TOTAL_WITHOUT_ABS_SQR = 160
+L2_IN_TOTAL_WITHOUT_MAIN_SQR = 128
 NUM_LS_BUCKETS = 12
+PHASE_CHANNELS_LEGACY = 6
+PHASE_CHANNELS_NO_ABS_SQR = 5
+PHASE5_KEEP_ROWS = (0, 1, 2, 3, 5)
+
+
+def migrate_phase_proj_state_dict_to_five(state_dict, prefix="layer_stacks.phase_proj."):
+    """Losslessly remove the unused FM AbsSqr Phase row from a 160-input model."""
+    weight_key = prefix + "weight"
+    bias_key = prefix + "bias"
+    weight = state_dict.get(weight_key)
+    bias = state_dict.get(bias_key)
+    if weight is None or bias is None or weight.shape[0] != PHASE_CHANNELS_LEGACY:
+        return False
+    rows = torch.tensor(PHASE5_KEEP_ROWS, device=weight.device)
+    state_dict[weight_key] = weight.index_select(0, rows)
+    state_dict[bias_key] = bias.index_select(0, rows)
+    return True
+
+
+def migrate_model_phase_to_five(model):
+    """Convert an in-memory 160-input Phase6 model to the exact Phase5 form."""
+    phase_proj = model.layer_stacks.phase_proj
+    if phase_proj.out_features == PHASE_CHANNELS_NO_ABS_SQR:
+        return False
+    if phase_proj.out_features != PHASE_CHANNELS_LEGACY:
+        raise ValueError("source Phase projection must have 5 or 6 outputs")
+    if not getattr(model, "remove_abs_sqr_l2", False):
+        raise ValueError("Phase5 conversion requires a 160-input NoAbsSqr model")
+
+    replacement = nn.Linear(phase_proj.in_features, PHASE_CHANNELS_NO_ABS_SQR,
+                            bias=phase_proj.bias is not None).to(
+                                device=phase_proj.weight.device,
+                                dtype=phase_proj.weight.dtype)
+    with torch.no_grad():
+        rows = torch.tensor(PHASE5_KEEP_ROWS, device=phase_proj.weight.device)
+        replacement.weight.copy_(phase_proj.weight.index_select(0, rows))
+        if phase_proj.bias is not None:
+            replacement.bias.copy_(phase_proj.bias.index_select(0, rows))
+    replacement.train(phase_proj.training)
+    model.layer_stacks.phase_proj = replacement
+    model.layer_stacks.phase_output_dimensions = PHASE_CHANNELS_NO_ABS_SQR
+    model.phase_output_dimensions = PHASE_CHANNELS_NO_ABS_SQR
+    return True
 
 
 class CUDATiming:
@@ -103,12 +147,31 @@ def get_parameters(layers):
 
 
 class LayerStacks(nn.Module):
-    def __init__(self, count, remove_abs_sqr_l2=True):
+    def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
+                 phase_output_dimensions=None):
         super(LayerStacks, self).__init__()
         self.count = count
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
+        self.remove_main_sqr_l2 = remove_main_sqr_l2
+        if phase_output_dimensions is None:
+            phase_output_dimensions = (
+                PHASE_CHANNELS_NO_ABS_SQR
+                if remove_abs_sqr_l2 else PHASE_CHANNELS_LEGACY
+            )
+        if phase_output_dimensions not in (PHASE_CHANNELS_NO_ABS_SQR,
+                                            PHASE_CHANNELS_LEGACY):
+            raise ValueError("phase_output_dimensions must be 5 or 6")
+        if phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR and not remove_abs_sqr_l2:
+            raise ValueError("5-channel Phase requires AbsSqr L2 removal")
+        self.phase_output_dimensions = phase_output_dimensions
+        if remove_main_sqr_l2 and not remove_abs_sqr_l2:
+            raise ValueError("MainSqr L2 removal currently requires AbsSqr L2 removal")
         self.l2_in_total = (
-            L2_IN_TOTAL_WITHOUT_ABS_SQR if remove_abs_sqr_l2 else L2_IN_TOTAL
+            L2_IN_TOTAL_WITHOUT_MAIN_SQR
+            if remove_main_sqr_l2
+            else L2_IN_TOTAL_WITHOUT_ABS_SQR
+            if remove_abs_sqr_l2
+            else L2_IN_TOTAL
         )
 
         # --- router層
@@ -146,7 +209,7 @@ class LayerStacks(nn.Module):
         self.lca_temp = nn.Parameter(torch.tensor(0.7))
 
         # --- Phase Gate
-        self.phase_proj = nn.Linear(384, 6)
+        self.phase_proj = nn.Linear(384, self.phase_output_dimensions)
 
         # --- lossへの加算用
         self.current_phase_for_loss = None
@@ -289,13 +352,17 @@ class LayerStacks(nn.Module):
         p_extra_combined = torch.cat([p_combined, main_sub], dim=1)
 
         phase_logit = (self.phase_proj(p_extra_combined) * 3.0) + 1.0
-        phase = 0.1 + 0.9 * torch.sigmoid(phase_logit)  # [B, 6]
+        phase = 0.1 + 0.9 * torch.sigmoid(phase_logit)
 
         p_detached = phase.detach()
-        phase_names = ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"]
+        phase_names = (
+            ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "Cross"]
+            if self.phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR
+            else ["MainSqr", "MainRaw", "FM_Diff", "FM_AbsR", "FM_AbsS", "Cross"]
+        )
         channel_stats = []
         if self.training and (self.step_counter % 100 == 0):
-            for i in range(6):
+            for i in range(self.phase_output_dimensions):
                 p_ch = p_detached[:, i]
                 stats = {
                     'name': phase_names[i],
@@ -373,31 +440,46 @@ class LayerStacks(nn.Module):
         p1 = phase[:, 1:2].unsqueeze(1)
         p2 = phase[:, 2:3].unsqueeze(1)
         p3 = phase[:, 3:4].unsqueeze(1)
-        p4 = phase[:, 4:5].unsqueeze(1)
-        p5 = phase[:, 5:6].unsqueeze(1)
+        if self.phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR:
+            p_abs_sqr = None
+            p_cross = phase[:, 4:5].unsqueeze(1)
+        else:
+            p_abs_sqr = phase[:, 4:5].unsqueeze(1)
+            p_cross = phase[:, 5:6].unsqueeze(1)
 
-        l2_main_sqr_weighted_all = l1_main_sqr_all * (0.5 + p0 * 0.5) * 1.3
+        l2_main_sqr_weighted_all = (
+            None
+            if self.remove_main_sqr_l2
+            else l1_main_sqr_all * (0.5 + p0 * 0.5) * 1.3
+        )
         l2_main_raw_weighted_all = l1_main_raw_all * (0.5 + p1 * 0.5) * 1.5
         l2_diff_weighted_all = l1_diff_l2_all * (0.5 + p2 * 0.5) * 1.0
         l1_abs_raw_weighted_all = l1_abs_raw_all * (0.5 + p3 * 0.5) * 0.7
         l1_abs_sqr_weighted_all = (
             None
             if self.remove_abs_sqr_l2
-            else l1_abs_sqr_all * (0.5 + p4 * 0.5) * 0.88
+            else l1_abs_sqr_all * (0.5 + p_abs_sqr * 0.5) * 0.88
         )
-        l2_cross_weighted_all = cross_feat_all * (0.5 + p5 * 0.5) * 1.5
+        l2_cross_weighted_all = cross_feat_all * (0.5 + p_cross * 0.5) * 1.5
 
-        l2_padding_all = torch.zeros((l1_main.shape[0], self.count, 2), device=l1_main.device)
-        l2_parts = [
-            l2_main_sqr_weighted_all,
+        # The compact 128-wide diagnostic layout removes only the direct
+        # MainSqr L2 block.  l1_main_sqr_all above remains live for Cross.
+        padding_size = 1 if self.remove_main_sqr_l2 else 2
+        l2_padding_all = torch.zeros(
+            (l1_main.shape[0], self.count, padding_size), device=l1_main.device
+        )
+        l2_parts = []
+        if not self.remove_main_sqr_l2:
+            l2_parts.append(l2_main_sqr_weighted_all)
+        l2_parts.extend([
             l2_main_raw_weighted_all,
             l2_diff_weighted_all,
             l1_abs_raw_weighted_all,
-        ]
+        ])
         if not self.remove_abs_sqr_l2:
             l2_parts.append(l1_abs_sqr_weighted_all)
         l2_parts.extend([l2_cross_weighted_all, l2_padding_all])
-        l2_input_all = torch.cat(l2_parts, dim=-1)  # [B, 12, 192 or 160]
+        l2_input_all = torch.cat(l2_parts, dim=-1)  # [B, 12, 192, 160, or 128]
 
         l2_input_all = torch.clamp(l2_input_all, 0.0, 1.0)
 
@@ -500,7 +582,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None):
         super(NNUE, self).__init__()
         self.num_ls_buckets = NUM_LS_BUCKETS
 
@@ -509,8 +591,19 @@ class NNUE(pl.LightningModule):
 
         self.feature_set = feature_set
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
+        self.remove_main_sqr_l2 = remove_main_sqr_l2
+        self.phase_output_dimensions = (
+            PHASE_CHANNELS_NO_ABS_SQR
+            if phase_output_dimensions is None and remove_abs_sqr_l2
+            else PHASE_CHANNELS_LEGACY
+            if phase_output_dimensions is None
+            else phase_output_dimensions
+        )
         self.layer_stacks = LayerStacks(
-            self.num_ls_buckets, remove_abs_sqr_l2=remove_abs_sqr_l2
+            self.num_ls_buckets,
+            remove_abs_sqr_l2=remove_abs_sqr_l2,
+            remove_main_sqr_l2=remove_main_sqr_l2,
+            phase_output_dimensions=self.phase_output_dimensions,
         )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
@@ -899,10 +992,19 @@ class NNUE(pl.LightningModule):
 
             print("-" * 110)
             print(f"[Signal Strength (L2 Input)]")
-            main_sqr_part = l2_input[:, 0:31].abs().mean().item()
-            main_raw_part = l2_input[:, 31:62].abs().mean().item()
-            fm_diff_part = l2_input[:, 62:94].abs().mean().item()
-            if self.remove_abs_sqr_l2:
+            if self.remove_main_sqr_l2:
+                main_sqr_part = float("nan")
+                main_raw_part = l2_input[:, 0:31].abs().mean().item()
+                fm_diff_part = l2_input[:, 31:63].abs().mean().item()
+                fm_abs_part = l2_input[:, 63:95].abs().mean().item()
+                cross_feat = l2_input[:, 95:127].abs().mean().item()
+            else:
+                main_sqr_part = l2_input[:, 0:31].abs().mean().item()
+                main_raw_part = l2_input[:, 31:62].abs().mean().item()
+                fm_diff_part = l2_input[:, 62:94].abs().mean().item()
+            if self.remove_main_sqr_l2:
+                pass
+            elif self.remove_abs_sqr_l2:
                 fm_abs_part = l2_input[:, 94:126].abs().mean().item()
                 cross_feat = l2_input[:, 126:158].abs().mean().item()
             else:
@@ -922,11 +1024,19 @@ class NNUE(pl.LightningModule):
                 high_signal = (t > 0.95).float().mean().item() * 100
                 print(f"{name:12} | {t.mean():7.3f} | {t_abs.mean():7.3f} | {t.std():7.3f} | {t.max():7.2f} | {t.min():7.2f} | {sparsity:6.1f}% | {high_signal:6.1f}%")
 
-            log_stats("Main(Sqr)",    l2_input[:, 0:31])
-            log_stats("Main(Raw)",    l2_input[:, 31:62])
-            log_stats("FM(Diff)",     l2_input[:, 62:94])
-            log_stats("FM(Abs_Raw)",  l2_input[:, 94:126])
-            if self.remove_abs_sqr_l2:
+            if self.remove_main_sqr_l2:
+                log_stats("Main(Raw)",   l2_input[:, 0:31])
+                log_stats("FM(Diff)",    l2_input[:, 31:63])
+                log_stats("FM(Abs_Raw)", l2_input[:, 63:95])
+                log_stats("cross_feat",  l2_input[:, 95:127])
+            else:
+                log_stats("Main(Sqr)",    l2_input[:, 0:31])
+                log_stats("Main(Raw)",    l2_input[:, 31:62])
+                log_stats("FM(Diff)",     l2_input[:, 62:94])
+                log_stats("FM(Abs_Raw)",  l2_input[:, 94:126])
+            if self.remove_main_sqr_l2:
+                pass
+            elif self.remove_abs_sqr_l2:
                 log_stats("cross_feat", l2_input[:, 126:158])
             else:
                 log_stats("FM(Abs_Sqr)", l2_input[:, 126:158])
@@ -4780,6 +4890,8 @@ class NNUE(pl.LightningModule):
                 offset2=self.offset2,
                 adjust_loss=self.adjust_loss,
                 remove_abs_sqr_l2=self.remove_abs_sqr_l2,
+                remove_main_sqr_l2=self.remove_main_sqr_l2,
+                phase_output_dimensions=self.phase_output_dimensions,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
@@ -4793,6 +4905,9 @@ class NNUE(pl.LightningModule):
         state_dict = checkpoint.get("state_dict", {})
         for k in [k for k in state_dict.keys() if k.startswith("ema_model.")]:
             del state_dict[k]
+        if (self.remove_abs_sqr_l2
+                and self.phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR):
+            migrate_phase_proj_state_dict_to_five(state_dict)
 
     def configure_optimizers(self):
         # =========================================================
