@@ -1312,7 +1312,8 @@ class NNUE(pl.LightningModule):
 
                 s1, e1 = i * 32, (i + 1) * 32
                 sf, ef = i * 64, (i + 1) * 64
-                s2, e2 = i * 96, (i + 1) * 96
+                l3_width = self.layer_stacks.l3_dimensions
+                s2, e2 = i * l3_width, (i + 1) * l3_width
 
                 md_w = wd[sf+32:ef].abs().mean().item()
                 md_g = gd_grad[sf+32:ef].abs().mean().item()
