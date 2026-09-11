@@ -24,7 +24,10 @@ L1_MAIN = 1280
 FM_DIM = 32
 L1 = L1_MAIN
 L2 = 31
-L3 = 96
+# Production default.  Legacy FC1-width-96 models remain readable when their
+# architecture explicitly identifies that width.
+L3 = 64
+L3_LEGACY = 96
 
 L2_IN_TOTAL = 192
 L2_IN_TOTAL_WITHOUT_ABS_SQR = 160
@@ -165,9 +168,12 @@ def get_parameters(layers):
 
 class LayerStacks(nn.Module):
     def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
-                 phase_output_dimensions=None):
+                 phase_output_dimensions=None, l3_dimensions=L3):
         super(LayerStacks, self).__init__()
         self.count = count
+        if l3_dimensions <= 0:
+            raise ValueError("l3_dimensions must be positive")
+        self.l3_dimensions = l3_dimensions
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
         self.remove_main_sqr_l2 = remove_main_sqr_l2
         if phase_output_dimensions is None:
@@ -207,8 +213,8 @@ class LayerStacks(nn.Module):
         self.fm_abs = nn.Linear(128, TOTAL_FM_GLU_OUT)
 
         # --- l2, output
-        self.l2 = nn.Linear(self.l2_in_total, L3 * count)
-        self.output = nn.Linear(L3, 1 * count)
+        self.l2 = nn.Linear(self.l2_in_total, self.l3_dimensions * count)
+        self.output = nn.Linear(self.l3_dimensions, 1 * count)
 
         # --- blend
         self.blend = nn.Parameter(torch.zeros(count))
@@ -282,8 +288,13 @@ class LayerStacks(nn.Module):
 
                 self.blend.data[i] = self.blend.data[0]
 
-                self.l2.weight.data[i*L3:(i+1)*L3, :].copy_(self.l2.weight.data[0:L3, :])
-                self.l2.bias.data[i*L3:(i+1)*L3].copy_(self.l2.bias.data[0:L3])
+                l3s, l3e = i * self.l3_dimensions, (i + 1) * self.l3_dimensions
+                self.l2.weight.data[l3s:l3e, :].copy_(
+                    self.l2.weight.data[0:self.l3_dimensions, :]
+                )
+                self.l2.bias.data[l3s:l3e].copy_(
+                    self.l2.bias.data[0:self.l3_dimensions]
+                )
                 self.output.weight.data[i:i+1, :].copy_(self.output.weight.data[0:1, :])
                 self.output.bias.data[i:i+1].copy_(self.output.bias.data[0:1])
 
@@ -498,8 +509,8 @@ class LayerStacks(nn.Module):
 
         # --- PHASE 6: Output (einsum による L2 & Output の高速一括計算) ---
         # ★ einsum による L2層の計算 [B, 12, L2_IN_DIM] -> [B, 12, L3]
-        W_l2 = self.l2.weight.view(self.count, L3, -1)   # [12, L3, L2_IN_DIM]
-        b_l2 = self.l2.bias.view(self.count, L3)         # [12, L3]
+        W_l2 = self.l2.weight.view(self.count, self.l3_dimensions, -1)
+        b_l2 = self.l2.bias.view(self.count, self.l3_dimensions)
         l2c_all = torch.einsum("bci,coi->bco", l2_input_all, W_l2) + b_l2
         l2x_all = torch.clamp(l2c_all, 0.0, 1.0)
 
@@ -562,8 +573,8 @@ class LayerStacks(nn.Module):
                 l1 = nn.Linear(L1_MAIN, 32)
                 diff_b = nn.Linear(128, 64)
                 abs_b = nn.Linear(128, 64)
-                l2 = nn.Linear(self.l2_in_total, L3)
-                output = nn.Linear(L3, 1)
+                l2 = nn.Linear(self.l2_in_total, self.l3_dimensions)
+                output = nn.Linear(self.l3_dimensions, 1)
                 cross_p = nn.Linear(self.cross_dim * 2, 32)
 
                 lca_q = self.q_proj
@@ -584,8 +595,9 @@ class LayerStacks(nn.Module):
                 cross_p.weight.data = self.cross_proj.weight.data[s_c:e_c, :]
                 cross_p.bias.data = self.cross_proj.bias.data[s_c:e_c]
 
-                l2.weight.data = self.l2.weight.data[i*L3:(i+1)*L3, :self.l2_in_total]
-                l2.bias.data = self.l2.bias.data[i*L3:(i+1)*L3]
+                l3s, l3e = i * self.l3_dimensions, (i + 1) * self.l3_dimensions
+                l2.weight.data = self.l2.weight.data[l3s:l3e, :self.l2_in_total]
+                l2.bias.data = self.l2.bias.data[l3s:l3e]
 
                 output.weight.data = self.output.weight.data[i:i+1, :]
                 output.bias.data = self.output.bias.data[i:i+1]
@@ -595,7 +607,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3):
         super(NNUE, self).__init__()
         self.num_ls_buckets = NUM_LS_BUCKETS
 
@@ -612,11 +624,13 @@ class NNUE(pl.LightningModule):
             if phase_output_dimensions is None
             else phase_output_dimensions
         )
+        self.l3_dimensions = l3_dimensions
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
             remove_abs_sqr_l2=remove_abs_sqr_l2,
             remove_main_sqr_l2=remove_main_sqr_l2,
             phase_output_dimensions=self.phase_output_dimensions,
+            l3_dimensions=self.l3_dimensions,
         )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
@@ -2951,7 +2965,10 @@ class NNUE(pl.LightningModule):
             w_fd = self.layer_stacks.fm_diff.weight[i * 64: (i + 1) * 64].reshape(-1)
             w_fa = self.layer_stacks.fm_abs.weight[i * 64: (i + 1) * 64].reshape(-1)
             w_cross = self.layer_stacks.cross_proj.weight[i * 32: (i + 1) * 32].reshape(-1)
-            w_l2 = self.layer_stacks.l2.weight[i * L3: (i + 1) * L3].reshape(-1)
+            l3_width = self.layer_stacks.l3_dimensions
+            w_l2 = self.layer_stacks.l2.weight[
+                i * l3_width: (i + 1) * l3_width
+            ].reshape(-1)
             w_out = self.layer_stacks.output.weight[i: i + 1].reshape(-1)
 
             v_i = torch.cat([w_l1, w_fd, w_fa, w_cross, w_l2, w_out], dim=0)

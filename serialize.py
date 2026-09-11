@@ -68,6 +68,7 @@ DEFAULT_DESCRIPTION = "HalfKA-KSDG3_FM-1280"
 COMPACT_DESCRIPTION = "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr"
 COMPACT_FC_HASH_XOR = 0x00600000
 PHASE5_DESCRIPTION = "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5"
+PHASE5_FC1X64_DESCRIPTION = PHASE5_DESCRIPTION + "-FC1x64"
 PHASE5_FC_HASH_XOR = 0x00050000
 SFNN_OUTER_HASH = 0x3C203B32
 SFNN_FEATURE_TRANSFORMER_HASH = 0x5F134AB8
@@ -77,13 +78,24 @@ class NNUEWriter():
   All values are stored in little endian.
   """
   def __init__(self, model, description=None, ft_compression='none'):
+    is_fc1x64 = getattr(model.layer_stacks, 'l3_dimensions', M.L3) == 64
     if description is None:
+        phase5_description = (
+            PHASE5_FC1X64_DESCRIPTION
+            if is_fc1x64
+            else PHASE5_DESCRIPTION
+        )
         description = (
-            PHASE5_DESCRIPTION
+            phase5_description
             if getattr(model, 'phase_output_dimensions', 6) == 5
             else COMPACT_DESCRIPTION
             if getattr(model, 'remove_abs_sqr_l2', False)
             else DEFAULT_DESCRIPTION
+        )
+    if is_fc1x64 != (PHASE5_FC1X64_DESCRIPTION in description):
+        raise ValueError(
+            "description/fc1 width mismatch: 64-wide models require "
+            f"{PHASE5_FC1X64_DESCRIPTION!r}, and 96-wide models must not use it"
         )
 
     self.buf = bytearray()
@@ -408,9 +420,15 @@ class NNUEReader():
         if PHASE5_DESCRIPTION in self.description
         else M.PHASE_CHANNELS_LEGACY
     )
+    l3_dimensions = (
+        M.L3
+        if PHASE5_FC1X64_DESCRIPTION in self.description
+        else M.L3_LEGACY
+    )
     self.model = M.NNUE(
         feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2,
-        phase_output_dimensions=phase_output_dimensions)
+        phase_output_dimensions=phase_output_dimensions,
+        l3_dimensions=l3_dimensions)
     fc_hash = NNUEWriter.fc_hash(self.model)
     expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
     # Accept legacy serializer output as well as the C++ SFNN fixed hash.
@@ -451,8 +469,9 @@ class NNUEReader():
       # cross_proj用
       cross_p_tmp = nn.Linear(self.model.layer_stacks.cross_dim * 2, 32, bias=True)
 
-      l2_tmp      = nn.Linear(self.model.layer_stacks.l2_in_total, M.L3)
-      output_tmp  = nn.Linear(M.L3, 1)
+      l3_dimensions = self.model.layer_stacks.l3_dimensions
+      l2_tmp      = nn.Linear(self.model.layer_stacks.l2_in_total, l3_dimensions)
+      output_tmp  = nn.Linear(l3_dimensions, 1)
 
       # --- 2. バイナリからの読み込み ---
       self.read_int32(fc_hash)
@@ -526,7 +545,8 @@ class NNUEReader():
       self.model.layer_stacks.blend.data[i] = torch.tensor(safe_val).logit()
 
       # L2 & Output
-      l2_s_idx, l2_e_idx = i * M.L3, (i + 1) * M.L3
+      l2_s_idx = i * l3_dimensions
+      l2_e_idx = (i + 1) * l3_dimensions
       self.model.layer_stacks.l2.weight.data[l2_s_idx:l2_e_idx, :] = l2_tmp.weight.data
       self.model.layer_stacks.l2.bias.data[l2_s_idx:l2_e_idx] = l2_tmp.bias.data
       
@@ -681,6 +701,11 @@ def main():
       elif isinstance(saved, dict) and 'state_dict' in saved:
         architecture = saved.get('architecture', {})
         l2_input_physical = architecture.get('l2_input_physical')
+        l3_dimensions = int(architecture.get('fc1_output_dimensions', M.L3))
+        if l3_dimensions not in (M.L3, M.L3_LEGACY):
+          raise Exception(
+              'Unsupported .pt fc1 output architecture: %r'
+              % (l3_dimensions,))
         if l2_input_physical not in (M.L2_IN_TOTAL,
                                      M.L2_IN_TOTAL_WITHOUT_ABS_SQR):
           raise Exception(
@@ -689,7 +714,13 @@ def main():
         nnue = M.NNUE(
             feature_set,
             remove_abs_sqr_l2=(
-                l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR))
+                l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR),
+            phase_output_dimensions=int(architecture.get(
+                'phase_output_dimensions',
+                M.PHASE_CHANNELS_NO_ABS_SQR
+                if l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR
+                else M.PHASE_CHANNELS_LEGACY)),
+            l3_dimensions=l3_dimensions)
         state_dict = saved['state_dict']
         if l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR:
           M.migrate_phase_proj_state_dict_to_five(state_dict)
@@ -721,7 +752,11 @@ def main():
       and getattr(nnue.layer_stacks.phase_proj, 'out_features', 6) == 6):
     M.migrate_model_phase_to_five(nnue)
     if args.description in (None, COMPACT_DESCRIPTION):
-      args.description = PHASE5_DESCRIPTION
+      args.description = (
+          PHASE5_FC1X64_DESCRIPTION
+          if nnue.layer_stacks.l3_dimensions == 64
+          else PHASE5_DESCRIPTION
+      )
 
   if args.ft_compression not in ['none', 'leb128']:
     raise Exception('Invalid compression method.')
