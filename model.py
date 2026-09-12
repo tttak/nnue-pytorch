@@ -120,6 +120,18 @@ def nnue_architecture_metadata(model):
         "fm_abs_raw_kept_source_units": list(getattr(
             model, "l2_fm_abs_raw_indices",
             getattr(stacks, "l2_fm_abs_raw_indices", tuple(range(32))))),
+        "lca_qk_dimensions": len(getattr(
+            model, "lca_qk_indices",
+            getattr(stacks, "lca_qk_indices", tuple(range(32))))),
+        "lca_value_dimensions": len(getattr(
+            model, "lca_value_indices",
+            getattr(stacks, "lca_value_indices", tuple(range(32))))),
+        "lca_qk_kept_source_units": list(getattr(
+            model, "lca_qk_indices",
+            getattr(stacks, "lca_qk_indices", tuple(range(32))))),
+        "lca_value_kept_source_units": list(getattr(
+            model, "lca_value_indices",
+            getattr(stacks, "lca_value_indices", tuple(range(32))))),
         "l2_input_physical": int(stacks.l2_in_total),
     }
 
@@ -151,6 +163,10 @@ def nnue_architecture_kwargs(metadata):
             int(v) for v in metadata["fm_diff_kept_source_units"]),
         "l2_fm_abs_raw_indices": tuple(
             int(v) for v in metadata["fm_abs_raw_kept_source_units"]),
+        "lca_qk_indices": tuple(int(v) for v in metadata.get(
+            "lca_qk_kept_source_units", range(32))),
+        "lca_value_indices": tuple(int(v) for v in metadata.get(
+            "lca_value_kept_source_units", range(32))),
     }
 
     # Validate the redundant physical width before any weights are loaded.
@@ -197,6 +213,14 @@ def checkpoint_architecture_metadata(checkpoint):
             "cross_output_dimensions": hparams["cross_output_dimensions"],
             "fm_diff_kept_source_units": hparams["l2_fm_diff_indices"],
             "fm_abs_raw_kept_source_units": hparams["l2_fm_abs_raw_indices"],
+            "lca_qk_dimensions": len(hparams.get(
+                "lca_qk_indices", tuple(range(32)))),
+            "lca_value_dimensions": len(hparams.get(
+                "lca_value_indices", tuple(range(32)))),
+            "lca_qk_kept_source_units": hparams.get(
+                "lca_qk_indices", tuple(range(32))),
+            "lca_value_kept_source_units": hparams.get(
+                "lca_value_indices", tuple(range(32))),
             "l2_input_physical": hparams.get("l2_input_physical"),
         }
     return None
@@ -277,7 +301,8 @@ class LayerStacks(nn.Module):
     def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
                  phase_output_dimensions=None, l3_dimensions=L3,
                  cross_output_dimensions=32, l2_fm_diff_indices=None,
-                 l2_fm_abs_raw_indices=None):
+                 l2_fm_abs_raw_indices=None, lca_qk_indices=None,
+                 lca_value_indices=None):
         super(LayerStacks, self).__init__()
         self.count = count
         if l3_dimensions <= 0:
@@ -306,6 +331,14 @@ class LayerStacks(nn.Module):
         self.register_buffer(
             "_l2_fm_abs_raw_index_tensor",
             torch.tensor(self.l2_fm_abs_raw_indices, dtype=torch.long), persistent=False,
+        )
+        self.lca_qk_indices = normalize_l2_indices("lca_qk_indices", lca_qk_indices)
+        self.lca_value_indices = normalize_l2_indices(
+            "lca_value_indices", lca_value_indices
+        )
+        self.register_buffer(
+            "_lca_value_index_tensor",
+            torch.tensor(self.lca_value_indices, dtype=torch.long), persistent=False,
         )
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
         self.remove_main_sqr_l2 = remove_main_sqr_l2
@@ -361,9 +394,9 @@ class LayerStacks(nn.Module):
         )
 
         # --- Lightweight Cross-Attention Layers ---
-        self.q_proj = nn.Linear(31, 32)  # Query
-        self.k_proj = nn.Linear(64, 32)  # Key
-        self.v_proj = nn.Linear(64, 32)  # Value
+        self.q_proj = nn.Linear(31, len(self.lca_qk_indices))  # Query
+        self.k_proj = nn.Linear(64, len(self.lca_qk_indices))  # Key
+        self.v_proj = nn.Linear(64, len(self.lca_value_indices))  # Value
 
         # Temperature パラメータ (初期値 0.7 = やや鋭めからスタート)
         self.lca_temp = nn.Parameter(torch.tensor(0.7))
@@ -587,12 +620,31 @@ class LayerStacks(nn.Module):
         k_all = self.k_proj(fm_cat_all)
         v_all = self.v_proj(fm_cat_all)
 
+        # Keep the trained sqrt(32) normalization for compact diagnostic LCA
+        # widths.  At 0M this makes selecting Q/K rows exactly equivalent to
+        # zero-masking the omitted latent dimensions in the 32-wide model.
         logit_all = (q_all * k_all).sum(dim=-1, keepdim=True) / 5.656            # [B, 12, 1]
         safe_temp = torch.clamp(self.lca_temp, min=0.125)
         att_score_all = torch.sigmoid(logit_all / safe_temp)
 
-        v_clamped_all = torch.clamp(v_all * 0.4 + 0.5, 0.0, 1.0)
-        l1_diff_l2_all = l1_diff_l2_all * (1 - att_score_all) + v_clamped_all * att_score_all  # [B, 12, 32]
+        if len(self.lca_value_indices) == 32:
+            v_full_all = v_all
+        else:
+            # Missing compact-V rows have zero preactivation.  Consequently
+            # their correction target is exactly 0.5 after the existing
+            # ``v * 0.4 + 0.5`` transform.  This definition is losslessly
+            # representable by a 32-wide diagnostic model with omitted V rows
+            # zeroed, which lets Python-only ablations use the unchanged
+            # serializer and C++ accuracy command.
+            v_full_all = v_all.new_zeros((*v_all.shape[:-1], 32))
+            v_full_all.index_copy_(
+                -1, self._lca_value_index_tensor, v_all
+            )
+        v_clamped_all = torch.clamp(v_full_all * 0.4 + 0.5, 0.0, 1.0)
+        l1_diff_l2_all = (
+            l1_diff_l2_all * (1 - att_score_all)
+            + v_clamped_all * att_score_all
+        )                                                                       # [B, 12, 32]
 
         # --- PHASE 4: CrossFeat (einsum による最適化) ---
         k_dim = self.cross_dim
@@ -769,7 +821,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None, lca_qk_indices=None, lca_value_indices=None):
         super(NNUE, self).__init__()
         self.num_ls_buckets = NUM_LS_BUCKETS
 
@@ -794,6 +846,12 @@ class NNUE(pl.LightningModule):
         self.l2_fm_abs_raw_indices = (
             tuple(range(32)) if l2_fm_abs_raw_indices is None else tuple(l2_fm_abs_raw_indices)
         )
+        self.lca_qk_indices = (
+            tuple(range(32)) if lca_qk_indices is None else tuple(lca_qk_indices)
+        )
+        self.lca_value_indices = (
+            tuple(range(32)) if lca_value_indices is None else tuple(lca_value_indices)
+        )
         # Keep only architecture-defining constructor values in Lightning
         # hparams.  In particular, feature_set is supplied explicitly when a
         # checkpoint is loaded and must not be pickled as constructor metadata.
@@ -805,6 +863,8 @@ class NNUE(pl.LightningModule):
             "cross_output_dimensions": self.cross_output_dimensions,
             "l2_fm_diff_indices": list(self.l2_fm_diff_indices),
             "l2_fm_abs_raw_indices": list(self.l2_fm_abs_raw_indices),
+            "lca_qk_indices": list(self.lca_qk_indices),
+            "lca_value_indices": list(self.lca_value_indices),
         })
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
@@ -815,6 +875,8 @@ class NNUE(pl.LightningModule):
             cross_output_dimensions=self.cross_output_dimensions,
             l2_fm_diff_indices=self.l2_fm_diff_indices,
             l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
+            lca_qk_indices=self.lca_qk_indices,
+            lca_value_indices=self.lca_value_indices,
         )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
@@ -5141,6 +5203,8 @@ class NNUE(pl.LightningModule):
                 cross_output_dimensions=self.cross_output_dimensions,
                 l2_fm_diff_indices=self.l2_fm_diff_indices,
                 l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
+                lca_qk_indices=self.lca_qk_indices,
+                lca_value_indices=self.lca_value_indices,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
@@ -5161,6 +5225,8 @@ class NNUE(pl.LightningModule):
             "cross_output_dimensions": architecture["cross_output_dimensions"],
             "l2_fm_diff_indices": architecture["fm_diff_kept_source_units"],
             "l2_fm_abs_raw_indices": architecture["fm_abs_raw_kept_source_units"],
+            "lca_qk_indices": architecture["lca_qk_kept_source_units"],
+            "lca_value_indices": architecture["lca_value_kept_source_units"],
         })
 
     def on_load_checkpoint(self, checkpoint):

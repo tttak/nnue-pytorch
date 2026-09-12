@@ -77,6 +77,10 @@ COMPACT128_DESCRIPTION = (
     "Cross16-FMDiff24-FMAbsRaw24"
 )
 COMPACT128_FC_HASH_XOR = 0x00128010
+LCA24_FC_HASH_XOR = 0x00CA2400
+LCA16_FC_HASH_XOR = 0x00CA1600
+LCA24_DESCRIPTION = COMPACT128_DESCRIPTION + "-LCAx24"
+LCA16_DESCRIPTION = COMPACT128_DESCRIPTION + "-LCAx16"
 COMPACT128_FM_DIFF_UNITS = (
     2, 10, 14, 13, 8, 6, 5, 28, 11, 3, 1, 15,
     7, 9, 12, 4, 0, 23, 27, 24, 20, 16, 22, 17,
@@ -99,6 +103,13 @@ class NNUEWriter():
         model.layer_stacks, 'l2_fm_diff_indices', tuple(range(32))))
     abs_units = tuple(getattr(
         model.layer_stacks, 'l2_fm_abs_raw_indices', tuple(range(32))))
+    lca_qk_units = tuple(getattr(
+        model.layer_stacks, 'lca_qk_indices', tuple(range(32))))
+    lca_value_units = tuple(getattr(
+        model.layer_stacks, 'lca_value_indices', tuple(range(32))))
+    lca_width = len(lca_qk_units)
+    if lca_width not in (16, 24, 32) or len(lca_value_units) != lca_width:
+        raise ValueError("serializer supports matching LCA Q/K/V widths 16, 24 or 32")
     is_compact128 = (
         getattr(model.layer_stacks, 'l2_in_total', None) == 128
         and cross_width == 16
@@ -119,6 +130,8 @@ class NNUEWriter():
             else PHASE5_DESCRIPTION
         )
         description = (
+            LCA24_DESCRIPTION if is_compact128 and lca_width == 24 else
+            LCA16_DESCRIPTION if is_compact128 and lca_width == 16 else
             COMPACT128_DESCRIPTION
             if is_compact128
             else
@@ -132,7 +145,8 @@ class NNUEWriter():
         )
     description_is_fc1x64 = (
         PHASE5_FC1X64_DESCRIPTION in description
-        or description == COMPACT128_DESCRIPTION
+        or description in (COMPACT128_DESCRIPTION, LCA24_DESCRIPTION,
+                           LCA16_DESCRIPTION)
     )
     if is_fc1x64 != description_is_fc1x64:
         raise ValueError(
@@ -144,11 +158,19 @@ class NNUEWriter():
             "description/Cross width mismatch: 24-wide models require "
             f"{CROSS24_DESCRIPTION!r}, and 32-wide models must not use it"
         )
-    if is_compact128 != (COMPACT128_DESCRIPTION == description):
+    if is_compact128 != (description in (
+            COMPACT128_DESCRIPTION, LCA24_DESCRIPTION, LCA16_DESCRIPTION)):
         raise ValueError(
             "description/compact128 mismatch: the 128-input fixed-order model "
             f"requires {COMPACT128_DESCRIPTION!r}"
         )
+    expected_lca_description = (
+        LCA24_DESCRIPTION if lca_width == 24 else
+        LCA16_DESCRIPTION if lca_width == 16 else None)
+    if ((expected_lca_description is not None and description != expected_lca_description)
+        or (expected_lca_description is None and description in (
+            LCA24_DESCRIPTION, LCA16_DESCRIPTION))):
+        raise ValueError("description/LCA width mismatch")
 
     self.buf = bytearray()
 
@@ -183,9 +205,11 @@ class NNUEWriter():
       print(f"FM Abs Path END [Pos: {len(self.buf)}]")
 
       print(f"LCA Q/K/V Projection START [Pos: {len(self.buf)}]")
-      self.write_fc_layer(model, lca_q)
-      self.write_fc_layer(model, lca_k)
-      self.write_fc_layer(model, lca_v)
+      # Compact LCA rows are physical rows, not SIMD padding. Input columns
+      # remain padded by write_fc_layer as required by the C++ affine layer.
+      self.write_fc_layer(model, lca_q, pad_output=False)
+      self.write_fc_layer(model, lca_k, pad_output=False)
+      self.write_fc_layer(model, lca_v, pad_output=False)
       print(f"LCA Q/K/V Projection END [Pos: {len(self.buf)}]")
 
       print(f"LCA Temperature: {lca_temp_val}")
@@ -249,6 +273,12 @@ class NNUEWriter():
       layer_hash ^= CROSS24_FC_HASH_XOR
     if getattr(model.layer_stacks, 'l2_in_total', None) == 128:
       layer_hash ^= COMPACT128_FC_HASH_XOR
+    lca_width = len(getattr(
+        model.layer_stacks, 'lca_qk_indices', tuple(range(32))))
+    if lca_width == 24:
+      layer_hash ^= LCA24_FC_HASH_XOR
+    elif lca_width == 16:
+      layer_hash ^= LCA16_FC_HASH_XOR
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
@@ -473,7 +503,20 @@ class NNUEReader():
     if version != VERSION:
       raise Exception('Unsupported NNUE version: 0x%08x' % version)
 
-    is_compact128 = self.description == COMPACT128_DESCRIPTION
+    is_compact128 = self.description in (
+        COMPACT128_DESCRIPTION, LCA24_DESCRIPTION, LCA16_DESCRIPTION)
+    lca_qk_indices = (
+        (0, 16, 28, 22, 3, 13, 19, 29, 10, 20, 7, 5, 23, 6, 2, 31,
+         14, 30, 4, 8, 24, 11, 21, 15)
+        if self.description == LCA24_DESCRIPTION else
+        (0, 16, 28, 22, 3, 13, 19, 29, 10, 20, 7, 5, 23, 6, 2, 31)
+        if self.description == LCA16_DESCRIPTION else tuple(range(32)))
+    lca_value_indices = (
+        (15, 9, 1, 2, 7, 5, 8, 14, 3, 11, 28, 6, 4, 24, 20, 31,
+         0, 16, 23, 29, 13, 17, 27, 22)
+        if self.description == LCA24_DESCRIPTION else
+        (15, 9, 1, 2, 7, 5, 8, 14, 3, 11, 28, 6, 4, 24, 20, 31)
+        if self.description == LCA16_DESCRIPTION else tuple(range(32)))
     remove_abs_sqr_l2 = COMPACT_DESCRIPTION in self.description or is_compact128
     phase_output_dimensions = (
         M.PHASE_CHANNELS_NO_ABS_SQR
@@ -497,7 +540,9 @@ class NNUEReader():
         l2_fm_diff_indices=(
             COMPACT128_FM_DIFF_UNITS if is_compact128 else None),
         l2_fm_abs_raw_indices=(
-            COMPACT128_FM_ABS_RAW_UNITS if is_compact128 else None))
+            COMPACT128_FM_ABS_RAW_UNITS if is_compact128 else None),
+        lca_qk_indices=lca_qk_indices,
+        lca_value_indices=lca_value_indices)
     fc_hash = NNUEWriter.fc_hash(self.model)
     expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
     # Accept legacy serializer output as well as the C++ SFNN fixed hash.
@@ -527,9 +572,9 @@ class NNUEReader():
       abs_b_tmp   = nn.Linear(128, 64)
 
       # LCA Projection用
-      lca_q_tmp   = nn.Linear(31, 32) # Query
-      lca_k_tmp   = nn.Linear(64, 32) # Key
-      lca_v_tmp   = nn.Linear(64, 32) # Value
+      lca_q_tmp   = nn.Linear(31, len(lca_qk_indices)) # Query
+      lca_k_tmp   = nn.Linear(64, len(lca_qk_indices)) # Key
+      lca_v_tmp   = nn.Linear(64, len(lca_value_indices)) # Value
 
       # Phase Gate 用
       # Phase5/Phase6 are both padded to 32 physical output rows on disk.
@@ -784,6 +829,10 @@ def main():
             architecture.get('fm_diff_kept_source_units', range(32)))
         l2_fm_abs_raw_indices = tuple(
             architecture.get('fm_abs_raw_kept_source_units', range(32)))
+        lca_qk_indices = tuple(
+            architecture.get('lca_qk_kept_source_units', range(32)))
+        lca_value_indices = tuple(
+            architecture.get('lca_value_kept_source_units', range(32)))
         if l3_dimensions not in (M.L3, M.L3_LEGACY):
           raise Exception(
               'Unsupported .pt fc1 output architecture: %r'
@@ -822,7 +871,9 @@ def main():
             l3_dimensions=l3_dimensions,
             cross_output_dimensions=cross_output_dimensions,
             l2_fm_diff_indices=l2_fm_diff_indices,
-            l2_fm_abs_raw_indices=l2_fm_abs_raw_indices)
+            l2_fm_abs_raw_indices=l2_fm_abs_raw_indices,
+            lca_qk_indices=lca_qk_indices,
+            lca_value_indices=lca_value_indices)
         state_dict = saved['state_dict']
         if l2_input_physical != M.L2_IN_TOTAL:
           M.migrate_phase_proj_state_dict_to_five(state_dict)

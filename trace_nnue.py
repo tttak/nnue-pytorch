@@ -697,10 +697,12 @@ def make_integer_reference(entries, nnue):
         + torch.matmul(v_weight.to(torch.int64), lca_fm_input)
     )
 
+    lca_qk_width = int(lca_query.numel())
+    lca_value_width = int(lca_value.numel())
     lca_dot_product = torch.zeros((), dtype=torch.float32)
     lca_query_f32 = lca_query.to(torch.float32)
     lca_key_f32 = lca_key.to(torch.float32)
-    for index in range(FM_DIM):
+    for index in range(lca_qk_width):
         lca_dot_product = lca_dot_product + (
             (lca_query_f32[index] / 8128.0)
             * (lca_key_f32[index] / 8128.0)
@@ -713,8 +715,15 @@ def make_integer_reference(entries, nnue):
         lca_dot_product * torch.tensor(0.17677, dtype=torch.float32)
     ) / lca_temperature
     lca_attention_score = sigmoid_float32(lca_attention_logit)
+    # Compact LCA keeps Q/K/V projections in ranking order.  Q/K are consumed
+    # directly at their compact width, while V is scattered back to the
+    # original 32 Diff channels.  An omitted V preactivation is exactly zero,
+    # hence its mapped value is 0.5, matching the Python model and C++ path.
+    lca_value_full = torch.zeros(FM_DIM, dtype=lca_value.dtype)
+    lca_value_indices = tuple(getattr(nnue, "lca_value_indices", range(FM_DIM)))
+    lca_value_full[list(lca_value_indices)] = lca_value
     lca_value_clamped = torch.clamp(
-        lca_value.to(torch.float32) / 8128.0 * 0.4 + 0.5,
+        lca_value_full.to(torch.float32) / 8128.0 * 0.4 + 0.5,
         0.0,
         1.0,
     )
@@ -731,9 +740,12 @@ def make_integer_reference(entries, nnue):
     reference["lca.main_fc_preact_after_gate"] = main_fc_after_gate
     reference["lca.query_input"] = lca_query_input
     reference["lca.fm_input"] = lca_fm_input
-    reference["lca.query_preact"] = lca_query
-    reference["lca.key_preact"] = lca_key
-    reference["lca.value_preact"] = lca_value
+    reference["lca.query_preact"] = F.pad(
+        lca_query, (0, FM_DIM - lca_qk_width))
+    reference["lca.key_preact"] = F.pad(
+        lca_key, (0, FM_DIM - lca_qk_width))
+    reference["lca.value_preact"] = F.pad(
+        lca_value, (0, FM_DIM - lca_value_width))
     reference["lca.temperature_f32_bits"] = float32_bits(lca_temperature)
     reference["lca.dot_product_f32_bits"] = float32_bits(lca_dot_product)
     reference["lca.attention_logit_f32_bits"] = float32_bits(
@@ -1671,7 +1683,10 @@ def compare_native_lca(
     temperature = torch.clamp(nnue.layer_stacks.lca_temp, min=0.125)
     attention_logit = (dot_product / 5.656) / temperature
     attention_score = torch.sigmoid(attention_logit)
-    value_clamped = torch.clamp(value * 0.4 + 0.5, 0.0, 1.0)
+    value_full = torch.zeros(FM_DIM, dtype=value.dtype, device=value.device)
+    value_indices = tuple(getattr(nnue, "lca_value_indices", range(FM_DIM)))
+    value_full[list(value_indices)] = value
+    value_clamped = torch.clamp(value_full * 0.4 + 0.5, 0.0, 1.0)
     output_post_lca = (
         diff_pre_lca * (1.0 - attention_score)
         + value_clamped * attention_score
@@ -1712,19 +1727,19 @@ def compare_native_lca(
         "LCA Query pre-activation: C++ / 8128 vs PyTorch",
         get_trace_integers(entries, "lca.query_preact", FM_DIM),
         nnue.weight_scale_hidden * nnue.quantized_one,
-        query,
+        F.pad(query, (0, FM_DIM - query.numel())),
     )
     report_comparison(
         "LCA Key pre-activation: C++ / 8128 vs PyTorch",
         get_trace_integers(entries, "lca.key_preact", FM_DIM),
         nnue.weight_scale_hidden * nnue.quantized_one,
-        key,
+        F.pad(key, (0, FM_DIM - key.numel())),
     )
     report_comparison(
         "LCA Value pre-activation: C++ / 8128 vs PyTorch",
         get_trace_integers(entries, "lca.value_preact", FM_DIM),
         nnue.weight_scale_hidden * nnue.quantized_one,
-        value,
+        F.pad(value, (0, FM_DIM - value.numel())),
     )
     report_float_bits_comparison(
         "LCA temperature",
@@ -2108,18 +2123,9 @@ def main():
     if args.checkpoint.lower().endswith(".pt"):
         saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         architecture = saved.get("architecture", {}) if isinstance(saved, dict) else {}
-        l2_input_physical = architecture.get("l2_input_physical")
         if not isinstance(saved, dict) or "state_dict" not in saved:
             raise ValueError("Recovery .pt must contain state_dict and architecture")
-        if l2_input_physical not in (
-            M.L2_IN_TOTAL, M.L2_IN_TOTAL_WITHOUT_ABS_SQR
-        ):
-            raise ValueError(f"Unsupported .pt L2 architecture: {l2_input_physical}")
-        nnue = M.NNUE(
-            feature_set,
-            remove_abs_sqr_l2=(
-                l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR),
-        )
+        nnue = M.NNUE(feature_set, **M.nnue_architecture_kwargs(architecture))
         nnue.load_state_dict(saved["state_dict"], strict=True)
     else:
         nnue = M.NNUE.load_from_checkpoint(
