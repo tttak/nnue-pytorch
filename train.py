@@ -410,8 +410,32 @@ def main():
 
     # 「.pt」の場合
     if args.resume_from_model.endswith(".pt"):
+      # A .pt resume source may contain a complete NNUE Python object rather
+      # than only tensor weights.  PyTorch 2.6+ defaults torch.load() to
+      # weights_only=True, so opt into object loading at this boundary only.
+      checkpoint = torch.load(
+          args.resume_from_model, map_location='cpu', weights_only=False)
 
-      # 1. まず、現在の設定でモデルの「器（インスタンス）」を作る
+      # Recreate the training model with the source architecture, not with the
+      # current defaults.  This is essential for compact L2/Cross models and
+      # also preserves the exact FM source-unit ordering.
+      if hasattr(checkpoint, 'state_dict'):
+          architecture = M.nnue_architecture_metadata(checkpoint)
+          checkpoint_dict = checkpoint.state_dict()
+      elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+          architecture = (checkpoint.get('architecture')
+                          or checkpoint.get('nnue_architecture'))
+          if architecture is None:
+              raise ValueError(
+                  ".pt state_dict package is missing architecture metadata")
+          checkpoint_dict = checkpoint['state_dict']
+      else:
+          # Legacy bare state_dict files have no architecture information and
+          # therefore retain the historical current-default fallback.
+          architecture = None
+          checkpoint_dict = checkpoint
+
+      architecture_kwargs = M.nnue_architecture_kwargs(architecture)
       nnue = M.NNUE(feature_set=feature_set,
                     start_lambda=start_lambda,
                     max_epoch=max_epoch,
@@ -425,25 +449,14 @@ def main():
                     offset=args.offset,
                     offset1=args.offset1,
                     offset2=args.offset2,
-                    adjust_loss=args.adjust_loss)
-
-      # 2. CPU 上で重みファイルをロード
-      # A .pt resume source may contain a complete NNUE Python object rather
-      # than only tensor weights.  PyTorch 2.6+ defaults torch.load() to
-      # weights_only=True, so opt into object loading at this boundary only.
-      checkpoint = torch.load(
-          args.resume_from_model, map_location='cpu', weights_only=False)
+                    adjust_loss=args.adjust_loss,
+                    **architecture_kwargs)
       model_dict = nnue.state_dict()
+      if architecture is not None:
+          print("Resuming .pt architecture:",
+                M.nnue_architecture_metadata(nnue))
 
-      # checkpoint が NNUE オブジェクトそのものだった場合
-      if hasattr(checkpoint, 'state_dict'):
-          # オブジェクトから辞書形式を取り出す
-          checkpoint_dict = checkpoint.state_dict()
-      else:
-          # すでに辞書形式（state_dict）だった場合
-          checkpoint_dict = checkpoint
-
-      # 3. checkpoint_dict を使って、形状が一致するものだけを抽出
+      # checkpoint_dict を使って、形状が一致するものだけを抽出
       pretrained_dict = {
           k: v for k, v in checkpoint_dict.items() 
           if k in model_dict and v.shape == model_dict[k].shape
@@ -481,7 +494,7 @@ def main():
 
                   print(f"Completed partial copy for {k}")
 
-      # 4. 現在のモデルの state_dict を更新してロード
+      # 現在のモデルの state_dict を更新してロード
       model_dict.update(pretrained_dict)
       nnue.load_state_dict(model_dict, strict=False)
 

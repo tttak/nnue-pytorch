@@ -36,6 +36,7 @@ NUM_LS_BUCKETS = 12
 PHASE_CHANNELS_LEGACY = 6
 PHASE_CHANNELS_NO_ABS_SQR = 5
 PHASE5_KEEP_ROWS = (0, 1, 2, 3, 5)
+NNUE_ARCHITECTURE_METADATA_VERSION = 1
 
 PHASE_CHANNEL_NAMES = {
     PHASE_CHANNELS_NO_ABS_SQR:
@@ -93,6 +94,112 @@ def migrate_model_phase_to_five(model):
     model.layer_stacks.phase_output_dimensions = PHASE_CHANNELS_NO_ABS_SQR
     model.phase_output_dimensions = PHASE_CHANNELS_NO_ABS_SQR
     return True
+
+
+def nnue_architecture_metadata(model):
+    """Return the complete shape/order metadata needed to rebuild ``model``.
+
+    The FM index lists are part of the architecture: for compact networks they
+    define which source units occupy each serialized L2 column, in that order.
+    """
+    stacks = model.layer_stacks
+    return {
+        "version": NNUE_ARCHITECTURE_METADATA_VERSION,
+        "remove_abs_sqr_l2": bool(getattr(model, "remove_abs_sqr_l2", False)),
+        "remove_main_sqr_l2": bool(getattr(model, "remove_main_sqr_l2", False)),
+        "phase_output_dimensions": int(getattr(
+            model, "phase_output_dimensions", stacks.phase_output_dimensions)),
+        "fc1_output_dimensions": int(getattr(
+            model, "l3_dimensions", stacks.l3_dimensions)),
+        "cross_output_dimensions": int(getattr(
+            model, "cross_output_dimensions",
+            getattr(stacks, "cross_output_dimensions", 32))),
+        "fm_diff_kept_source_units": list(getattr(
+            model, "l2_fm_diff_indices",
+            getattr(stacks, "l2_fm_diff_indices", tuple(range(32))))),
+        "fm_abs_raw_kept_source_units": list(getattr(
+            model, "l2_fm_abs_raw_indices",
+            getattr(stacks, "l2_fm_abs_raw_indices", tuple(range(32))))),
+        "l2_input_physical": int(stacks.l2_in_total),
+    }
+
+
+def nnue_architecture_kwargs(metadata):
+    """Convert saved architecture metadata into :class:`NNUE` kwargs."""
+    if not metadata:
+        return {}
+    version = int(metadata.get("version", NNUE_ARCHITECTURE_METADATA_VERSION))
+    if version != NNUE_ARCHITECTURE_METADATA_VERSION:
+        raise ValueError(f"unsupported NNUE architecture metadata version: {version}")
+
+    saved_width = metadata.get("l2_input_physical")
+    remove_abs_sqr_l2 = metadata.get("remove_abs_sqr_l2")
+    if remove_abs_sqr_l2 is None:
+        if saved_width is None:
+            raise ValueError(
+                "NNUE architecture metadata lacks remove_abs_sqr_l2 and L2 width")
+        remove_abs_sqr_l2 = int(saved_width) != L2_IN_TOTAL
+
+    kwargs = {
+        "remove_abs_sqr_l2": bool(remove_abs_sqr_l2),
+        "remove_main_sqr_l2": bool(metadata.get("remove_main_sqr_l2", False)),
+        "phase_output_dimensions": int(metadata["phase_output_dimensions"]),
+        "l3_dimensions": int(metadata.get(
+            "fc1_output_dimensions", metadata.get("l3_dimensions", L3))),
+        "cross_output_dimensions": int(metadata["cross_output_dimensions"]),
+        "l2_fm_diff_indices": tuple(
+            int(v) for v in metadata["fm_diff_kept_source_units"]),
+        "l2_fm_abs_raw_indices": tuple(
+            int(v) for v in metadata["fm_abs_raw_kept_source_units"]),
+    }
+
+    # Validate the redundant physical width before any weights are loaded.
+    base = (
+        L2_IN_TOTAL_WITHOUT_MAIN_SQR
+        if kwargs["remove_main_sqr_l2"]
+        else L2_IN_TOTAL_WITHOUT_ABS_SQR
+        if kwargs["remove_abs_sqr_l2"]
+        else L2_IN_TOTAL
+    )
+    expected = (base
+                - (32 - kwargs["cross_output_dimensions"])
+                - (32 - len(kwargs["l2_fm_diff_indices"]))
+                - (32 - len(kwargs["l2_fm_abs_raw_indices"])))
+    saved = metadata.get("l2_input_physical", expected)
+    if saved is not None and int(saved) != expected:
+        raise ValueError(
+            f"inconsistent NNUE architecture metadata: L2 width {saved}, "
+            f"derived width {expected}")
+    return kwargs
+
+
+def checkpoint_architecture_metadata(checkpoint):
+    """Read architecture metadata from a Lightning checkpoint, if present."""
+    metadata = checkpoint.get("nnue_architecture")
+    if metadata:
+        return metadata
+
+    # New checkpoints also copy constructor-compatible values into hparams so
+    # Lightning's standard load_from_checkpoint() can reconstruct the model.
+    hparams = checkpoint.get("hyper_parameters", {}) or {}
+    required = {
+        "remove_abs_sqr_l2", "phase_output_dimensions", "l3_dimensions",
+        "cross_output_dimensions", "l2_fm_diff_indices",
+        "l2_fm_abs_raw_indices",
+    }
+    if required.issubset(hparams):
+        return {
+            "version": NNUE_ARCHITECTURE_METADATA_VERSION,
+            "remove_abs_sqr_l2": hparams["remove_abs_sqr_l2"],
+            "remove_main_sqr_l2": hparams.get("remove_main_sqr_l2", False),
+            "phase_output_dimensions": hparams["phase_output_dimensions"],
+            "fc1_output_dimensions": hparams["l3_dimensions"],
+            "cross_output_dimensions": hparams["cross_output_dimensions"],
+            "fm_diff_kept_source_units": hparams["l2_fm_diff_indices"],
+            "fm_abs_raw_kept_source_units": hparams["l2_fm_abs_raw_indices"],
+            "l2_input_physical": hparams.get("l2_input_physical"),
+        }
+    return None
 
 
 class CUDATiming:
@@ -687,6 +794,18 @@ class NNUE(pl.LightningModule):
         self.l2_fm_abs_raw_indices = (
             tuple(range(32)) if l2_fm_abs_raw_indices is None else tuple(l2_fm_abs_raw_indices)
         )
+        # Keep only architecture-defining constructor values in Lightning
+        # hparams.  In particular, feature_set is supplied explicitly when a
+        # checkpoint is loaded and must not be pickled as constructor metadata.
+        self.save_hyperparameters({
+            "remove_abs_sqr_l2": self.remove_abs_sqr_l2,
+            "remove_main_sqr_l2": self.remove_main_sqr_l2,
+            "phase_output_dimensions": self.phase_output_dimensions,
+            "l3_dimensions": self.l3_dimensions,
+            "cross_output_dimensions": self.cross_output_dimensions,
+            "l2_fm_diff_indices": list(self.l2_fm_diff_indices),
+            "l2_fm_abs_raw_indices": list(self.l2_fm_abs_raw_indices),
+        })
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
             remove_abs_sqr_l2=remove_abs_sqr_l2,
@@ -5020,6 +5139,8 @@ class NNUE(pl.LightningModule):
                 phase_output_dimensions=self.phase_output_dimensions,
                 l3_dimensions=self.l3_dimensions,
                 cross_output_dimensions=self.cross_output_dimensions,
+                l2_fm_diff_indices=self.l2_fm_diff_indices,
+                l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
@@ -5028,8 +5149,31 @@ class NNUE(pl.LightningModule):
             for param in self.ema_model.parameters():
                 param.requires_grad = False
 
+    def on_save_checkpoint(self, checkpoint):
+        """Persist every architecture choice needed for an exact reload."""
+        architecture = nnue_architecture_metadata(self)
+        checkpoint["nnue_architecture"] = architecture
+        checkpoint.setdefault("hyper_parameters", {}).update({
+            "remove_abs_sqr_l2": architecture["remove_abs_sqr_l2"],
+            "remove_main_sqr_l2": architecture["remove_main_sqr_l2"],
+            "phase_output_dimensions": architecture["phase_output_dimensions"],
+            "l3_dimensions": architecture["fc1_output_dimensions"],
+            "cross_output_dimensions": architecture["cross_output_dimensions"],
+            "l2_fm_diff_indices": architecture["fm_diff_kept_source_units"],
+            "l2_fm_abs_raw_indices": architecture["fm_abs_raw_kept_source_units"],
+        })
+
     def on_load_checkpoint(self, checkpoint):
         """過去の余分な EMA キーを安全に削除"""
+        saved_architecture = checkpoint_architecture_metadata(checkpoint)
+        if saved_architecture is not None:
+            saved_kwargs = nnue_architecture_kwargs(saved_architecture)
+            current_kwargs = nnue_architecture_kwargs(
+                nnue_architecture_metadata(self))
+            if saved_kwargs != current_kwargs:
+                raise ValueError(
+                    "checkpoint NNUE architecture does not match the "
+                    "constructed model")
         state_dict = checkpoint.get("state_dict", {})
         for k in [k for k in state_dict.keys() if k.startswith("ema_model.")]:
             del state_dict[k]
