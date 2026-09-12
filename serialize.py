@@ -70,6 +70,8 @@ COMPACT_FC_HASH_XOR = 0x00600000
 PHASE5_DESCRIPTION = "HalfKA-KSDG3_FM-1280-L2x160-NoAbsSqr-Phase5"
 PHASE5_FC1X64_DESCRIPTION = PHASE5_DESCRIPTION + "-FC1x64"
 PHASE5_FC_HASH_XOR = 0x00050000
+CROSS24_DESCRIPTION = PHASE5_FC1X64_DESCRIPTION + "-Cross24"
+CROSS24_FC_HASH_XOR = 0x00240000
 SFNN_OUTER_HASH = 0x3C203B32
 SFNN_FEATURE_TRANSFORMER_HASH = 0x5F134AB8
 
@@ -79,6 +81,10 @@ class NNUEWriter():
   """
   def __init__(self, model, description=None, ft_compression='none'):
     is_fc1x64 = getattr(model.layer_stacks, 'l3_dimensions', M.L3) == 64
+    cross_width = getattr(model.layer_stacks, 'cross_output_dimensions', 32)
+    if cross_width not in (24, 32):
+        raise ValueError(
+            f"serializer supports Cross widths 24 and 32, got {cross_width}")
     if description is None:
         phase5_description = (
             PHASE5_FC1X64_DESCRIPTION
@@ -86,7 +92,9 @@ class NNUEWriter():
             else PHASE5_DESCRIPTION
         )
         description = (
-            phase5_description
+            CROSS24_DESCRIPTION
+            if cross_width == 24
+            else phase5_description
             if getattr(model, 'phase_output_dimensions', 6) == 5
             else COMPACT_DESCRIPTION
             if getattr(model, 'remove_abs_sqr_l2', False)
@@ -96,6 +104,11 @@ class NNUEWriter():
         raise ValueError(
             "description/fc1 width mismatch: 64-wide models require "
             f"{PHASE5_FC1X64_DESCRIPTION!r}, and 96-wide models must not use it"
+        )
+    if (cross_width == 24) != (CROSS24_DESCRIPTION in description):
+        raise ValueError(
+            "description/Cross width mismatch: 24-wide models require "
+            f"{CROSS24_DESCRIPTION!r}, and 32-wide models must not use it"
         )
 
     self.buf = bytearray()
@@ -144,7 +157,10 @@ class NNUEWriter():
       print(f"Phase Proj END [Pos: {len(self.buf)}]")
 
       print(f"Cross Proj START [Pos: {len(self.buf)}]")
-      self.write_fc_layer(model, cross_p) 
+      # Cross24 is a real 24-output layer on disk and in C++.  Unlike Phase5,
+      # it is not padded back to 32 output rows; the architecture string/hash
+      # prevents a Cross32 binary from interpreting this shorter payload.
+      self.write_fc_layer(model, cross_p, pad_output=False)
       print(f"Cross Proj END [Pos: {len(self.buf)}]")
 
       print(f"L2 Layer START [Pos: {len(self.buf)}]")
@@ -190,6 +206,8 @@ class NNUEWriter():
       layer_hash ^= COMPACT_FC_HASH_XOR
     if getattr(model, 'phase_output_dimensions', 6) == 5:
       layer_hash ^= PHASE5_FC_HASH_XOR
+    if getattr(model.layer_stacks, 'cross_output_dimensions', 32) == 24:
+      layer_hash ^= CROSS24_FC_HASH_XOR
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
@@ -327,7 +345,7 @@ class NNUEWriter():
     self.write_tensor(to_numpy(pw_exported.flatten()), ft_compression)
     self.write_tensor(to_numpy(pw_bucket_exported.flatten()), ft_compression)
 
-  def write_fc_layer(self, model, layer, is_output=False):
+  def write_fc_layer(self, model, layer, is_output=False, pad_output=True):
     # FC layers are stored as int8 weights, and int32 biases
     kWeightScaleHidden = model.weight_scale_hidden
     kWeightScaleOut = model.nnue2score * model.weight_scale_out / model.quantized_one
@@ -352,7 +370,7 @@ class NNUEWriter():
 
     # --- パディング (Bias と Weight の行数) ---
     num_output = weight.shape[0]
-    if num_output != 1 and num_output % 32 != 0:
+    if pad_output and num_output != 1 and num_output % 32 != 0:
         padded_output = num_output + (32 - (num_output % 32))
 
         # Biasを0でパディング
@@ -425,10 +443,12 @@ class NNUEReader():
         if PHASE5_FC1X64_DESCRIPTION in self.description
         else M.L3_LEGACY
     )
+    cross_output_dimensions = 24 if CROSS24_DESCRIPTION in self.description else 32
     self.model = M.NNUE(
         feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2,
         phase_output_dimensions=phase_output_dimensions,
-        l3_dimensions=l3_dimensions)
+        l3_dimensions=l3_dimensions,
+        cross_output_dimensions=cross_output_dimensions)
     fc_hash = NNUEWriter.fc_hash(self.model)
     expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
     # Accept legacy serializer output as well as the C++ SFNN fixed hash.
@@ -467,7 +487,10 @@ class NNUEReader():
       phase_p_tmp = nn.Linear(384, 32)
 
       # cross_proj用
-      cross_p_tmp = nn.Linear(self.model.layer_stacks.cross_dim * 2, 32, bias=True)
+      cross_p_tmp = nn.Linear(
+          self.model.layer_stacks.cross_dim * 2,
+          self.model.layer_stacks.cross_output_dimensions,
+          bias=True)
 
       l3_dimensions = self.model.layer_stacks.l3_dimensions
       l2_tmp      = nn.Linear(self.model.layer_stacks.l2_in_total, l3_dimensions)
@@ -522,8 +545,12 @@ class NNUEReader():
       self.model.layer_stacks.fm_abs.bias.data[fm_s:fm_e] = abs_b_tmp.bias.data
 
       # Cross Projection
-      self.model.layer_stacks.cross_proj.weight.data[l1_s:l1_e, :] = cross_p_tmp.weight.data
-      self.model.layer_stacks.cross_proj.bias.data[l1_s:l1_e] = cross_p_tmp.bias.data
+      cross_dims = self.model.layer_stacks.cross_output_dimensions
+      cross_s, cross_e = i * cross_dims, (i + 1) * cross_dims
+      self.model.layer_stacks.cross_proj.weight.data[cross_s:cross_e, :] = \
+          cross_p_tmp.weight.data[:cross_dims, :]
+      self.model.layer_stacks.cross_proj.bias.data[cross_s:cross_e] = \
+          cross_p_tmp.bias.data[:cross_dims]
 
       # LCA パラメータの分配 (バケット共通だがセット)
       self.model.layer_stacks.q_proj.weight.data = lca_q_tmp.weight.data
@@ -702,27 +729,39 @@ def main():
         architecture = saved.get('architecture', {})
         l2_input_physical = architecture.get('l2_input_physical')
         l3_dimensions = int(architecture.get('fc1_output_dimensions', M.L3))
+        cross_output_dimensions = int(
+            architecture.get('cross_output_dimensions', 32))
         if l3_dimensions not in (M.L3, M.L3_LEGACY):
           raise Exception(
               'Unsupported .pt fc1 output architecture: %r'
               % (l3_dimensions,))
+        expected_l2_input = (
+            M.L2_IN_TOTAL_WITHOUT_ABS_SQR
+            - (32 - cross_output_dimensions)
+        )
+        if cross_output_dimensions not in (24, 32):
+          raise Exception(
+              'Unsupported .pt Cross output architecture: %r'
+              % (cross_output_dimensions,))
         if l2_input_physical not in (M.L2_IN_TOTAL,
-                                     M.L2_IN_TOTAL_WITHOUT_ABS_SQR):
+                                     M.L2_IN_TOTAL_WITHOUT_ABS_SQR,
+                                     expected_l2_input):
           raise Exception(
               'Unsupported or missing .pt L2 architecture: %r'
               % (l2_input_physical,))
         nnue = M.NNUE(
             feature_set,
             remove_abs_sqr_l2=(
-                l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR),
+                l2_input_physical != M.L2_IN_TOTAL),
             phase_output_dimensions=int(architecture.get(
                 'phase_output_dimensions',
                 M.PHASE_CHANNELS_NO_ABS_SQR
-                if l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR
+                if l2_input_physical != M.L2_IN_TOTAL
                 else M.PHASE_CHANNELS_LEGACY)),
-            l3_dimensions=l3_dimensions)
+            l3_dimensions=l3_dimensions,
+            cross_output_dimensions=cross_output_dimensions)
         state_dict = saved['state_dict']
-        if l2_input_physical == M.L2_IN_TOTAL_WITHOUT_ABS_SQR:
+        if l2_input_physical != M.L2_IN_TOTAL:
           M.migrate_phase_proj_state_dict_to_five(state_dict)
         nnue.load_state_dict(state_dict, strict=True)
       else:

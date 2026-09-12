@@ -168,12 +168,16 @@ def get_parameters(layers):
 
 class LayerStacks(nn.Module):
     def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
-                 phase_output_dimensions=None, l3_dimensions=L3):
+                 phase_output_dimensions=None, l3_dimensions=L3,
+                 cross_output_dimensions=32):
         super(LayerStacks, self).__init__()
         self.count = count
         if l3_dimensions <= 0:
             raise ValueError("l3_dimensions must be positive")
         self.l3_dimensions = l3_dimensions
+        if not 1 <= cross_output_dimensions <= 32:
+            raise ValueError("cross_output_dimensions must be in 1..32")
+        self.cross_output_dimensions = cross_output_dimensions
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
         self.remove_main_sqr_l2 = remove_main_sqr_l2
         if phase_output_dimensions is None:
@@ -195,7 +199,7 @@ class LayerStacks(nn.Module):
             else L2_IN_TOTAL_WITHOUT_ABS_SQR
             if remove_abs_sqr_l2
             else L2_IN_TOTAL
-        )
+        ) - (32 - self.cross_output_dimensions)
 
         # --- router層
         self.router = nn.Linear(384, count)
@@ -221,7 +225,9 @@ class LayerStacks(nn.Module):
 
         # --- cross_proj
         self.cross_dim = 16
-        self.cross_proj = nn.Linear(self.cross_dim * 2, 32 * count)
+        self.cross_proj = nn.Linear(
+            self.cross_dim * 2, self.cross_output_dimensions * count
+        )
 
         # --- Lightweight Cross-Attention Layers ---
         self.q_proj = nn.Linear(31, 32)  # Query
@@ -249,6 +255,10 @@ class LayerStacks(nn.Module):
         self.last_att_score = None
         self.last_lca_temp = None
         self.last_phase = None
+        # Python ablation tools may opt in to retaining Cross activations.
+        # The default keeps production training free of the large diagnostic tensor.
+        self.capture_cross_diagnostics = False
+        self.last_cross_feat_all = None
 
         self.idx_offset = None
         self._init_layers()
@@ -283,8 +293,14 @@ class LayerStacks(nn.Module):
                 self.fm_abs.weight.data[sf:ef, :].copy_(self.fm_abs.weight.data[0:64, :])
                 self.fm_abs.bias.data[sf:ef].copy_(self.fm_abs.bias.data[0:64])
 
-                self.cross_proj.weight.data[s1:e1, :].copy_(self.cross_proj.weight.data[0:32, :])
-                self.cross_proj.bias.data[s1:e1].copy_(self.cross_proj.bias.data[0:32])
+                cs = i * self.cross_output_dimensions
+                ce = (i + 1) * self.cross_output_dimensions
+                self.cross_proj.weight.data[cs:ce, :].copy_(
+                    self.cross_proj.weight.data[0:self.cross_output_dimensions, :]
+                )
+                self.cross_proj.bias.data[cs:ce].copy_(
+                    self.cross_proj.bias.data[0:self.cross_output_dimensions]
+                )
 
                 self.blend.data[i] = self.blend.data[0]
 
@@ -454,10 +470,16 @@ class LayerStacks(nn.Module):
         cross_cat_all = torch.cat([cross_diff_all, cross_abs_all], dim=-1)           # [B, 12, 2*k_dim]
 
         # ★ einsum による12バケット個別の全結合演算
-        W_cross = self.cross_proj.weight.view(self.count, 32, -1)  # [12, 32, 2*k_dim]
-        b_cross = self.cross_proj.bias.view(self.count, 32)        # [12, 32]
-        cross_feat_all = torch.einsum("bci,coi->bco", cross_cat_all, W_cross) + b_cross  # [B, 12, 32]
+        W_cross = self.cross_proj.weight.view(
+            self.count, self.cross_output_dimensions, -1
+        )
+        b_cross = self.cross_proj.bias.view(
+            self.count, self.cross_output_dimensions
+        )
+        cross_feat_all = torch.einsum("bci,coi->bco", cross_cat_all, W_cross) + b_cross
         cross_feat_all = torch.clamp(cross_feat_all, 0.0, 1.0)
+        if self.capture_cross_diagnostics:
+            self.last_cross_feat_all = cross_feat_all.detach()
 
         # --- PHASE 5: L2 Input 構築 (全12バケット完全独立) ---
         p0 = phase[:, 0:1].unsqueeze(1)  # [B, 1, 1]
@@ -575,7 +597,7 @@ class LayerStacks(nn.Module):
                 abs_b = nn.Linear(128, 64)
                 l2 = nn.Linear(self.l2_in_total, self.l3_dimensions)
                 output = nn.Linear(self.l3_dimensions, 1)
-                cross_p = nn.Linear(self.cross_dim * 2, 32)
+                cross_p = nn.Linear(self.cross_dim * 2, self.cross_output_dimensions)
 
                 lca_q = self.q_proj
                 lca_k = self.k_proj
@@ -591,7 +613,8 @@ class LayerStacks(nn.Module):
                 abs_b.weight.data = self.fm_abs.weight.data[i*64:(i+1)*64, :]
                 abs_b.bias.data = self.fm_abs.bias.data[i*64:(i+1)*64]
 
-                s_c, e_c = i * 32, (i + 1) * 32
+                s_c = i * self.cross_output_dimensions
+                e_c = (i + 1) * self.cross_output_dimensions
                 cross_p.weight.data = self.cross_proj.weight.data[s_c:e_c, :]
                 cross_p.bias.data = self.cross_proj.bias.data[s_c:e_c]
 
@@ -607,7 +630,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32):
         super(NNUE, self).__init__()
         self.num_ls_buckets = NUM_LS_BUCKETS
 
@@ -625,12 +648,14 @@ class NNUE(pl.LightningModule):
             else phase_output_dimensions
         )
         self.l3_dimensions = l3_dimensions
+        self.cross_output_dimensions = cross_output_dimensions
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
             remove_abs_sqr_l2=remove_abs_sqr_l2,
             remove_main_sqr_l2=remove_main_sqr_l2,
             phase_output_dimensions=self.phase_output_dimensions,
             l3_dimensions=self.l3_dimensions,
+            cross_output_dimensions=self.cross_output_dimensions,
         )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
@@ -1025,7 +1050,7 @@ class NNUE(pl.LightningModule):
                 main_raw_part = l2_input[:, 0:31].abs().mean().item()
                 fm_diff_part = l2_input[:, 31:63].abs().mean().item()
                 fm_abs_part = l2_input[:, 63:95].abs().mean().item()
-                cross_feat = l2_input[:, 95:127].abs().mean().item()
+                cross_feat = l2_input[:, 95:95 + self.cross_output_dimensions].abs().mean().item()
             else:
                 main_sqr_part = l2_input[:, 0:31].abs().mean().item()
                 main_raw_part = l2_input[:, 31:62].abs().mean().item()
@@ -1034,10 +1059,10 @@ class NNUE(pl.LightningModule):
                 pass
             elif self.remove_abs_sqr_l2:
                 fm_abs_part = l2_input[:, 94:126].abs().mean().item()
-                cross_feat = l2_input[:, 126:158].abs().mean().item()
+                cross_feat = l2_input[:, 126:126 + self.cross_output_dimensions].abs().mean().item()
             else:
                 fm_abs_part = l2_input[:, 94:158].abs().mean().item()
-                cross_feat = l2_input[:, 158:190].abs().mean().item()
+                cross_feat = l2_input[:, 158:158 + self.cross_output_dimensions].abs().mean().item()
 
             print(f" L2 In | Main(Sqr): {main_sqr_part:.4f} | Main(Raw): {main_raw_part:.4f} | FM(Diff): {fm_diff_part:.4f} | FM(Abs): {fm_abs_part:.4f}  | cross_feat: {cross_feat:.4f}")
 
@@ -1056,7 +1081,7 @@ class NNUE(pl.LightningModule):
                 log_stats("Main(Raw)",   l2_input[:, 0:31])
                 log_stats("FM(Diff)",    l2_input[:, 31:63])
                 log_stats("FM(Abs_Raw)", l2_input[:, 63:95])
-                log_stats("cross_feat",  l2_input[:, 95:127])
+                log_stats("cross_feat",  l2_input[:, 95:95 + self.cross_output_dimensions])
             else:
                 log_stats("Main(Sqr)",    l2_input[:, 0:31])
                 log_stats("Main(Raw)",    l2_input[:, 31:62])
@@ -1065,10 +1090,10 @@ class NNUE(pl.LightningModule):
             if self.remove_main_sqr_l2:
                 pass
             elif self.remove_abs_sqr_l2:
-                log_stats("cross_feat", l2_input[:, 126:158])
+                log_stats("cross_feat", l2_input[:, 126:126 + self.cross_output_dimensions])
             else:
                 log_stats("FM(Abs_Sqr)", l2_input[:, 126:158])
-                log_stats("cross_feat",  l2_input[:, 158:190])
+                log_stats("cross_feat",  l2_input[:, 158:158 + self.cross_output_dimensions])
 
             if self.input.v.grad is not None:
                 v_grad_mean = self.input.v.grad.abs().mean().item()
@@ -2970,7 +2995,10 @@ class NNUE(pl.LightningModule):
             w_l1 = self.layer_stacks.l1.weight[i * 32: (i + 1) * 32].reshape(-1)
             w_fd = self.layer_stacks.fm_diff.weight[i * 64: (i + 1) * 64].reshape(-1)
             w_fa = self.layer_stacks.fm_abs.weight[i * 64: (i + 1) * 64].reshape(-1)
-            w_cross = self.layer_stacks.cross_proj.weight[i * 32: (i + 1) * 32].reshape(-1)
+            cross_width = self.layer_stacks.cross_output_dimensions
+            w_cross = self.layer_stacks.cross_proj.weight[
+                i * cross_width: (i + 1) * cross_width
+            ].reshape(-1)
             l3_width = self.layer_stacks.l3_dimensions
             w_l2 = self.layer_stacks.l2.weight[
                 i * l3_width: (i + 1) * l3_width
@@ -4950,6 +4978,8 @@ class NNUE(pl.LightningModule):
                 remove_abs_sqr_l2=self.remove_abs_sqr_l2,
                 remove_main_sqr_l2=self.remove_main_sqr_l2,
                 phase_output_dimensions=self.phase_output_dimensions,
+                l3_dimensions=self.l3_dimensions,
+                cross_output_dimensions=self.cross_output_dimensions,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
