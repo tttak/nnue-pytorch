@@ -169,7 +169,8 @@ def get_parameters(layers):
 class LayerStacks(nn.Module):
     def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
                  phase_output_dimensions=None, l3_dimensions=L3,
-                 cross_output_dimensions=32):
+                 cross_output_dimensions=32, l2_fm_diff_indices=None,
+                 l2_fm_abs_raw_indices=None):
         super(LayerStacks, self).__init__()
         self.count = count
         if l3_dimensions <= 0:
@@ -178,6 +179,27 @@ class LayerStacks(nn.Module):
         if not 1 <= cross_output_dimensions <= 32:
             raise ValueError("cross_output_dimensions must be in 1..32")
         self.cross_output_dimensions = cross_output_dimensions
+        def normalize_l2_indices(name, values):
+            values = tuple(range(32)) if values is None else tuple(int(v) for v in values)
+            if not values or len(values) > 32 or len(set(values)) != len(values):
+                raise ValueError(f"{name} must contain 1..32 unique indices")
+            if min(values) < 0 or max(values) >= 32:
+                raise ValueError(f"{name} values must be in 0..31")
+            return values
+        self.l2_fm_diff_indices = normalize_l2_indices(
+            "l2_fm_diff_indices", l2_fm_diff_indices
+        )
+        self.l2_fm_abs_raw_indices = normalize_l2_indices(
+            "l2_fm_abs_raw_indices", l2_fm_abs_raw_indices
+        )
+        self.register_buffer(
+            "_l2_fm_diff_index_tensor",
+            torch.tensor(self.l2_fm_diff_indices, dtype=torch.long), persistent=False,
+        )
+        self.register_buffer(
+            "_l2_fm_abs_raw_index_tensor",
+            torch.tensor(self.l2_fm_abs_raw_indices, dtype=torch.long), persistent=False,
+        )
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
         self.remove_main_sqr_l2 = remove_main_sqr_l2
         if phase_output_dimensions is None:
@@ -199,7 +221,9 @@ class LayerStacks(nn.Module):
             else L2_IN_TOTAL_WITHOUT_ABS_SQR
             if remove_abs_sqr_l2
             else L2_IN_TOTAL
-        ) - (32 - self.cross_output_dimensions)
+        ) - (32 - self.cross_output_dimensions) \
+          - (32 - len(self.l2_fm_diff_indices)) \
+          - (32 - len(self.l2_fm_abs_raw_indices))
 
         # --- router層
         self.router = nn.Linear(384, count)
@@ -501,6 +525,14 @@ class LayerStacks(nn.Module):
         l2_main_raw_weighted_all = l1_main_raw_all * (0.5 + p1 * 0.5) * 1.5
         l2_diff_weighted_all = l1_diff_l2_all * (0.5 + p2 * 0.5) * 1.0
         l1_abs_raw_weighted_all = l1_abs_raw_all * (0.5 + p3 * 0.5) * 0.7
+        if len(self.l2_fm_diff_indices) != 32:
+            l2_diff_weighted_all = l2_diff_weighted_all.index_select(
+                -1, self._l2_fm_diff_index_tensor
+            )
+        if len(self.l2_fm_abs_raw_indices) != 32:
+            l1_abs_raw_weighted_all = l1_abs_raw_weighted_all.index_select(
+                -1, self._l2_fm_abs_raw_index_tensor
+            )
         l1_abs_sqr_weighted_all = (
             None
             if self.remove_abs_sqr_l2
@@ -630,7 +662,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None):
         super(NNUE, self).__init__()
         self.num_ls_buckets = NUM_LS_BUCKETS
 
@@ -649,6 +681,12 @@ class NNUE(pl.LightningModule):
         )
         self.l3_dimensions = l3_dimensions
         self.cross_output_dimensions = cross_output_dimensions
+        self.l2_fm_diff_indices = (
+            tuple(range(32)) if l2_fm_diff_indices is None else tuple(l2_fm_diff_indices)
+        )
+        self.l2_fm_abs_raw_indices = (
+            tuple(range(32)) if l2_fm_abs_raw_indices is None else tuple(l2_fm_abs_raw_indices)
+        )
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
             remove_abs_sqr_l2=remove_abs_sqr_l2,
@@ -656,6 +694,8 @@ class NNUE(pl.LightningModule):
             phase_output_dimensions=self.phase_output_dimensions,
             l3_dimensions=self.l3_dimensions,
             cross_output_dimensions=self.cross_output_dimensions,
+            l2_fm_diff_indices=self.l2_fm_diff_indices,
+            l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
         )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda

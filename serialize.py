@@ -72,6 +72,19 @@ PHASE5_FC1X64_DESCRIPTION = PHASE5_DESCRIPTION + "-FC1x64"
 PHASE5_FC_HASH_XOR = 0x00050000
 CROSS24_DESCRIPTION = PHASE5_FC1X64_DESCRIPTION + "-Cross24"
 CROSS24_FC_HASH_XOR = 0x00240000
+COMPACT128_DESCRIPTION = (
+    "HalfKA-KSDG3_FM-1280-L2x128-NoAbsSqr-Phase5-FC1x64-"
+    "Cross16-FMDiff24-FMAbsRaw24"
+)
+COMPACT128_FC_HASH_XOR = 0x00128010
+COMPACT128_FM_DIFF_UNITS = (
+    2, 10, 14, 13, 8, 6, 5, 28, 11, 3, 1, 15,
+    7, 9, 12, 4, 0, 23, 27, 24, 20, 16, 22, 17,
+)
+COMPACT128_FM_ABS_RAW_UNITS = (
+    10, 20, 28, 21, 8, 15, 4, 9, 19, 13, 17, 18,
+    3, 1, 6, 25, 24, 0, 14, 12, 2, 22, 5, 31,
+)
 SFNN_OUTER_HASH = 0x3C203B32
 SFNN_FEATURE_TRANSFORMER_HASH = 0x5F134AB8
 
@@ -82,9 +95,23 @@ class NNUEWriter():
   def __init__(self, model, description=None, ft_compression='none'):
     is_fc1x64 = getattr(model.layer_stacks, 'l3_dimensions', M.L3) == 64
     cross_width = getattr(model.layer_stacks, 'cross_output_dimensions', 32)
-    if cross_width not in (24, 32):
+    diff_units = tuple(getattr(
+        model.layer_stacks, 'l2_fm_diff_indices', tuple(range(32))))
+    abs_units = tuple(getattr(
+        model.layer_stacks, 'l2_fm_abs_raw_indices', tuple(range(32))))
+    is_compact128 = (
+        getattr(model.layer_stacks, 'l2_in_total', None) == 128
+        and cross_width == 16
+        and diff_units == COMPACT128_FM_DIFF_UNITS
+        and abs_units == COMPACT128_FM_ABS_RAW_UNITS
+    )
+    if cross_width not in (16, 24, 32):
         raise ValueError(
-            f"serializer supports Cross widths 24 and 32, got {cross_width}")
+            f"serializer supports Cross widths 16, 24 and 32, got {cross_width}")
+    if cross_width == 16 and not is_compact128:
+        raise ValueError(
+            "Cross16 serialization is reserved for the fixed compact128 "
+            "unit ordering")
     if description is None:
         phase5_description = (
             PHASE5_FC1X64_DESCRIPTION
@@ -92,6 +119,9 @@ class NNUEWriter():
             else PHASE5_DESCRIPTION
         )
         description = (
+            COMPACT128_DESCRIPTION
+            if is_compact128
+            else
             CROSS24_DESCRIPTION
             if cross_width == 24
             else phase5_description
@@ -100,7 +130,11 @@ class NNUEWriter():
             if getattr(model, 'remove_abs_sqr_l2', False)
             else DEFAULT_DESCRIPTION
         )
-    if is_fc1x64 != (PHASE5_FC1X64_DESCRIPTION in description):
+    description_is_fc1x64 = (
+        PHASE5_FC1X64_DESCRIPTION in description
+        or description == COMPACT128_DESCRIPTION
+    )
+    if is_fc1x64 != description_is_fc1x64:
         raise ValueError(
             "description/fc1 width mismatch: 64-wide models require "
             f"{PHASE5_FC1X64_DESCRIPTION!r}, and 96-wide models must not use it"
@@ -109,6 +143,11 @@ class NNUEWriter():
         raise ValueError(
             "description/Cross width mismatch: 24-wide models require "
             f"{CROSS24_DESCRIPTION!r}, and 32-wide models must not use it"
+        )
+    if is_compact128 != (COMPACT128_DESCRIPTION == description):
+        raise ValueError(
+            "description/compact128 mismatch: the 128-input fixed-order model "
+            f"requires {COMPACT128_DESCRIPTION!r}"
         )
 
     self.buf = bytearray()
@@ -208,6 +247,8 @@ class NNUEWriter():
       layer_hash ^= PHASE5_FC_HASH_XOR
     if getattr(model.layer_stacks, 'cross_output_dimensions', 32) == 24:
       layer_hash ^= CROSS24_FC_HASH_XOR
+    if getattr(model.layer_stacks, 'l2_in_total', None) == 128:
+      layer_hash ^= COMPACT128_FC_HASH_XOR
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
@@ -432,23 +473,31 @@ class NNUEReader():
     if version != VERSION:
       raise Exception('Unsupported NNUE version: 0x%08x' % version)
 
-    remove_abs_sqr_l2 = COMPACT_DESCRIPTION in self.description
+    is_compact128 = self.description == COMPACT128_DESCRIPTION
+    remove_abs_sqr_l2 = COMPACT_DESCRIPTION in self.description or is_compact128
     phase_output_dimensions = (
         M.PHASE_CHANNELS_NO_ABS_SQR
-        if PHASE5_DESCRIPTION in self.description
+        if PHASE5_DESCRIPTION in self.description or is_compact128
         else M.PHASE_CHANNELS_LEGACY
     )
     l3_dimensions = (
         M.L3
-        if PHASE5_FC1X64_DESCRIPTION in self.description
+        if PHASE5_FC1X64_DESCRIPTION in self.description or is_compact128
         else M.L3_LEGACY
     )
-    cross_output_dimensions = 24 if CROSS24_DESCRIPTION in self.description else 32
+    cross_output_dimensions = (
+        16 if is_compact128 else
+        24 if CROSS24_DESCRIPTION in self.description else 32
+    )
     self.model = M.NNUE(
         feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2,
         phase_output_dimensions=phase_output_dimensions,
         l3_dimensions=l3_dimensions,
-        cross_output_dimensions=cross_output_dimensions)
+        cross_output_dimensions=cross_output_dimensions,
+        l2_fm_diff_indices=(
+            COMPACT128_FM_DIFF_UNITS if is_compact128 else None),
+        l2_fm_abs_raw_indices=(
+            COMPACT128_FM_ABS_RAW_UNITS if is_compact128 else None))
     fc_hash = NNUEWriter.fc_hash(self.model)
     expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
     # Accept legacy serializer output as well as the C++ SFNN fixed hash.
@@ -731,6 +780,10 @@ def main():
         l3_dimensions = int(architecture.get('fc1_output_dimensions', M.L3))
         cross_output_dimensions = int(
             architecture.get('cross_output_dimensions', 32))
+        l2_fm_diff_indices = tuple(
+            architecture.get('fm_diff_kept_source_units', range(32)))
+        l2_fm_abs_raw_indices = tuple(
+            architecture.get('fm_abs_raw_kept_source_units', range(32)))
         if l3_dimensions not in (M.L3, M.L3_LEGACY):
           raise Exception(
               'Unsupported .pt fc1 output architecture: %r'
@@ -738,11 +791,19 @@ def main():
         expected_l2_input = (
             M.L2_IN_TOTAL_WITHOUT_ABS_SQR
             - (32 - cross_output_dimensions)
+            - (32 - len(l2_fm_diff_indices))
+            - (32 - len(l2_fm_abs_raw_indices))
         )
-        if cross_output_dimensions not in (24, 32):
+        if cross_output_dimensions not in (16, 24, 32):
           raise Exception(
               'Unsupported .pt Cross output architecture: %r'
               % (cross_output_dimensions,))
+        if cross_output_dimensions == 16 and (
+            l2_fm_diff_indices != COMPACT128_FM_DIFF_UNITS
+            or l2_fm_abs_raw_indices != COMPACT128_FM_ABS_RAW_UNITS
+            or l2_input_physical != 128):
+          raise Exception(
+              'Cross16 .pt must use the fixed compact128 FM unit ordering')
         if l2_input_physical not in (M.L2_IN_TOTAL,
                                      M.L2_IN_TOTAL_WITHOUT_ABS_SQR,
                                      expected_l2_input):
@@ -759,7 +820,9 @@ def main():
                 if l2_input_physical != M.L2_IN_TOTAL
                 else M.PHASE_CHANNELS_LEGACY)),
             l3_dimensions=l3_dimensions,
-            cross_output_dimensions=cross_output_dimensions)
+            cross_output_dimensions=cross_output_dimensions,
+            l2_fm_diff_indices=l2_fm_diff_indices,
+            l2_fm_abs_raw_indices=l2_fm_abs_raw_indices)
         state_dict = saved['state_dict']
         if l2_input_physical != M.L2_IN_TOTAL:
           M.migrate_phase_proj_state_dict_to_five(state_dict)
