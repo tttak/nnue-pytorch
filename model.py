@@ -693,7 +693,7 @@ class NNUE(pl.LightningModule):
 
         self._zero_virtual_feature_weights()
 
-        self.enable_cuda_timing = True
+        self.enable_cuda_timing = False
 
         self.cuda_timing = CUDATiming()
 
@@ -710,7 +710,8 @@ class NNUE(pl.LightningModule):
         self.cuda_time_count = 0
         self._timing_this_batch = False
 
-        self.enable_torch_profiler = True
+        self.enable_torch_profiler = False
+        self.enable_ft_loss_contribution_measurement = False
         self._torch_profiler = None
         self._torch_profiler_start_batch = 350
         self._torch_profiler_num_batches = 2
@@ -1648,7 +1649,11 @@ class NNUE(pl.LightningModule):
                 + (weights["fm_couple"] * fm_couple_loss)
             )
 
-        if self.training and (self.global_step % 500 == 0):
+        if (
+            self.enable_ft_loss_contribution_measurement
+            and self.training
+            and self.global_step % 500 == 0
+        ):
             self._measure_ft_loss_contributions({
                 "base": base_loss,
                 "pairwise": weights["pairwise"] * pairwise_loss,
