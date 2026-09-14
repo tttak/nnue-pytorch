@@ -8095,6 +8095,10 @@ namespace binpack
         std::shared_ptr<Position> pos = std::make_shared<Position>();
         Move move;
         std::int16_t score;
+        // Optional probability target for experimental ranking losses.
+        // Ordinary readers initialize this from score; the normal training
+        // path therefore remains unchanged.
+        float ranking_target;
         std::uint16_t ply;
         std::int16_t result;
 
@@ -8125,6 +8129,7 @@ namespace binpack
         ret.pos->set_from_packed_sfen(psv.sfen, &ret.stateInfo, Threads.main(), mirror);
         ret.move = ret.pos->to_move(psv.move);
         ret.score = psv.score;
+        ret.ranking_target = static_cast<float>(psv.score);
         ret.ply = psv.gamePly;
         ret.result = psv.game_result;
 

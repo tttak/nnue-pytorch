@@ -11,7 +11,12 @@
 // Defines the network structure
 // 入力特徴量とネットワーク構造が定義されたヘッダをincludeする
 
-#if defined(EVAL_NNUE_HALFKP256)
+#if defined(EVAL_NNUE_HALFKP512_8_96)
+
+// Diagnostic architecture used to read the tanuki-dr5 network.
+#include "architectures/halfkp_512x2-8-96.h"
+
+#elif defined(EVAL_NNUE_HALFKP256)
 
 // 標準NNUE型。NNUE評価関数のデフォルトは、halfKP256
 

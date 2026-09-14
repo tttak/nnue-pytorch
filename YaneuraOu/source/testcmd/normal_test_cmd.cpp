@@ -12,6 +12,10 @@
 #include "../thread.h"
 #include "../search.h"
 
+#if defined(EVAL_NNUE) && defined(ENABLE_STATIC_EVAL_BIN_TOOL)
+#include "../eval/nnue/nnue_test_command.h"
+#endif
+
 #if defined(EVAL_LEARN)
 #include "../eval/evaluate_common.h"
 #endif
@@ -236,6 +240,9 @@ namespace Test
 	{
 		if (token == "genmoves")         gen_moves(pos, is);       // 現在の局面に対して指し手生成のテストを行う。
 		else if (token == "autoplay")    auto_play(pos, is);       // 連続自己対局を行う。
+#if defined(EVAL_NNUE) && defined(ENABLE_STATIC_EVAL_BIN_TOOL)
+		else if (token == "nn")          Eval::NNUE::TestCommand(pos, is);
+#endif
 #if defined (EVAL_LEARN)
 		else if (token == "evalsave")    Eval::save_eval("");      // 現在の評価関数のパラメーターをファイルに保存
 #endif

@@ -58,7 +58,12 @@ namespace Eval {
                 bool ReadParameters(std::istream& stream, const AlignedPtr<T>& pointer) {
                     std::uint32_t header;
                     stream.read(reinterpret_cast<char*>(&header), sizeof(header));
-                    if (!stream || header != T::GetHashValue()) return false;
+                    if (!stream || header != T::GetHashValue()) {
+                        sync_cout << "info string NNUE component hash mismatch: file="
+                                  << header << " expected=" << T::GetHashValue()
+                                  << sync_endl;
+                        return false;
+                    }
                     return pointer->ReadParameters(stream);
                 }
 
@@ -87,7 +92,12 @@ namespace Eval {
             stream.read(reinterpret_cast<char*>(&version), sizeof(version));
             stream.read(reinterpret_cast<char*>(hash_value), sizeof(*hash_value));
             stream.read(reinterpret_cast<char*>(&size), sizeof(size));
-            if (!stream || version != kVersion) return false;
+            if (!stream || version != kVersion) {
+                sync_cout << "info string NNUE header read failed: stream="
+                          << static_cast<bool>(stream) << " version=" << version
+                          << " expected_version=" << kVersion << sync_endl;
+                return false;
+            }
             architecture->resize(size);
             stream.read(&(*architecture)[0], size);
             return !stream.fail();
@@ -108,11 +118,39 @@ namespace Eval {
         bool ReadParameters(std::istream& stream) {
             std::uint32_t hash_value;
             std::string architecture;
-            if (!ReadHeader(stream, &hash_value, &architecture)) return false;
-            if (hash_value != kHashValue) return false;
-            if (!Detail::ReadParameters(stream, feature_transformer)) return false;
-            if (!Detail::ReadParameters(stream, network)) return false;
-            return stream && stream.peek() == std::ios::traits_type::eof();
+            if (!ReadHeader(stream, &hash_value, &architecture)) {
+                sync_cout << "info string NNUE ReadParameters: header failed"
+                          << sync_endl;
+                return false;
+            }
+            if (hash_value != kHashValue) {
+                sync_cout << "info string NNUE architecture hash mismatch: file="
+                          << hash_value << " expected=" << kHashValue
+                          << " architecture=" << architecture << sync_endl;
+                return false;
+            }
+            if (!Detail::ReadParameters(stream, feature_transformer)) {
+                sync_cout << "info string NNUE ReadParameters: feature transformer failed"
+                          << sync_endl;
+                return false;
+            }
+            if (!Detail::ReadParameters(stream, network)) {
+                sync_cout << "info string NNUE ReadParameters: network failed"
+                          << sync_endl;
+                return false;
+            }
+            if (!stream) {
+                sync_cout << "info string NNUE ReadParameters: stream failed after network"
+                          << sync_endl;
+                return false;
+            }
+            const auto trailing = stream.peek();
+            if (trailing != std::ios::traits_type::eof()) {
+                sync_cout << "info string NNUE ReadParameters: trailing/status failed,"
+                             " trailing=" << trailing << sync_endl;
+                return false;
+            }
+            return true;
         }
 
         // 評価関数パラメータを書き込む
@@ -245,6 +283,10 @@ namespace Eval {
                     const std::string file_path = Path::Combine(dir_name, file_name);
                     std::ifstream stream(file_path, std::ios::binary);
                     sync_cout << "info string loading eval file : " << file_path << sync_endl;
+#if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
+                    sync_cout << "info string engine NNUE architecture : "
+                              << NNUE::GetArchitectureString() << sync_endl;
+#endif
 
                     return NNUE::ReadParameters(stream);
                 }

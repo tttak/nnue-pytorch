@@ -339,6 +339,7 @@ struct SparseBatch
         is_white = new float[size];
         outcome = new float[size];
         score = new float[size];
+        ranking_target = new float[size];
         white = new int[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES * 2];
         black = new int[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES * 2];
         white_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
@@ -373,6 +374,7 @@ struct SparseBatch
     float* is_white;
     float* outcome;
     float* score;
+    float* ranking_target;
     int num_active_white_features;
     int num_active_black_features;
     int max_active_features;
@@ -390,6 +392,7 @@ struct SparseBatch
         delete[] is_white;
         delete[] outcome;
         delete[] score;
+        delete[] ranking_target;
         delete[] white;
         delete[] black;
         delete[] white_values;
@@ -408,6 +411,7 @@ private:
         is_white[i] = static_cast<float>(e.pos->side_to_move() == Color::BLACK);
         outcome[i] = (e.result + 1.0f) / 2.0f;
         score[i] = e.score;
+        ranking_target[i] = e.ranking_target;
         layer_stack_indices[i] = e.pos->stack_index();
         material[i] = e.material;
         kif_group_id[i] = e.kif_group_id;
@@ -440,8 +444,8 @@ struct Stream : AnyStream
 {
     using StorageType = StorageT;
 
-    Stream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
-        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, skipPredicate))
+    Stream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr) :
+        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, skipPredicate, ranking_target3_filename ? ranking_target3_filename : ""))
     {
     }
 
@@ -483,7 +487,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr) :
         BaseType(
             std::max(
                 1,
@@ -497,7 +501,8 @@ struct FeaturedBatchStream : Stream<StorageT>
             skiprate,
             mirror,
             cyclic,
-            skipPredicate
+            skipPredicate,
+            ranking_target3_filename
         ),
         m_concurrency(concurrency),
         m_batch_size(batch_size)
@@ -707,6 +712,36 @@ extern "C" {
         {
             return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, skipPredicate);
         }
+
+        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_with_ranking_target3(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+
+        std::string_view feature_set(feature_set_c);
+        if (feature_set == "HalfKA_KSDG3")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename);
+        if (feature_set == "HalfKA_KSDG3^")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename);
 
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;

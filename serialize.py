@@ -81,6 +81,10 @@ LCA24_FC_HASH_XOR = 0x00CA2400
 LCA16_FC_HASH_XOR = 0x00CA1600
 LCA24_DESCRIPTION = COMPACT128_DESCRIPTION + "-LCAx24"
 LCA16_DESCRIPTION = COMPACT128_DESCRIPTION + "-LCAx16"
+UNCERTAINTY_DESCRIPTION_SUFFIX = "-UncertaintyBucket12x64"
+UNCERTAINTY_FC_HASH_XOR = 0x00554E43
+HAO_RISK_DESCRIPTION_SUFFIX = "-HaoSearchRiskContextFc1V1"
+HAO_RISK_FC_HASH_XOR = 0x48414F52
 COMPACT128_FM_DIFF_UNITS = (
     2, 10, 14, 13, 8, 6, 5, 28, 11, 3, 1, 15,
     7, 9, 12, 4, 0, 23, 27, 24, 20, 16, 22, 17,
@@ -96,7 +100,8 @@ class NNUEWriter():
   """
   All values are stored in little endian.
   """
-  def __init__(self, model, description=None, ft_compression='none'):
+  def __init__(self, model, description=None, ft_compression='none',
+               uncertainty_head=None, hao_risk_heads=None):
     is_fc1x64 = getattr(model.layer_stacks, 'l3_dimensions', M.L3) == 64
     cross_width = getattr(model.layer_stacks, 'cross_output_dimensions', 32)
     diff_units = tuple(getattr(
@@ -143,9 +148,19 @@ class NNUEWriter():
             if getattr(model, 'remove_abs_sqr_l2', False)
             else DEFAULT_DESCRIPTION
         )
+    if (uncertainty_head is not None
+        and not description.endswith(UNCERTAINTY_DESCRIPTION_SUFFIX)):
+      description += UNCERTAINTY_DESCRIPTION_SUFFIX
+    if (hao_risk_heads is not None
+        and not description.endswith(HAO_RISK_DESCRIPTION_SUFFIX)):
+      description += HAO_RISK_DESCRIPTION_SUFFIX
+    if uncertainty_head is not None and hao_risk_heads is not None:
+      raise ValueError("legacy uncertainty and Hao risk heads are mutually exclusive")
+    architecture_description = description.removesuffix(
+        UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     description_is_fc1x64 = (
-        PHASE5_FC1X64_DESCRIPTION in description
-        or description in (COMPACT128_DESCRIPTION, LCA24_DESCRIPTION,
+        PHASE5_FC1X64_DESCRIPTION in architecture_description
+        or architecture_description in (COMPACT128_DESCRIPTION, LCA24_DESCRIPTION,
                            LCA16_DESCRIPTION)
     )
     if is_fc1x64 != description_is_fc1x64:
@@ -153,12 +168,12 @@ class NNUEWriter():
             "description/fc1 width mismatch: 64-wide models require "
             f"{PHASE5_FC1X64_DESCRIPTION!r}, and 96-wide models must not use it"
         )
-    if (cross_width == 24) != (CROSS24_DESCRIPTION in description):
+    if (cross_width == 24) != (CROSS24_DESCRIPTION in architecture_description):
         raise ValueError(
             "description/Cross width mismatch: 24-wide models require "
             f"{CROSS24_DESCRIPTION!r}, and 32-wide models must not use it"
         )
-    if is_compact128 != (description in (
+    if is_compact128 != (architecture_description in (
             COMPACT128_DESCRIPTION, LCA24_DESCRIPTION, LCA16_DESCRIPTION)):
         raise ValueError(
             "description/compact128 mismatch: the 128-input fixed-order model "
@@ -167,8 +182,9 @@ class NNUEWriter():
     expected_lca_description = (
         LCA24_DESCRIPTION if lca_width == 24 else
         LCA16_DESCRIPTION if lca_width == 16 else None)
-    if ((expected_lca_description is not None and description != expected_lca_description)
-        or (expected_lca_description is None and description in (
+    if ((expected_lca_description is not None
+         and architecture_description != expected_lca_description)
+        or (expected_lca_description is None and architecture_description in (
             LCA24_DESCRIPTION, LCA16_DESCRIPTION))):
         raise ValueError("description/LCA width mismatch")
 
@@ -178,6 +194,10 @@ class NNUEWriter():
     # because it doesn't have more restrictive bounds than these defined by quantization,
     # but it might be necessary in the future.
     fc_hash = self.fc_hash(model)
+    if uncertainty_head is not None:
+      fc_hash ^= UNCERTAINTY_FC_HASH_XOR
+    if hao_risk_heads is not None:
+      fc_hash ^= HAO_RISK_FC_HASH_XOR
     self.write_header(model, fc_hash, description)
     self.int32(SFNN_FEATURE_TRANSFORMER_HASH)
     self.write_feature_transformer(model, ft_compression)
@@ -187,8 +207,32 @@ class NNUEWriter():
     self.write_fc_layer(model, model.layer_stacks.router)
     print(f"Router Layer END [Pos: {len(self.buf)}]")
 
-    for (l1, diff_b, abs_b, cross_p, l2, output
-         , bucket_blend, lca_q, lca_k, lca_v, lca_temp_val, phase_p) in model.layer_stacks.get_coalesced_layer_stacks():
+    if uncertainty_head is not None:
+      uncertainty_weight, uncertainty_bias = uncertainty_head
+      if tuple(uncertainty_weight.shape) != (model.num_ls_buckets, 64):
+        raise ValueError("bucket-specific uncertainty weight must be [12,64]")
+      if tuple(uncertainty_bias.shape) != (model.num_ls_buckets,):
+        raise ValueError("bucket-specific uncertainty bias must be [12]")
+
+    if hao_risk_heads is not None:
+      required = {
+          'context_numeric_weight': (16, 6),
+          'context_numeric_bias': (16,),
+          'context_bucket_weight': (12, 16),
+          'context_output_weight': (16,),
+          'context_output_bias': (),
+          'fc1_weight': (12, 64), 'fc1_bias': (12,),
+          'joint_weight': (12, 80), 'joint_bias': (12,),
+          'residual_weight': (12, 64), 'residual_bias': (12,),
+      }
+      for name, shape in required.items():
+        if name not in hao_risk_heads or tuple(hao_risk_heads[name].shape) != shape:
+          raise ValueError(f"Hao risk head {name} must have shape {shape}")
+
+    for bucket_index, (l1, diff_b, abs_b, cross_p, l2, output,
+                       bucket_blend, lca_q, lca_k, lca_v, lca_temp_val,
+                       phase_p) in enumerate(
+                           model.layer_stacks.get_coalesced_layer_stacks()):
 
       self.int32(fc_hash)
 
@@ -235,8 +279,37 @@ class NNUEWriter():
       print(f"Output Layer END [Pos: {len(self.buf)}]")
 
       print(f"Bucket Blend Value: {bucket_blend}")
-      self.write_blend_param(bucket_blend)
+      serialized_blend = getattr(model, 'serialized_bucket_blend_alpha', None)
+      if serialized_blend is not None:
+        self.int32(int(serialized_blend[bucket_index]))
+        print(f"Alpha preserved exactly as: {int(serialized_blend[bucket_index])} / 16384")
+      else:
+        self.write_blend_param(bucket_blend)
       print(f"Bucket Blend END [Pos: {len(self.buf)}]")
+
+      if uncertainty_head is not None:
+        weight = to_numpy(uncertainty_weight[bucket_index]).astype(
+            np.float32, copy=False)
+        bias = float(uncertainty_bias[bucket_index])
+        self.buf.extend(weight.tobytes())
+        self.float32(bias)
+        print(f"Uncertainty Head END [Pos: {len(self.buf)}]")
+      if hao_risk_heads is not None:
+        def append_f32(value):
+          array = to_numpy(value).astype(np.float32, copy=False)
+          self.buf.extend(array.tobytes())
+        append_f32(hao_risk_heads['context_numeric_weight'])
+        append_f32(hao_risk_heads['context_numeric_bias'])
+        append_f32(hao_risk_heads['context_bucket_weight'][bucket_index])
+        append_f32(hao_risk_heads['context_output_weight'])
+        append_f32(hao_risk_heads['context_output_bias'])
+        append_f32(hao_risk_heads['fc1_weight'][bucket_index])
+        append_f32(hao_risk_heads['fc1_bias'][bucket_index])
+        append_f32(hao_risk_heads['joint_weight'][bucket_index])
+        append_f32(hao_risk_heads['joint_bias'][bucket_index])
+        append_f32(hao_risk_heads['residual_weight'][bucket_index])
+        append_f32(hao_risk_heads['residual_bias'][bucket_index])
+        print(f"Hao Search Risk Heads END [Pos: {len(self.buf)}]")
 
   def write_blend_param(self, val):
     # シグモイド適用済みの値を 0～16384 の整数で保存
@@ -503,34 +576,42 @@ class NNUEReader():
     if version != VERSION:
       raise Exception('Unsupported NNUE version: 0x%08x' % version)
 
-    is_compact128 = self.description in (
+    self.has_uncertainty_head = self.description.endswith(
+        UNCERTAINTY_DESCRIPTION_SUFFIX)
+    self.has_hao_risk_heads = self.description.endswith(
+        HAO_RISK_DESCRIPTION_SUFFIX)
+    if self.has_uncertainty_head and self.has_hao_risk_heads:
+      raise Exception('Conflicting diagnostic head suffixes')
+    architecture_description = self.description.removesuffix(
+        UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
+    is_compact128 = architecture_description in (
         COMPACT128_DESCRIPTION, LCA24_DESCRIPTION, LCA16_DESCRIPTION)
     lca_qk_indices = (
         (0, 16, 28, 22, 3, 13, 19, 29, 10, 20, 7, 5, 23, 6, 2, 31,
          14, 30, 4, 8, 24, 11, 21, 15)
-        if self.description == LCA24_DESCRIPTION else
+        if architecture_description == LCA24_DESCRIPTION else
         (0, 16, 28, 22, 3, 13, 19, 29, 10, 20, 7, 5, 23, 6, 2, 31)
-        if self.description == LCA16_DESCRIPTION else tuple(range(32)))
+        if architecture_description == LCA16_DESCRIPTION else tuple(range(32)))
     lca_value_indices = (
         (15, 9, 1, 2, 7, 5, 8, 14, 3, 11, 28, 6, 4, 24, 20, 31,
          0, 16, 23, 29, 13, 17, 27, 22)
-        if self.description == LCA24_DESCRIPTION else
+        if architecture_description == LCA24_DESCRIPTION else
         (15, 9, 1, 2, 7, 5, 8, 14, 3, 11, 28, 6, 4, 24, 20, 31)
-        if self.description == LCA16_DESCRIPTION else tuple(range(32)))
-    remove_abs_sqr_l2 = COMPACT_DESCRIPTION in self.description or is_compact128
+        if architecture_description == LCA16_DESCRIPTION else tuple(range(32)))
+    remove_abs_sqr_l2 = COMPACT_DESCRIPTION in architecture_description or is_compact128
     phase_output_dimensions = (
         M.PHASE_CHANNELS_NO_ABS_SQR
-        if PHASE5_DESCRIPTION in self.description or is_compact128
+        if PHASE5_DESCRIPTION in architecture_description or is_compact128
         else M.PHASE_CHANNELS_LEGACY
     )
     l3_dimensions = (
         M.L3
-        if PHASE5_FC1X64_DESCRIPTION in self.description or is_compact128
+        if PHASE5_FC1X64_DESCRIPTION in architecture_description or is_compact128
         else M.L3_LEGACY
     )
     cross_output_dimensions = (
         16 if is_compact128 else
-        24 if CROSS24_DESCRIPTION in self.description else 32
+        24 if CROSS24_DESCRIPTION in architecture_description else 32
     )
     self.model = M.NNUE(
         feature_set, remove_abs_sqr_l2=remove_abs_sqr_l2,
@@ -544,6 +625,10 @@ class NNUEReader():
         lca_qk_indices=lca_qk_indices,
         lca_value_indices=lca_value_indices)
     fc_hash = NNUEWriter.fc_hash(self.model)
+    if self.has_uncertainty_head:
+      fc_hash ^= UNCERTAINTY_FC_HASH_XOR
+    if self.has_hao_risk_heads:
+      fc_hash ^= HAO_RISK_FC_HASH_XOR
     expected_network_hash = fc_hash ^ feature_set.hash ^ (M.L1 * 2)
     # Accept legacy serializer output as well as the C++ SFNN fixed hash.
     if network_hash not in (SFNN_OUTER_HASH, expected_network_hash):
@@ -565,6 +650,24 @@ class NNUEReader():
     self.model.layer_stacks.router.bias.data   = router_p_tmp.bias.data[:12]
 
 
+    uncertainty_weight = torch.empty((self.model.num_ls_buckets, 64))
+    uncertainty_bias = torch.empty(self.model.num_ls_buckets)
+    serialized_bucket_blend_alpha = []
+    hao = None
+    if self.has_hao_risk_heads:
+      hao = {
+          'context_numeric_weight': torch.empty((16, 6)),
+          'context_numeric_bias': torch.empty(16),
+          'context_bucket_weight': torch.empty((self.model.num_ls_buckets, 16)),
+          'context_output_weight': torch.empty(16),
+          'context_output_bias': torch.empty(()),
+          'fc1_weight': torch.empty((self.model.num_ls_buckets, 64)),
+          'fc1_bias': torch.empty(self.model.num_ls_buckets),
+          'joint_weight': torch.empty((self.model.num_ls_buckets, 80)),
+          'joint_bias': torch.empty(self.model.num_ls_buckets),
+          'residual_weight': torch.empty((self.model.num_ls_buckets, 64)),
+          'residual_bias': torch.empty(self.model.num_ls_buckets),
+      }
     for i in range(self.model.num_ls_buckets):
       # --- 1. 一時レイヤーの定義 ---
       l1_tmp      = nn.Linear(M.L1_MAIN, 32)
@@ -618,7 +721,34 @@ class NNUEReader():
 
       # Blend Parameter (alpha)
       int_alpha = self.read_int32() 
+      serialized_bucket_blend_alpha.append(int_alpha)
       bucket_blend_val = float(int_alpha) / 16384.0
+      if self.has_uncertainty_head:
+        uncertainty_weight[i] = self.tensor(np.float32, [64])
+        uncertainty_bias[i] = struct.unpack('<f', self.f.read(4))[0]
+      if self.has_hao_risk_heads:
+        # Common tensors are deliberately duplicated in each bucket block.
+        numeric_weight = self.tensor(np.float32, [16, 6])
+        numeric_bias = self.tensor(np.float32, [16])
+        hao['context_bucket_weight'][i] = self.tensor(np.float32, [16])
+        output_weight = self.tensor(np.float32, [16])
+        output_bias = self.tensor(np.float32, [])
+        hao['fc1_weight'][i] = self.tensor(np.float32, [64])
+        hao['fc1_bias'][i] = self.tensor(np.float32, [])
+        hao['joint_weight'][i] = self.tensor(np.float32, [80])
+        hao['joint_bias'][i] = self.tensor(np.float32, [])
+        hao['residual_weight'][i] = self.tensor(np.float32, [64])
+        hao['residual_bias'][i] = self.tensor(np.float32, [])
+        if i == 0:
+          hao['context_numeric_weight'].copy_(numeric_weight)
+          hao['context_numeric_bias'].copy_(numeric_bias)
+          hao['context_output_weight'].copy_(output_weight)
+          hao['context_output_bias'].copy_(output_bias)
+        elif not (torch.equal(hao['context_numeric_weight'], numeric_weight)
+                  and torch.equal(hao['context_numeric_bias'], numeric_bias)
+                  and torch.equal(hao['context_output_weight'], output_weight)
+                  and torch.equal(hao['context_output_bias'], output_bias)):
+          raise Exception('Hao context common parameters differ between buckets')
       
       # --- 3. モデルの各パラメータ (バケット別) へ分配 ---
       # MainPath は 32次元単位
@@ -673,6 +803,13 @@ class NNUEReader():
       
       self.model.layer_stacks.output.weight.data[i:(i+1), :] = output_tmp.weight.data
       self.model.layer_stacks.output.bias.data[i:(i+1)] = output_tmp.bias.data
+
+    if self.has_uncertainty_head:
+      self.model.uncertainty_head_weight = uncertainty_weight
+      self.model.uncertainty_head_bias = uncertainty_bias
+    self.model.serialized_bucket_blend_alpha = tuple(serialized_bucket_blend_alpha)
+    if self.has_hao_risk_heads:
+      self.model.hao_risk_heads = hao
 
 
   def read_header(self, feature_set, fc_hash):
@@ -805,10 +942,42 @@ def main():
   parser.add_argument("--ft_optimize", action='store_true', dest='ft_optimize', help="Whether to perform full feature transformer optimization (ftperm.py) on the resulting network. This process is very time consuming.")
   parser.add_argument("--ft_optimize_data", default=None, type=str, dest='ft_optimize_data', help="Path to the dataset to use for FT optimization.")
   parser.add_argument("--ft_optimize_count", default=10000, type=int, dest='ft_optimize_count', help="Number of positions to use for FT optimization.")
+  parser.add_argument(
+      "--uncertainty-head", default=None, type=str,
+      help="Frozen linear-probe .pt containing state_dict.bucket_specific; "
+           "writes the diagnostic 12x64 uncertainty head into nn.bin.")
+  parser.add_argument(
+      "--hao-risk-heads", default=None, type=str,
+      help="Packaged 10M Hao context/fc1/joint/residual diagnostic heads; "
+           "writes an optional trailing block into an experiment-only nn.bin.")
   features.add_argparse_args(parser)
   args = parser.parse_args()
 
   feature_set = features.get_feature_set_from_name(args.features)
+  uncertainty_head = None
+  hao_risk_heads = None
+  if args.uncertainty_head is not None:
+    package = torch.load(args.uncertainty_head, map_location='cpu',
+                         weights_only=False)
+    try:
+      state = package['state_dict']['bucket_specific']
+      uncertainty_head = (
+          state['weight'].detach().cpu().to(torch.float32),
+          state['bias'].detach().cpu().to(torch.float32))
+    except (KeyError, TypeError, AttributeError) as exc:
+      raise ValueError(
+          "--uncertainty-head must contain state_dict.bucket_specific "
+          "weight[12,64] and bias[12]") from exc
+  if args.hao_risk_heads is not None:
+    package = torch.load(args.hao_risk_heads, map_location='cpu',
+                         weights_only=False)
+    hao_risk_heads = package.get('hao_risk_heads', package)
+    if not isinstance(hao_risk_heads, dict):
+      raise ValueError('--hao-risk-heads must contain a hao_risk_heads dict')
+    hao_risk_heads = {
+        name: torch.as_tensor(value).detach().cpu().to(torch.float32)
+        for name, value in hao_risk_heads.items()
+    }
 
   print('Converting %s to %s' % (args.source, args.target))
 
@@ -888,6 +1057,12 @@ def main():
       nnue = reader.model
       if args.description is None:
         args.description = reader.description
+      if uncertainty_head is None and reader.has_uncertainty_head:
+        uncertainty_head = (
+            reader.model.uncertainty_head_weight,
+            reader.model.uncertainty_head_bias)
+      if hao_risk_heads is None and reader.has_hao_risk_heads:
+        hao_risk_heads = reader.model.hao_risk_heads
   """
     else:
     raise Exception('Invalid network input format.')
@@ -936,7 +1111,9 @@ def main():
     torch.save(nnue, args.target)
   elif args.target.endswith(('.nnue', '.bin')):
     os.makedirs(os.path.dirname(args.target), exist_ok=True)
-    writer = NNUEWriter(nnue, args.description, ft_compression=args.ft_compression)
+    writer = NNUEWriter(
+        nnue, args.description, ft_compression=args.ft_compression,
+        uncertainty_head=uncertainty_head, hao_risk_heads=hao_risk_heads)
     with open(args.target, 'wb') as f:
       f.write(writer.buf)
   else:

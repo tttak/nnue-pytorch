@@ -792,7 +792,9 @@ constexpr bool pretty_jp = false;
 // HalfKA-KSDG3 FM 1280型
 #define LONG_EFFECT_LIBRARY
 #define USE_BOARD_EFFECT_PREV
+#if !defined(DISABLE_DISTINGUISH_GOLDS)
 #define DISTINGUISH_GOLDS
+#endif
 
 
 // -- 評価関数の種類によりエンジン名に使用する文字列を変更する。
@@ -852,4 +854,3 @@ constexpr bool pretty_jp = false;
 #define ADD_BOARD_EFFECT_BOTH_REWIND(color_,sq_,e1_,e2_) { board_effect[color_].e[sq_] += (uint8_t)e1_; board_effect[~color_].e[sq_] += (uint8_t)e2_; }
 
 #endif // ifndef _CONFIG_H_INCLUDED
-

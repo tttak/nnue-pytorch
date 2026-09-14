@@ -1,7 +1,10 @@
 import argparse
 import atexit
 import builtins
+import csv
 from datetime import datetime
+import hashlib
+import json
 import model as M
 import nnue_dataset
 import nnue_bin_dataset
@@ -20,6 +23,252 @@ from pytorch_lightning import loggers as pl_loggers
 from torch.utils.data import DataLoader, Dataset
 
 import pytorch_lightning.callbacks
+
+
+class TeacherSampleStatsCallback(pytorch_lightning.Callback):
+  """Opt-in, run-local accounting of loader streams and loss populations."""
+
+  def __init__(self, output_path, stream_files, nominal_rates):
+    super().__init__()
+    self.output_path = Path(output_path).resolve()
+    self.stream_files = [str(Path(path).resolve()) for path in stream_files]
+    self.nominal_rates = list(nominal_rates)
+    self._device_counts = None
+    self._batch_count = 0
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    group_ids = batch[10].detach().view(-1).to(dtype=torch.int64)
+    batch_counts = torch.bincount(group_ids, minlength=4)
+    self._device_counts = (
+        batch_counts if self._device_counts is None
+        else self._device_counts + batch_counts)
+    self._batch_count += 1
+
+  def _report(self, trainer):
+    if self._device_counts is None:
+      counts = [0, 0, 0, 0]
+    else:
+      counts = self._device_counts.detach().cpu().tolist()
+    total = int(sum(counts))
+    group_rows = []
+    for group in range(1, max(4, len(counts))):
+      count = int(counts[group]) if group < len(counts) else 0
+      group_rows.append({
+          "kif_group_id": group,
+          "stream": self.stream_files[group - 1] if group <= 3 else None,
+          "nominal_rate": self.nominal_rates[group - 1] if group <= 3 else None,
+          "sample_count": count,
+          "sample_rate": count / total if total else 0.0,
+          "base_loss_target": group in (1, 2),
+          "pairwise_target": group == 3,
+          "listwise_target": group == 3,
+      })
+    base_count = sum(row["sample_count"] for row in group_rows
+                     if row["base_loss_target"])
+    ranking_count = sum(row["sample_count"] for row in group_rows
+                        if row["pairwise_target"])
+    return {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "lightning_log_dir": getattr(trainer.logger, "log_dir", None),
+        "global_step": int(trainer.global_step),
+        "current_epoch": int(trainer.current_epoch),
+        "batches_observed": self._batch_count,
+        "total_samples": total,
+        "loss_population": {
+            "base_loss": {"count": base_count,
+                          "rate": base_count / total if total else 0.0,
+                          "kif_group_ids": [1, 2]},
+            "pairwise": {"count": ranking_count,
+                         "rate": ranking_count / total if total else 0.0,
+                         "kif_group_ids": [3]},
+            "listwise": {"count": ranking_count,
+                         "rate": ranking_count / total if total else 0.0,
+                         "kif_group_ids": [3]},
+        },
+        "groups": group_rows,
+    }
+
+  def save(self, trainer):
+    report = self._report(trainer)
+    self.output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = self.output_path.with_suffix(self.output_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    os.replace(temporary, self.output_path)
+    csv_path = self.output_path.with_suffix(".csv")
+    csv_temporary = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with csv_temporary.open("w", newline="", encoding="utf-8-sig") as target:
+      writer = csv.DictWriter(target, fieldnames=[
+          "kif_group_id", "stream", "nominal_rate", "sample_count",
+          "sample_rate", "base_loss_target", "pairwise_target",
+          "listwise_target"])
+      writer.writeheader()
+      writer.writerows(report["groups"])
+    os.replace(csv_temporary, csv_path)
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    self.save(trainer)
+
+  def on_fit_end(self, trainer, pl_module):
+    self.save(trainer)
+
+  def on_exception(self, trainer, pl_module, exception):
+    self.save(trainer)
+
+
+class UncertaintyTrainingStatsCallback(pytorch_lightning.Callback):
+  """Run-local uncertainty distribution and deterministic sample digest."""
+
+  def __init__(self, output_path):
+    super().__init__()
+    self.output_path = Path(output_path).resolve()
+    self.history = []
+    self._reset_epoch()
+
+  def _reset_epoch(self):
+    self.histogram = torch.zeros(256, dtype=torch.int64)
+    self.base_histogram = torch.zeros(256, dtype=torch.int64)
+    self.bucket_histogram = torch.zeros((12, 256), dtype=torch.int64)
+    self.sample_digest = hashlib.sha256()
+    self.batches = 0
+    self.loss_sums = {}
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    uncertainty = getattr(pl_module, "last_teacher_uncertainty", None)
+    if uncertainty is None:
+      return
+    u = uncertainty.detach().view(-1)
+    bucket = pl_module.layer_stacks.last_routing_indices.detach().view(-1).long()
+    q8 = torch.clamp(torch.round(u * 255.0), 0, 255).long()
+    group = batch[10].detach().view(-1).long()
+    base_mask = (group == 1) | (group == 2)
+    self.histogram += torch.bincount(q8, minlength=256).cpu()
+    self.base_histogram += torch.bincount(q8[base_mask], minlength=256).cpu()
+    combined = bucket * 256 + q8
+    self.bucket_histogram += torch.bincount(
+        combined, minlength=12 * 256).view(12, 256).cpu()
+
+    # score/material/group/ply form a compact run-local identity fingerprint.
+    # This is diagnostic-only and deliberately avoids the much larger sparse
+    # feature tensors.  Exact A/B equality detects loader sequence divergence.
+    for index in (7, 9, 10, 11):
+      value = batch[index].detach().contiguous().cpu().numpy()
+      self.sample_digest.update(value.tobytes())
+    self.batches += 1
+    components = getattr(pl_module, "last_training_loss_components", None) or {}
+    for name, value in components.items():
+      detached = value.detach().double()
+      self.loss_sums[name] = (
+          detached if name not in self.loss_sums
+          else self.loss_sums[name] + detached)
+
+  @staticmethod
+  def _histogram_summary(histogram, mid_threshold, high_threshold):
+    total = int(histogram.sum().item())
+    q = torch.arange(256, dtype=torch.float64) / 255.0
+    mean = float((histogram.double() * q).sum().item() / total) if total else 0.0
+    mid_index = int(round(mid_threshold * 255.0))
+    high_index = int(round(high_threshold * 255.0))
+    return {
+        "count": total,
+        "mean": mean,
+        "low_rate": float(histogram[:mid_index].sum().item() / total) if total else 0.0,
+        "medium_rate": float(histogram[mid_index:high_index].sum().item() / total) if total else 0.0,
+        "high_rate": float(histogram[high_index:].sum().item() / total) if total else 0.0,
+        "q8_histogram": histogram.tolist(),
+    }
+
+  def _snapshot(self, trainer, pl_module):
+    snapshot = {
+        "epoch": int(trainer.current_epoch),
+        "global_step": int(trainer.global_step),
+        "batches": self.batches,
+        "sample_sequence_sha256": self.sample_digest.hexdigest(),
+        "mean_training_losses": {
+            name: float((value / max(1, self.batches)).cpu().item())
+            for name, value in self.loss_sums.items()
+        },
+        "all": self._histogram_summary(
+            self.histogram,
+            pl_module.uncertainty_mid_threshold,
+            pl_module.uncertainty_high_threshold),
+        "base_population": self._histogram_summary(
+            self.base_histogram,
+            pl_module.uncertainty_mid_threshold,
+            pl_module.uncertainty_high_threshold),
+        "bucket": {
+            f"B{i:02d}": self._histogram_summary(
+                self.bucket_histogram[i],
+                pl_module.uncertainty_mid_threshold,
+                pl_module.uncertainty_high_threshold)
+            for i in range(12)
+        },
+    }
+    self.history.append(snapshot)
+
+  def save(self):
+    self.output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = self.output_path.with_suffix(self.output_path.suffix + ".tmp")
+    report = {"epochs": self.history}
+    temporary.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    os.replace(temporary, self.output_path)
+
+  def on_train_epoch_end(self, trainer, pl_module):
+    self._snapshot(trainer, pl_module)
+    self.save()
+    self._reset_epoch()
+
+  def on_fit_end(self, trainer, pl_module):
+    if self.batches:
+      self._snapshot(trainer, pl_module)
+      self._reset_epoch()
+    self.save()
+
+  def on_exception(self, trainer, pl_module, exception):
+    if self.batches:
+      self._snapshot(trainer, pl_module)
+      self._reset_epoch()
+    self.save()
+
+
+class PositionMilestoneCheckpointCallback(pytorch_lightning.Callback):
+  """Opt-in intra-epoch checkpoints at approximate sample-count milestones."""
+
+  def __init__(self, output_dir, milestones):
+    super().__init__()
+    self.output_dir = Path(output_dir).resolve()
+    self.milestones = sorted(set(int(value) for value in milestones))
+    if not self.milestones or self.milestones[0] <= 0:
+      raise ValueError("position milestones must be positive")
+    self.samples_seen = 0
+    self.saved = []
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    self.samples_seen += int(batch[7].numel())
+    while len(self.saved) < len(self.milestones):
+      target = self.milestones[len(self.saved)]
+      if self.samples_seen < target:
+        break
+      self.output_dir.mkdir(parents=True, exist_ok=True)
+      path = self.output_dir / f"milestone_{target}.ckpt"
+      temporary = path.with_suffix(path.suffix + ".tmp")
+      trainer.save_checkpoint(str(temporary), weights_only=True)
+      os.replace(temporary, path)
+      self.saved.append({
+          "target_positions": target,
+          "actual_positions": self.samples_seen,
+          "global_step": int(trainer.global_step),
+          "checkpoint": str(path),
+      })
+      manifest = self.output_dir / "milestone_manifest.json"
+      manifest.write_text(
+          json.dumps({"milestones": self.saved}, ensure_ascii=False, indent=2) + "\n",
+          encoding="utf-8")
+      print(
+          f"Position milestone saved: target={target}, "
+          f"actual={self.samples_seen}, path={path}", flush=True)
 
 
 class GracefulInterruptController:
@@ -231,12 +480,12 @@ class TextLogPrintTee:
       self._stream.close()
       self._closed = True
 
-def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror):
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
   train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename1, train_filename2, train_filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
                                                    random_fen_skipping=random_fen_skipping, device=main_device)
   # num_workers has to be 0 for sparse, and 1 for dense
@@ -334,6 +583,12 @@ def main():
   parser.add_argument("--log_every_n_steps", "--log-every-n-steps", default=50,
                       type=int, dest="log_every_n_steps",
                       help="How often Lightning logs training metrics.")
+  parser.add_argument(
+      "--limit-val-batches", default=1.0, type=float,
+      help="Lightning validation batch limit (default: full validation).")
+  parser.add_argument(
+      "--num-sanity-val-steps", default=2, type=int,
+      help="Lightning validation sanity steps (default: 2).")
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--start-lambda", default=None, type=float, dest='start_lambda', help="lambda to use at first epoch.")
@@ -347,6 +602,9 @@ def main():
   parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping', help="If enabled positions that are bad training targets will be skipped during loading. Default: False")
   parser.add_argument("--random-fen-skipping", default=0, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
+  parser.add_argument(
+      "--resume-training-state", dest="resume_training_state",
+      help="Resume model, optimizer, scheduler, epoch and global step from a Lightning .ckpt.")
   parser.add_argument("--epoch-size", default=1000000, type=int, dest='epoch_size', help="epoch size.")
   parser.add_argument("--in-scaling", default=240, type=int, dest='in_scaling', help="in-scaling.")
   parser.add_argument("--out-scaling", default=280, type=int, dest='out_scaling', help="out-scaling.")
@@ -360,9 +618,49 @@ def main():
   parser.add_argument("--mirror", default=0.00, type=float, dest='mirror', help="mirror")
   parser.add_argument("--network-save-period", type=int, default=1000000000, dest='network_save_period', help="Number of epochs between network snapshots. None to disable.")
   parser.add_argument("--text-log", dest="text_log", help="Duplicate ordinary print() output to this UTF-8 text file; progress bars remain terminal-only.")
+  parser.add_argument(
+      "--teacher-sample-report", dest="teacher_sample_report",
+      help="Write opt-in per-stream and per-loss sample counts as JSON/CSV.")
+  parser.add_argument(
+      "--ranking-target3", dest="ranking_target3",
+      help=("Optional float32 score-equivalent sidecar aligned one-to-one "
+            "with train3. Only pairwise/listwise targets use it."))
+  parser.add_argument(
+      "--ranking-disagreement-weight", type=float, default=1.0,
+      dest="ranking_disagreement_weight",
+      help=("Relative pair/list contribution when raw and alternate ranking "
+            "targets disagree (default: 1.0)."))
+  parser.add_argument(
+      "--uncertainty-head", dest="uncertainty_head",
+      help="Frozen bucket-specific fc1-64 teacher-disagreement probe (.pt).")
+  parser.add_argument(
+      "--uncertainty-base-weight-strength", type=float, default=0.0,
+      dest="uncertainty_base_weight_strength",
+      help="Training-only base sample weight w(u)=1-strength*u (default: 0).")
+  parser.add_argument(
+      "--uncertainty-report", dest="uncertainty_report",
+      help="Write run-local uncertainty distributions and sample digests as JSON.")
+  parser.add_argument(
+      "--enable-ft-loss-contribution-measurement", action="store_true",
+      dest="enable_ft_loss_contribution_measurement",
+      help="Enable the existing sparse 500-step FT gradient/cosine diagnostic.")
+  parser.add_argument(
+      "--position-milestones", dest="position_milestones",
+      help="Comma-separated sample counts for opt-in intra-epoch checkpoints.")
+  parser.add_argument(
+      "--position-milestone-dir", dest="position_milestone_dir",
+      help="Directory for --position-milestones checkpoints.")
 
   features.add_argparse_args(parser)
   args = parser.parse_args()
+
+  if args.resume_training_state:
+    if args.resume_from_model and (
+        Path(args.resume_from_model).resolve()
+        != Path(args.resume_training_state).resolve()):
+      raise ValueError(
+          "--resume-from-model and --resume-training-state must name the same checkpoint")
+    args.resume_from_model = args.resume_training_state
 
   text_log_tee = (
       TextLogPrintTee(args.text_log, started_at) if args.text_log else None)
@@ -385,6 +683,29 @@ def main():
     raise ValueError(f"The sum of train1-rate and train2-rate ({rates_sum}) must be less than 1.0")
   if args.skiprate < 1.0:
     raise ValueError(f"--skiprate must be 1.0 or greater (got {args.skiprate})")
+  if args.ranking_target3:
+    ranking_path = Path(args.ranking_target3)
+    if not ranking_path.exists():
+      raise FileNotFoundError(ranking_path)
+    expected = Path(args.train3).stat().st_size // 40 * 4
+    if ranking_path.stat().st_size != expected:
+      raise ValueError(
+          "--ranking-target3 must contain one float32 per train3 record: "
+          f"expected {expected} bytes, got {ranking_path.stat().st_size}")
+    if args.smart_fen_skipping or args.random_fen_skipping:
+      raise ValueError(
+          "--ranking-target3 requires smart/random fen skipping disabled")
+  if not 0.0 < args.ranking_disagreement_weight <= 1.0:
+    raise ValueError("--ranking-disagreement-weight must be in (0, 1]")
+  if not 0.0 <= args.uncertainty_base_weight_strength < 1.0:
+    raise ValueError("--uncertainty-base-weight-strength must be in [0, 1)")
+  if (args.uncertainty_base_weight_strength > 0.0 or args.uncertainty_report) \
+      and not args.uncertainty_head:
+    raise ValueError(
+        "--uncertainty-head is required when weighting or reporting is enabled")
+  if bool(args.position_milestones) != bool(args.position_milestone_dir):
+    raise ValueError(
+        "--position-milestones and --position-milestone-dir must be used together")
 
   feature_set = features.get_feature_set_from_name(args.features)
 
@@ -500,7 +821,28 @@ def main():
 
     # 「.ckpt」の場合
     else:
-      nnue = M.NNUE.load_from_checkpoint(args.resume_from_model, feature_set=feature_set, strict=False)
+      resume_overrides = {}
+      if args.resume_training_state:
+        # Lightning restores tensors/optimizer/loop state through ckpt_path,
+        # while these constructor values describe the continuation segment.
+        resume_overrides = {
+            "start_lambda": start_lambda,
+            "max_epoch": max_epoch,
+            "end_lambda": end_lambda,
+            "gamma": args.gamma,
+            "lr": args.lr,
+            "epoch_size": args.epoch_size,
+            "batch_size": args.batch_size,
+            "in_scaling": args.in_scaling,
+            "out_scaling": args.out_scaling,
+            "offset": args.offset,
+            "offset1": args.offset1,
+            "offset2": args.offset2,
+            "adjust_loss": args.adjust_loss,
+        }
+      nnue = M.NNUE.load_from_checkpoint(
+          args.resume_from_model, feature_set=feature_set, strict=False,
+          **resume_overrides)
 
       """
       # 1. まず、新しい構造のモデルを普通に作る
@@ -544,6 +886,26 @@ def main():
     nnue.gamma = args.gamma
     nnue.lr = args.lr
 
+  nnue.ranking_disagreement_weight = args.ranking_disagreement_weight
+  if args.ranking_target3:
+    print(
+        "Alternate ranking target enabled: "
+        f"disagreement_weight={args.ranking_disagreement_weight:.3f}"
+    )
+
+  if args.uncertainty_head:
+    nnue.configure_uncertainty_base_weighting(
+        args.uncertainty_head,
+        strength=args.uncertainty_base_weight_strength)
+    print(
+        "Frozen uncertainty head enabled: "
+        f"strength={args.uncertainty_base_weight_strength:.3f}, "
+        f"path={Path(args.uncertainty_head).resolve()}"
+    )
+  nnue.enable_ft_loss_contribution_measurement = (
+      args.enable_ft_loss_contribution_measurement)
+  nnue.capture_training_loss_components = bool(args.uncertainty_report)
+
   print("Feature set: {}".format(feature_set.name))
   print("Num real features: {}".format(feature_set.num_real_features))
   print("Num virtual features: {}".format(feature_set.num_virtual_features))
@@ -581,16 +943,36 @@ def main():
       every_n_epochs=args.network_save_period,
       log_dir=tb_logger.log_dir,
       interrupt_controller=interrupt_controller)
+  callbacks = [checkpoint_callback]
+  if args.teacher_sample_report:
+    teacher_sample_callback = TeacherSampleStatsCallback(
+        args.teacher_sample_report,
+        [args.train1, args.train2, args.train3],
+        [args.train1_rate, args.train2_rate,
+         1.0 - args.train1_rate - args.train2_rate])
+    # Save the small diagnostic before a possibly long interrupt checkpoint.
+    callbacks.insert(0, teacher_sample_callback)
+  if args.uncertainty_report:
+    callbacks.insert(0, UncertaintyTrainingStatsCallback(args.uncertainty_report))
+  if args.position_milestones:
+    milestones = [
+        int(value.strip()) for value in args.position_milestones.split(",")
+        if value.strip()
+    ]
+    callbacks.append(PositionMilestoneCheckpointCallback(
+        args.position_milestone_dir, milestones))
   trainer_device_args = (
       {"accelerator": "gpu", "devices": args.gpus}
       if args.gpus > 0
       else {"accelerator": "cpu", "devices": 1})
   trainer = pl.Trainer(
-      callbacks=[checkpoint_callback],
+      callbacks=callbacks,
       logger=tb_logger,
       max_epochs=args.max_epochs,
       default_root_dir=args.default_root_dir,
       log_every_n_steps=args.log_every_n_steps,
+      limit_val_batches=args.limit_val_batches,
+      num_sanity_val_steps=args.num_sanity_val_steps,
       **trainer_device_args)
 
   main_device = str(trainer.strategy.root_device)
@@ -600,13 +982,13 @@ def main():
     train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3)
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()
   try:
     try:
-      trainer.fit(nnue, train, val)
+      trainer.fit(nnue, train, val, ckpt_path=args.resume_training_state)
     except SystemExit:
       # Lightning 2.6 calls on_exception(KeyboardInterrupt), performs its own
       # graceful teardown, then raises SystemExit(1).  Once our callback has

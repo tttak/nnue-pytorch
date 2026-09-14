@@ -427,7 +427,7 @@ void is_ready(bool skipCorruptCheck)
 	// 起動時に時間のかかる処理をしてしまうと将棋所がタイムアウト判定をして、思考エンジンとしての認識をリタイアしてしまう。
 	if (!USI::load_eval_finished)
 	{
-#if 0
+#if defined(ENABLE_STATIC_EVAL_BIN_TOOL)
 		// 評価関数の読み込み
 		Eval::load_eval();
 

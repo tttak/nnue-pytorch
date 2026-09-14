@@ -8,6 +8,8 @@
 #include <fstream>
 #include <string>
 #include <memory>
+#include <numeric>
+#include <stdexcept>
 
 #include <ppl.h>
 
@@ -64,13 +66,15 @@ namespace training_data {
         static constexpr auto openmode = std::ios::in | std::ios::binary;
         static inline const std::string extension = "bin";
 
-        BinSfenInputStream(std::string filename1, std::string filename2, std::string filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate) :
+        BinSfenInputStream(std::string filename1, std::string filename2, std::string filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, std::string ranking_target3_filename = {}) :
             m_stream1(filename1, openmode),
             m_stream2(filename2, openmode),
             m_stream3(filename3, openmode),
+            m_ranking_target3_stream(ranking_target3_filename, openmode),
             m_filename1(filename1),
             m_filename2(filename2),
             m_filename3(filename3),
+            m_ranking_target3_filename(std::move(ranking_target3_filename)),
             m_train1_rate(train1_rate),
             m_train2_rate(train2_rate),
             m_skiprate(skiprate),
@@ -81,6 +85,8 @@ namespace training_data {
             m_cyclic(cyclic),
             m_skipPredicate(std::move(skipPredicate))
         {
+            if (!m_ranking_target3_filename.empty() && !m_ranking_target3_stream)
+                throw std::runtime_error("cannot open ranking target3 probability file");
         }
 
         std::optional<TrainingDataEntry> next() override
@@ -139,6 +145,9 @@ namespace training_data {
             std::vector<Learner::PackedSfenValue> packedSfenValues1(m1);
             std::vector<Learner::PackedSfenValue> packedSfenValues2(m2);
             std::vector<Learner::PackedSfenValue> packedSfenValues3(m3);
+            std::vector<float> rankingTargets3;
+            if (!m_ranking_target3_filename.empty())
+                rankingTargets3.resize(m3);
 
             for (int i=0;i<2;i++) {
                 if (m_stream1.read(reinterpret_cast<char*>(&packedSfenValues1[0]), sizeof(Learner::PackedSfenValue) * m1)) {
@@ -162,17 +171,29 @@ namespace training_data {
 
             for (int i=0;i<2;i++) {
                 if (m_stream3.read(reinterpret_cast<char*>(&packedSfenValues3[0]), sizeof(Learner::PackedSfenValue) * m3)) {
+                    if (!m_ranking_target3_filename.empty()
+                        && !m_ranking_target3_stream.read(
+                            reinterpret_cast<char*>(rankingTargets3.data()),
+                            sizeof(float) * m3)) {
+                        throw std::runtime_error(
+                            "ranking target3 file is shorter than train3");
+                    }
                     break;
                 }
                 else {
                     std::cout << "fill()!!" << "m_stream3 = std::fstream(m_filename3, openmode);" << m_filename3 << std::endl;
                     m_stream3 = std::fstream(m_filename3, openmode);
+                    if (!m_ranking_target3_filename.empty())
+                        m_ranking_target3_stream = std::fstream(
+                            m_ranking_target3_filename, openmode);
                 }
             }
 
             std::shuffle(packedSfenValues1.begin(), packedSfenValues1.end(), m_rand);
             std::shuffle(packedSfenValues2.begin(), packedSfenValues2.end(), m_rand);
-            std::shuffle(packedSfenValues3.begin(), packedSfenValues3.end(), m_rand);
+            std::vector<std::size_t> order3(m3);
+            std::iota(order3.begin(), order3.end(), std::size_t{0});
+            std::shuffle(order3.begin(), order3.end(), m_rand);
 
             PRNG prng;
             float mirror = m_mirror;
@@ -187,10 +208,15 @@ namespace training_data {
                 const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
                 work_vec[n1+i] = packedSfenValueToTrainingDataEntry(packedSfenValues2[i], mir, 2);
             });
-            concurrency::parallel_for(size_t(0), n3, [&work_vec, &packedSfenValues3, &n1, &n2, &prng, &mirror](size_t i)
+            concurrency::parallel_for(size_t(0), n3, [&work_vec, &packedSfenValues3, &rankingTargets3, &order3, &n1, &n2, &prng, &mirror, this](size_t i)
             {
                 const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
-                work_vec[n1+n2+i] = packedSfenValueToTrainingDataEntry(packedSfenValues3[i], mir, 3);
+                const auto source_index = order3[i];
+                work_vec[n1+n2+i] = packedSfenValueToTrainingDataEntry(
+                    packedSfenValues3[source_index], mir, 3);
+                if (!m_ranking_target3_filename.empty())
+                    work_vec[n1+n2+i].ranking_target =
+                        rankingTargets3[source_index];
             });
 
             int j = n - remain1;
@@ -221,9 +247,11 @@ namespace training_data {
         std::fstream m_stream1;
         std::fstream m_stream2;
         std::fstream m_stream3;
+        std::fstream m_ranking_target3_stream;
         std::string m_filename1;
         std::string m_filename2;
         std::string m_filename3;
+        std::string m_ranking_target3_filename;
         float m_train1_rate;
         float m_train2_rate;
         float m_skiprate;
@@ -236,19 +264,19 @@ namespace training_data {
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
     };
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, const std::string& ranking_target3_filename = {})
     {
         if (has_extension(filename1, BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate));
+            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate), ranking_target3_filename);
 
         return nullptr;
     }
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr)
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, const std::string& ranking_target3_filename = {})
     {
         // TODO (low priority): optimize and parallelize .bin reading.
         if (has_extension(filename1, BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate));
+            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate), ranking_target3_filename);
 
         return nullptr;
     }

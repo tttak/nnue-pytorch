@@ -423,6 +423,11 @@ class LayerStacks(nn.Module):
         # The default keeps production training free of the large diagnostic tensor.
         self.capture_cross_diagnostics = False
         self.last_cross_feat_all = None
+        # Experiment-only capture used by teacher-disagreement confidence
+        # weighting.  It is disabled unless train.py explicitly loads a frozen
+        # probe head, so the ordinary production training path pays no cost.
+        self.capture_uncertainty_fc1 = False
+        self.last_uncertainty_fc1 = None
 
         self.idx_offset = None
         self._init_layers()
@@ -726,6 +731,13 @@ class LayerStacks(nn.Module):
         b_l2 = self.l2.bias.view(self.count, self.l3_dimensions)
         l2c_all = torch.einsum("bci,coi->bco", l2_input_all, W_l2) + b_l2
         l2x_all = torch.clamp(l2c_all, 0.0, 1.0)
+        if self.capture_uncertainty_fc1:
+            batch_indices = torch.arange(
+                l2x_all.shape[0], device=l2x_all.device
+            )
+            self.last_uncertainty_fc1 = l2x_all[
+                batch_indices, router_indices
+            ].detach()
 
         # ★ einsum による Output層の計算 [B, 12, L3] -> [B, 12, 1]
         W_out = self.output.weight.view(self.count, 1, -1)  # [12, 1, L3]
@@ -823,6 +835,9 @@ class LayerStacks(nn.Module):
 class NNUE(pl.LightningModule):
     def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None, lca_qk_indices=None, lca_value_indices=None):
         super(NNUE, self).__init__()
+        # Optional training-only attenuation for pairs whose raw teacher and
+        # alternate ranking teacher order disagree.  1.0 is exactly legacy.
+        self.ranking_disagreement_weight = 1.0
         self.num_ls_buckets = NUM_LS_BUCKETS
 
         self.input = DoubleFeatureTransformerSlice(feature_set.num_features, L1_MAIN, FM_DIM)
@@ -967,6 +982,81 @@ class NNUE(pl.LightningModule):
         # reproduces the former every-batch TensorBoard/statistics behavior for
         # A/B measurement without changing any loss or gradient expression.
         self.diagnostic_log_interval = 500
+
+        # Frozen teacher-disagreement head.  Non-persistent buffers follow the
+        # Lightning device without changing checkpoints, serializer output, or
+        # the NNUE architecture.  configure_uncertainty_base_weighting() is the
+        # only opt-in entry point.
+        self.register_buffer(
+            "_uncertainty_head_weight", torch.empty(0), persistent=False
+        )
+        self.register_buffer(
+            "_uncertainty_head_bias", torch.empty(0), persistent=False
+        )
+        self.uncertainty_base_weight_strength = 0.0
+        self.uncertainty_mid_threshold = 0.08444935
+        self.uncertainty_high_threshold = 0.13851012
+        self.last_teacher_uncertainty = None
+        self.last_uncertainty_weight = None
+        self.capture_training_loss_components = False
+        self.last_training_loss_components = None
+        # Experiment-only escape hatch for sparse gradient diagnostics.  Raw
+        # tensors retain the autograd graph, so this must remain disabled in
+        # ordinary training.
+        self.capture_training_loss_tensors = False
+        self.last_training_loss_tensors = None
+
+    def configure_uncertainty_base_weighting(
+        self,
+        head_path,
+        strength=0.0,
+        mid_threshold=0.08444935,
+        high_threshold=0.13851012,
+    ):
+        """Load the frozen bucket-specific fc1-64 probe used by experiment 31."""
+        if not 0.0 <= strength < 1.0:
+            raise ValueError("uncertainty base weight strength must be in [0, 1)")
+        if self.layer_stacks.l3_dimensions != 64:
+            raise ValueError("uncertainty weighting requires fc1 width 64")
+
+        package = torch.load(head_path, map_location="cpu", weights_only=False)
+        try:
+            state = package["state_dict"]["bucket_specific"]
+            weight = state["weight"].detach().to(dtype=torch.float32)
+            bias = state["bias"].detach().to(dtype=torch.float32)
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError(
+                "uncertainty head must contain state_dict.bucket_specific weight/bias"
+            ) from exc
+        expected_weight = (self.num_ls_buckets, self.layer_stacks.l3_dimensions)
+        if tuple(weight.shape) != expected_weight or tuple(bias.shape) != (self.num_ls_buckets,):
+            raise ValueError(
+                "uncertainty head shape mismatch: "
+                f"weight={tuple(weight.shape)}, bias={tuple(bias.shape)}, "
+                f"expected={expected_weight}/{(self.num_ls_buckets,)}"
+            )
+
+        device = self.device
+        self._uncertainty_head_weight = weight.to(device=device)
+        self._uncertainty_head_bias = bias.to(device=device)
+        self.uncertainty_base_weight_strength = float(strength)
+        self.uncertainty_mid_threshold = float(mid_threshold)
+        self.uncertainty_high_threshold = float(high_threshold)
+        self.layer_stacks.capture_uncertainty_fc1 = True
+        for tensor in (self._uncertainty_head_weight, self._uncertainty_head_bias):
+            tensor.requires_grad_(False)
+
+    def _predict_teacher_uncertainty(self, active_indices):
+        if self._uncertainty_head_weight.numel() == 0:
+            return None
+        activation = self.layer_stacks.last_uncertainty_fc1
+        if activation is None:
+            raise RuntimeError("uncertainty fc1 activation was not captured")
+        bucket = active_indices.view(-1).to(dtype=torch.long)
+        weight = self._uncertainty_head_weight.index_select(0, bucket)
+        bias = self._uncertainty_head_bias.index_select(0, bucket)
+        with torch.no_grad():
+            return torch.sigmoid((activation * weight).sum(dim=-1) + bias)
 
     def _collect_detailed_diagnostics_this_step(self):
         return (
@@ -1659,7 +1749,12 @@ class NNUE(pl.LightningModule):
             material,
             kif_group_id,
             ply,
+            *optional_ranking_target,
         ) = batch
+        ranking_score = (
+            optional_ranking_target[0]
+            if optional_ranking_target else score
+        )
         self.print_mem("After batch")
 
         # ==========================================
@@ -1690,6 +1785,61 @@ class NNUE(pl.LightningModule):
         active_indices = getattr(
             self.layer_stacks, "last_routing_indices", layer_stack_indices
         )
+        teacher_uncertainty = self._predict_teacher_uncertainty(active_indices)
+        uncertainty_sample_weight = None
+        if teacher_uncertainty is not None:
+            self.last_teacher_uncertainty = teacher_uncertainty.detach()
+            if self.training and self.uncertainty_base_weight_strength > 0.0:
+                uncertainty_sample_weight = (
+                    1.0
+                    - self.uncertainty_base_weight_strength
+                    * teacher_uncertainty.detach()
+                )
+            self.last_uncertainty_weight = (
+                uncertainty_sample_weight.detach()
+                if uncertainty_sample_weight is not None
+                else torch.ones_like(teacher_uncertainty)
+            )
+
+            if self.training and self.global_step % self.diagnostic_log_interval == 0:
+                with torch.no_grad():
+                    low_rate = (
+                        teacher_uncertainty < self.uncertainty_mid_threshold
+                    ).float().mean()
+                    high_rate = (
+                        teacher_uncertainty >= self.uncertainty_high_threshold
+                    ).float().mean()
+                    bucket_count = torch.bincount(
+                        active_indices.view(-1).long(), minlength=self.num_ls_buckets
+                    )
+                    bucket_sum = torch.zeros(
+                        self.num_ls_buckets,
+                        device=teacher_uncertainty.device,
+                        dtype=teacher_uncertainty.dtype,
+                    ).scatter_add_(
+                        0, active_indices.view(-1).long(), teacher_uncertainty
+                    )
+                    bucket_mean = bucket_sum / bucket_count.clamp_min(1)
+                    packed = torch.cat([
+                        teacher_uncertainty.mean().view(1),
+                        teacher_uncertainty.std().view(1),
+                        low_rate.view(1),
+                        high_rate.view(1),
+                        bucket_mean,
+                    ]).detach().cpu().tolist()
+                print(
+                    "[Uncertainty confidence] "
+                    f"mean={packed[0]:.6f} std={packed[1]:.6f} "
+                    f"low={packed[2]:.3%} top10-threshold={packed[3]:.3%} "
+                    f"strength={self.uncertainty_base_weight_strength:.3f}"
+                )
+                print(
+                    "[Uncertainty confidence buckets] "
+                    + " ".join(
+                        f"B{i:02d}={packed[4+i]:.5f}"
+                        for i in range(self.num_ls_buckets)
+                    )
+                )
 
         # ==========================================
         # Phase 2: スコアから勝率(qf, pf, pt)への変換
@@ -1707,6 +1857,26 @@ class NNUE(pl.LightningModule):
 
             pt = pf * actual_lambda + outcome * (1.0 - actual_lambda)
 
+            # Experimental role-separated training may provide a second score
+            # for ranking losses.  It is never used by base/router/distill/aux
+            # losses.  With no alternate target this is exactly pt/score.
+            if optional_ranking_target:
+                ranking_p = (
+                    ranking_score - self.offset1
+                ) / self.out_scaling
+                ranking_pm = (
+                    -ranking_score - self.offset2
+                ) / self.out_scaling
+                ranking_pf = 0.5 * (
+                    1.0 + ranking_p.sigmoid() - ranking_pm.sigmoid()
+                )
+                ranking_pt = (
+                    ranking_pf * actual_lambda
+                    + outcome * (1.0 - actual_lambda)
+                )
+            else:
+                ranking_pt = pt
+
         # ==========================================
         # Phase 3: 各種 Loss の計算
         # ==========================================
@@ -1718,6 +1888,7 @@ class NNUE(pl.LightningModule):
                 gradient_firewall(qf, self.base_ft_grad_scale),
                 pf,
                 kif_group_id_flat,
+                uncertainty_sample_weight,
             )
         self.print_mem("After Base Loss")
 
@@ -1799,6 +1970,8 @@ class NNUE(pl.LightningModule):
                 pt,
                 qf,
                 score,
+                ranking_pt,
+                ranking_score,
                 scorenet,
                 active_indices,
                 material,
@@ -1894,6 +2067,28 @@ class NNUE(pl.LightningModule):
                 + (weights["fm_residual"] * fm_residual_loss)
                 + (weights["fm_couple"] * fm_couple_loss)
             )
+        if self.training and self.capture_training_loss_components:
+            self.last_training_loss_components = {
+                "total": loss.detach(),
+                "base": base_loss.detach(),
+                "pairwise": pairwise_loss.detach(),
+                "listwise": listwise_loss.detach(),
+                "router_load": router_load_loss.detach(),
+                "router_ce": router_ce_loss.detach(),
+                "bucket_distill": bucket_distill_loss.detach(),
+                "ema_distill": ema_distill_loss.detach(),
+                "phase": phase_penalty.detach(),
+                "main_aux": main_aux_loss.detach(),
+                "fm_residual": fm_residual_loss.detach(),
+                "fm_couple": fm_couple_loss.detach(),
+            }
+        if self.training and self.capture_training_loss_tensors:
+            self.last_training_loss_tensors = {
+                "total": loss,
+                "base": base_loss,
+                "pairwise": weights["pairwise"] * pairwise_loss,
+                "listwise": weights["listwise"] * listwise_loss,
+            }
 
         if (
             self.enable_ft_loss_contribution_measurement
@@ -2262,7 +2457,9 @@ class NNUE(pl.LightningModule):
             return lambda_dict[loss_type]
         return self.start_lambda + (self.end_lambda - self.start_lambda) * (self.current_epoch / self.max_epoch)
 
-    def _compute_base_loss(self, pt, qf, pf, kif_group_id_flat):
+    def _compute_base_loss(
+        self, pt, qf, pf, kif_group_id_flat, sample_weight=None
+    ):
         error = torch.abs(pt - qf)
 
         # 基本loss
@@ -2286,6 +2483,14 @@ class NNUE(pl.LightningModule):
         weights = 1.0 + 0.5 * pf_eq
 
         weights_flat = weights.view(-1)
+        if sample_weight is not None:
+            # Treat uncertainty confidence as a true per-sample weight.  It is
+            # composed with the existing equilibrium weight before both the
+            # numerator and denominator, leaving every loss element and mask
+            # operation in its existing order.
+            if sample_weight.numel() != weights_flat.numel():
+                raise ValueError("uncertainty sample weight shape mismatch")
+            weights_flat = weights_flat * sample_weight.view(-1)
 
         base_loss_mask = (
             (kif_group_id_flat == 1)
@@ -2920,7 +3125,10 @@ class NNUE(pl.LightningModule):
 
         return distill_loss
 
-    def _prepare_sorted_data(self, pairwise_indices, pt, qf, score, scorenet, active_indices, material, ply):
+    def _prepare_sorted_data(
+        self, pairwise_indices, pt, qf, score, ranking_pt,
+        ranking_score, scorenet, active_indices, material, ply
+    ):
         if pairwise_indices.numel() <= 1:
             return None
 
@@ -2931,6 +3139,9 @@ class NNUE(pl.LightningModule):
         ):
             qf_p = qf_flat.index_select(0, pairwise_indices)
         score_p = score.view(-1).index_select(0, pairwise_indices)
+        ranking_pt_p = ranking_pt.view(-1).index_select(0, pairwise_indices)
+        ranking_score_p = ranking_score.view(-1).index_select(
+            0, pairwise_indices)
         scorenet_flat = scorenet.view(-1)
         with torch.profiler.record_function(
             "NNUE/index_select_prepare_pairwise_scorenet"
@@ -2963,6 +3174,8 @@ class NNUE(pl.LightningModule):
         with torch.profiler.record_function("NNUE/index_prepare_sorted_qf"):
             qf_sorted = qf_p[sorted_indices]
         score_sorted = score_p[sorted_indices]
+        ranking_pt_sorted = ranking_pt_p[sorted_indices]
+        ranking_score_sorted = ranking_score_p[sorted_indices]
         with torch.profiler.record_function(
             "NNUE/index_prepare_sorted_scorenet"
         ):
@@ -2975,6 +3188,8 @@ class NNUE(pl.LightningModule):
             'pt': pt_sorted,
             'qf': qf_sorted,
             'score': score_sorted,
+            'ranking_pt': ranking_pt_sorted,
+            'ranking_score': ranking_score_sorted,
             'scorenet': scorenet_sorted,
             'lsind': lsind_sorted,
             'material': material_sorted,
@@ -3008,7 +3223,8 @@ class NNUE(pl.LightningModule):
 
         pt_s = sorted_data['pt']
         qf_s = gradient_firewall(sorted_data['qf'], self.pairwise_ft_grad_scale)
-        score_s = sorted_data['score']
+        score_s = sorted_data['ranking_score']
+        ranking_pt_s = sorted_data['ranking_pt']
         scorenet_s = gradient_firewall(
             sorted_data['scorenet'],
             self.pairwise_ft_grad_scale,
@@ -3016,6 +3232,7 @@ class NNUE(pl.LightningModule):
         lsind_s, mat_s, ply_s = sorted_data['lsind'], sorted_data['material'], sorted_data['ply']
 
         total_pairwise_loss = torch.tensor(0.0, device=device)
+        total_pairwise_weight = torch.tensor(0.0, device=device)
         total_valid_pairs = 0
         all_pred_diffs, all_target_directions, all_value_gaps = [], [], []
         all_valid_lsinds, all_diff_abs = [], []
@@ -3026,6 +3243,9 @@ class NNUE(pl.LightningModule):
                 continue
 
             pt_A, pt_B = pt_s[:-w], pt_s[w:]
+            target_pt_A, target_pt_B = (
+                ranking_pt_s[:-w], ranking_pt_s[w:]
+            )
             qf_A, qf_B = qf_s[:-w], qf_s[w:]
             ply_A, ply_B = ply_s[:-w], ply_s[w:]
             cp_true_A, cp_true_B = score_s[:-w], score_s[w:]
@@ -3046,7 +3266,7 @@ class NNUE(pl.LightningModule):
             )
 
             if valid_pair_mask.any():
-                target_direction = torch.sign(pt_A - pt_B)
+                target_direction = torch.sign(target_pt_A - target_pt_B)
 
                 pred_diff = qf_A - qf_B
                 pair_weight_curve = torch.sigmoid((diff_abs - 0.005) * 150) * torch.sigmoid((0.05 - diff_abs) * 120)
@@ -3062,11 +3282,27 @@ class NNUE(pl.LightningModule):
                 equal_penalty = pred_diff.pow(2) * 1.0
                 pairwise_loss_all = torch.where(target_direction != 0, raw_pairwise, equal_penalty)
 
-                total_pairwise_loss += pairwise_loss_all.masked_fill(
-                    ~valid_pair_mask,
-                    0.0,
-                ).sum()
                 valid_cnt = valid_pair_mask.sum().item()
+                if self.ranking_disagreement_weight < 1.0:
+                    raw_target_direction = torch.sign(pt_A - pt_B)
+                    disagreement_weight = torch.where(
+                        target_direction != raw_target_direction,
+                        torch.as_tensor(
+                            self.ranking_disagreement_weight,
+                            dtype=pt_A.dtype,
+                            device=device,
+                        ),
+                        torch.ones((), dtype=pt_A.dtype, device=device),
+                    )
+                    total_pairwise_loss += (
+                        pairwise_loss_all * disagreement_weight
+                    ).masked_fill(~valid_pair_mask, 0.0).sum()
+                    total_pairwise_weight += disagreement_weight.masked_fill(
+                        ~valid_pair_mask, 0.0).sum()
+                else:
+                    total_pairwise_loss += pairwise_loss_all.masked_fill(
+                        ~valid_pair_mask, 0.0).sum()
+                    total_pairwise_weight += valid_cnt
                 total_valid_pairs += valid_cnt
 
                 if collect_metrics:
@@ -3081,7 +3317,7 @@ class NNUE(pl.LightningModule):
                     all_valid_lsinds.append(lsind_true_A[valid_pair_mask].detach())
                     all_diff_abs.append(diff_abs[valid_pair_mask].detach())
 
-        pairwise_loss = (total_pairwise_loss / total_valid_pairs) if total_valid_pairs > 0 else torch.tensor(0.0, device=device)
+        pairwise_loss = (total_pairwise_loss / total_pairwise_weight) if total_valid_pairs > 0 else torch.tensor(0.0, device=device)
 
         metrics = {
             'total_valid_pairs': total_valid_pairs,
@@ -3114,10 +3350,12 @@ class NNUE(pl.LightningModule):
         ]
 
         pt_s = sorted_data['pt']
+        ranking_pt_s = sorted_data['ranking_pt']
         qf_s = gradient_firewall(sorted_data['qf'], self.listwise_ft_grad_scale)
         mat_s, lsind_s, ply_s = sorted_data['material'], sorted_data['lsind'], sorted_data['ply']
 
         total_listwise_loss = torch.tensor(0.0, device=device)
+        total_listwise_weight = torch.tensor(0.0, device=device)
         total_valid_groups = 0
         all_listwise_ranges = []
 
@@ -3127,11 +3365,13 @@ class NNUE(pl.LightningModule):
                 continue
 
             pt_blocks = pt_s.unfold(0, block_size, 1)
+            ranking_pt_blocks = ranking_pt_s.unfold(0, block_size, 1)
             qf_blocks = qf_s.unfold(0, block_size, 1)
             mat_blocks = mat_s.unfold(0, block_size, 1)
             lsind_blocks = lsind_s.unfold(0, block_size, 1)
 
             pt_lists = pt_blocks[:, ::stride]
+            ranking_pt_lists = ranking_pt_blocks[:, ::stride]
             qf_lists = qf_blocks[:, ::stride]
             mat_lists = mat_blocks[:, ::stride]
             lsind_lists = lsind_blocks[:, ::stride]
@@ -3159,6 +3399,8 @@ class NNUE(pl.LightningModule):
                 ).flatten()
 
                 pt_filtered = pt_lists.index_select(0, valid_indices)
+                ranking_pt_filtered = ranking_pt_lists.index_select(
+                    0, valid_indices)
                 with torch.profiler.record_function(
                     "NNUE/index_select_listwise_qf_valid_group"
                 ):
@@ -3168,14 +3410,40 @@ class NNUE(pl.LightningModule):
                     pt_range_current.index_select(0, valid_indices).detach()
                 )
 
-                true_dist = torch.softmax(pt_filtered / temperature, dim=-1)
+                true_dist = torch.softmax(
+                    ranking_pt_filtered / temperature, dim=-1)
                 pred_log_dist = torch.log_softmax(qf_filtered / temperature, dim=-1)
 
-                total_listwise_loss += F.kl_div(pred_log_dist, true_dist, reduction="sum")
-                total_valid_groups += valid_group_mask.sum().item()
+                valid_groups = valid_group_mask.sum().item()
+                if self.ranking_disagreement_weight < 1.0:
+                    # Listwise groups contain six positions.  Weight each
+                    # group by the mean of its 15 raw-vs-ranking pair weights.
+                    raw_delta = pt_filtered.unsqueeze(2) - pt_filtered.unsqueeze(1)
+                    ranking_delta = (
+                        ranking_pt_filtered.unsqueeze(2)
+                        - ranking_pt_filtered.unsqueeze(1)
+                    )
+                    upper = torch.triu(torch.ones(
+                        (list_size, list_size), dtype=torch.bool, device=device),
+                        diagonal=1)
+                    disagree_rate = (
+                        (torch.sign(raw_delta) != torch.sign(ranking_delta))[:, upper]
+                        .to(qf_filtered.dtype).mean(dim=1)
+                    )
+                    group_weight = 1.0 - (
+                        1.0 - self.ranking_disagreement_weight) * disagree_rate
+                    group_loss = F.kl_div(
+                        pred_log_dist, true_dist, reduction="none").sum(dim=1)
+                    total_listwise_loss += (group_loss * group_weight).sum()
+                    total_listwise_weight += group_weight.sum()
+                else:
+                    total_listwise_loss += F.kl_div(
+                        pred_log_dist, true_dist, reduction="sum")
+                    total_listwise_weight += valid_groups
+                total_valid_groups += valid_groups
 
         if total_valid_groups > 0:
-            listwise_loss = total_listwise_loss / total_valid_groups
+            listwise_loss = total_listwise_loss / total_listwise_weight
             pt_range = torch.cat(all_listwise_ranges, dim=0)
             return listwise_loss, pt_range
 
