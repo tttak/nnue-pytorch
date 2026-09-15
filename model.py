@@ -838,6 +838,14 @@ class NNUE(pl.LightningModule):
         # Optional training-only attenuation for pairs whose raw teacher and
         # alternate ranking teacher order disagree.  1.0 is exactly legacy.
         self.ranking_disagreement_weight = 1.0
+        # Experiment 41: the existing train3-aligned float sidecar can instead
+        # carry a DL-median score-equivalent for an auxiliary loss.  This is
+        # opt-in and leaves the production loss stack bit-for-bit unchanged.
+        self.consensus_aux_mode = "none"
+        self.consensus_aux_target = "sidecar"
+        self.consensus_aux_strength = 0.0
+        self.consensus_aux_beta = 0.05
+        self.last_consensus_aux_stats = None
         self.num_ls_buckets = NUM_LS_BUCKETS
 
         self.input = DoubleFeatureTransformerSlice(feature_set.num_features, L1_MAIN, FM_DIM)
@@ -1860,7 +1868,12 @@ class NNUE(pl.LightningModule):
             # Experimental role-separated training may provide a second score
             # for ranking losses.  It is never used by base/router/distill/aux
             # losses.  With no alternate target this is exactly pt/score.
-            if optional_ranking_target:
+            use_alternate_ranking = (
+                bool(optional_ranking_target)
+                and (self.consensus_aux_mode == "none"
+                     or self.consensus_aux_target == "dls")
+            )
+            if use_alternate_ranking:
                 ranking_p = (
                     ranking_score - self.offset1
                 ) / self.out_scaling
@@ -1876,6 +1889,75 @@ class NNUE(pl.LightningModule):
                 )
             else:
                 ranking_pt = pt
+
+            consensus_aux_loss = qf.new_zeros(())
+            if self.training and self.consensus_aux_mode not in ("none", "off"):
+                if (self.consensus_aux_target == "sidecar"
+                    and not optional_ranking_target):
+                    raise RuntimeError(
+                        "consensus auxiliary loss requires --ranking-target3")
+                if self.consensus_aux_target == "dls":
+                    consensus_score = score.view(-1)
+                    consensus_p_raw = pf.view(-1)
+                    valid = (kif_group_id_flat == 3)
+                elif self.consensus_aux_target == "sidecar":
+                    consensus_score = ranking_score.view(-1)
+                    valid = (
+                        (kif_group_id_flat == 3)
+                        & torch.isfinite(consensus_score)
+                    )
+                    consensus_p_raw = 0.5 * (
+                        1.0
+                        + ((consensus_score - self.offset1)
+                           / self.out_scaling).sigmoid()
+                        - ((-consensus_score - self.offset2)
+                           / self.out_scaling).sigmoid()
+                    )
+                else:
+                    raise ValueError(
+                        f"unknown consensus auxiliary target: "
+                        f"{self.consensus_aux_target}")
+                # NaN is the sidecar's explicit "teacher signs split" marker.
+                # Replace it before arithmetic because NaN*zero remains NaN.
+                consensus_p = torch.where(
+                    valid, consensus_p_raw, qf.view(-1).detach())
+                gap = torch.abs(qf.view(-1).detach() - consensus_p.detach())
+                aux_weight = valid.to(dtype=qf.dtype)
+                if self.consensus_aux_mode == "gap_top":
+                    aux_weight = aux_weight * (gap >= 0.20).to(qf.dtype)
+                elif self.consensus_aux_mode == "gap_piecewise":
+                    aux_weight = aux_weight * torch.where(
+                        gap < 0.05,
+                        torch.zeros_like(gap),
+                        torch.where(
+                            gap < 0.10,
+                            torch.full_like(gap, 0.25),
+                            torch.where(
+                                gap < 0.20,
+                                torch.full_like(gap, 0.50),
+                                torch.ones_like(gap),
+                            ),
+                        ),
+                    )
+                elif self.consensus_aux_mode not in ("uniform", "sign"):
+                    raise ValueError(
+                        f"unknown consensus auxiliary mode: {self.consensus_aux_mode}")
+
+                per_sample_aux = F.smooth_l1_loss(
+                    qf.view(-1), consensus_p,
+                    reduction="none", beta=self.consensus_aux_beta)
+                aux_weight_sum = aux_weight.sum()
+                if aux_weight_sum > 0:
+                    consensus_aux_loss = (
+                        per_sample_aux * aux_weight
+                    ).sum() / aux_weight_sum
+                self.last_consensus_aux_stats = {
+                    "eligible": valid.detach().sum(),
+                    "weighted": (aux_weight > 0).detach().sum(),
+                    "mean_gap": gap.masked_select(valid).mean().detach()
+                    if valid.any() else gap.new_zeros(()),
+                    "loss": consensus_aux_loss.detach(),
+                }
 
         # ==========================================
         # Phase 3: 各種 Loss の計算
@@ -1971,7 +2053,7 @@ class NNUE(pl.LightningModule):
                 qf,
                 score,
                 ranking_pt,
-                ranking_score,
+                (ranking_score if use_alternate_ranking else score),
                 scorenet,
                 active_indices,
                 material,
@@ -2051,6 +2133,7 @@ class NNUE(pl.LightningModule):
         with torch.profiler.record_function("NNUE/total_loss"):
             loss = (
                 base_loss
+                + (self.consensus_aux_strength * consensus_aux_loss)
                 + (weights["pairwise"] * pairwise_loss)
                 + (weights["listwise"] * listwise_loss)
                 + (weights["phase"] * phase_penalty)
@@ -2071,6 +2154,7 @@ class NNUE(pl.LightningModule):
             self.last_training_loss_components = {
                 "total": loss.detach(),
                 "base": base_loss.detach(),
+                "consensus_aux": consensus_aux_loss.detach(),
                 "pairwise": pairwise_loss.detach(),
                 "listwise": listwise_loss.detach(),
                 "router_load": router_load_loss.detach(),
@@ -2089,6 +2173,16 @@ class NNUE(pl.LightningModule):
                 "pairwise": weights["pairwise"] * pairwise_loss,
                 "listwise": weights["listwise"] * listwise_loss,
             }
+        if self.training and self.consensus_aux_mode not in ("none", "off"):
+            self.log(
+                "train_consensus_aux",
+                consensus_aux_loss,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=False,
+                logger=True,
+                batch_size=qf.numel(),
+            )
 
         if (
             self.enable_ft_loss_contribution_measurement

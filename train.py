@@ -624,12 +624,31 @@ def main():
   parser.add_argument(
       "--ranking-target3", dest="ranking_target3",
       help=("Optional float32 score-equivalent sidecar aligned one-to-one "
-            "with train3. Only pairwise/listwise targets use it."))
+            "with train3. Pairwise/listwise use it unless a legacy "
+            "sidecar-target auxiliary reserves it."))
   parser.add_argument(
       "--ranking-disagreement-weight", type=float, default=1.0,
       dest="ranking_disagreement_weight",
       help=("Relative pair/list contribution when raw and alternate ranking "
             "targets disagree (default: 1.0)."))
+  parser.add_argument(
+      "--consensus-aux-mode", default="none",
+      choices=("none", "off", "uniform", "sign", "gap_top", "gap_piecewise"),
+      help=("Experiment-only DL-consensus auxiliary mode. 'off' consumes "
+            "--ranking-target3 but keeps raw-DLS ranking and adds no loss."))
+  parser.add_argument(
+      "--consensus-aux-strength", type=float, default=0.0,
+      help="Coefficient for the experiment-only probability SmoothL1 auxiliary loss.")
+  parser.add_argument(
+      "--consensus-aux-beta", type=float, default=0.05,
+      help="SmoothL1 beta for --consensus-aux-mode (default: 0.05).")
+  parser.add_argument(
+      "--consensus-aux-target", default="sidecar",
+      choices=("sidecar", "dls"),
+      help=("Auxiliary target source: the train3-aligned sidecar (legacy) or "
+            "the raw DLSuisho15b/base score already present in the batch. "
+            "Using 'dls' leaves --ranking-target3 available exclusively for "
+            "pairwise/listwise consensus ranking."))
   parser.add_argument(
       "--uncertainty-head", dest="uncertainty_head",
       help="Frozen bucket-specific fc1-64 teacher-disagreement probe (.pt).")
@@ -697,6 +716,15 @@ def main():
           "--ranking-target3 requires smart/random fen skipping disabled")
   if not 0.0 < args.ranking_disagreement_weight <= 1.0:
     raise ValueError("--ranking-disagreement-weight must be in (0, 1]")
+  if (args.consensus_aux_mode != "none"
+      and args.consensus_aux_target == "sidecar"
+      and not args.ranking_target3):
+    raise ValueError(
+        "--consensus-aux-mode requires a train3-aligned --ranking-target3")
+  if args.consensus_aux_strength < 0.0:
+    raise ValueError("--consensus-aux-strength must be non-negative")
+  if args.consensus_aux_beta <= 0.0:
+    raise ValueError("--consensus-aux-beta must be positive")
   if not 0.0 <= args.uncertainty_base_weight_strength < 1.0:
     raise ValueError("--uncertainty-base-weight-strength must be in [0, 1)")
   if (args.uncertainty_base_weight_strength > 0.0 or args.uncertainty_report) \
@@ -887,10 +915,25 @@ def main():
     nnue.lr = args.lr
 
   nnue.ranking_disagreement_weight = args.ranking_disagreement_weight
-  if args.ranking_target3:
+  if (args.ranking_target3
+      and (args.consensus_aux_mode == "none"
+           or args.consensus_aux_target == "dls")):
     print(
         "Alternate ranking target enabled: "
         f"disagreement_weight={args.ranking_disagreement_weight:.3f}"
+    )
+  nnue.consensus_aux_mode = args.consensus_aux_mode
+  nnue.consensus_aux_target = args.consensus_aux_target
+  nnue.consensus_aux_strength = args.consensus_aux_strength
+  nnue.consensus_aux_beta = args.consensus_aux_beta
+  if args.consensus_aux_mode != "none":
+    print(
+        "DL consensus auxiliary: "
+        f"mode={args.consensus_aux_mode}, "
+        f"strength={args.consensus_aux_strength:.6g}, "
+        f"beta={args.consensus_aux_beta:.6g}; "
+        f"target={args.consensus_aux_target}; "
+        "raw DLSuisho15b remains the base target"
     )
 
   if args.uncertainty_head:
