@@ -1364,24 +1364,42 @@ class NNUE(pl.LightningModule):
 
             print("-" * 110)
             print(f"[Signal Strength (L2 Input)]")
-            if self.remove_main_sqr_l2:
-                main_sqr_part = float("nan")
-                main_raw_part = l2_input[:, 0:31].abs().mean().item()
-                fm_diff_part = l2_input[:, 31:63].abs().mean().item()
-                fm_abs_part = l2_input[:, 63:95].abs().mean().item()
-                cross_feat = l2_input[:, 95:95 + self.cross_output_dimensions].abs().mean().item()
-            else:
-                main_sqr_part = l2_input[:, 0:31].abs().mean().item()
-                main_raw_part = l2_input[:, 31:62].abs().mean().item()
-                fm_diff_part = l2_input[:, 62:94].abs().mean().item()
-            if self.remove_main_sqr_l2:
-                pass
-            elif self.remove_abs_sqr_l2:
-                fm_abs_part = l2_input[:, 94:126].abs().mean().item()
-                cross_feat = l2_input[:, 126:126 + self.cross_output_dimensions].abs().mean().item()
-            else:
-                fm_abs_part = l2_input[:, 94:158].abs().mean().item()
-                cross_feat = l2_input[:, 158:158 + self.cross_output_dimensions].abs().mean().item()
+            # Derive diagnostic slices from the active architecture.  The
+            # compact128 layout uses Diff24 / AbsRaw24 / Cross16, so the old
+            # fixed 160-wide offsets read the two zero-padding lanes as Cross.
+            l2_sections = {}
+            l2_cursor = 0
+
+            def add_l2_section(name, width):
+                nonlocal l2_cursor
+                l2_sections[name] = l2_input[:, l2_cursor:l2_cursor + width]
+                l2_cursor += width
+
+            if not self.remove_main_sqr_l2:
+                add_l2_section("Main(Sqr)", 31)
+            add_l2_section("Main(Raw)", 31)
+            add_l2_section("FM(Diff)", len(self.l2_fm_diff_indices))
+            add_l2_section("FM(Abs_Raw)", len(self.l2_fm_abs_raw_indices))
+            if not self.remove_abs_sqr_l2:
+                add_l2_section("FM(Abs_Sqr)", 32)
+            add_l2_section("cross_feat", self.cross_output_dimensions)
+
+            expected_padding = 1 if self.remove_main_sqr_l2 else 2
+            if l2_cursor + expected_padding != l2_input.shape[1]:
+                raise RuntimeError(
+                    "L2 diagnostic layout mismatch: "
+                    f"sections={l2_cursor}, padding={expected_padding}, "
+                    f"physical={l2_input.shape[1]}"
+                )
+
+            main_sqr_part = (
+                l2_sections["Main(Sqr)"].abs().mean().item()
+                if "Main(Sqr)" in l2_sections else float("nan")
+            )
+            main_raw_part = l2_sections["Main(Raw)"].abs().mean().item()
+            fm_diff_part = l2_sections["FM(Diff)"].abs().mean().item()
+            fm_abs_part = l2_sections["FM(Abs_Raw)"].abs().mean().item()
+            cross_feat = l2_sections["cross_feat"].abs().mean().item()
 
             print(f" L2 In | Main(Sqr): {main_sqr_part:.4f} | Main(Raw): {main_raw_part:.4f} | FM(Diff): {fm_diff_part:.4f} | FM(Abs): {fm_abs_part:.4f}  | cross_feat: {cross_feat:.4f}")
 
@@ -1396,23 +1414,8 @@ class NNUE(pl.LightningModule):
                 high_signal = (t > 0.95).float().mean().item() * 100
                 print(f"{name:12} | {t.mean():7.3f} | {t_abs.mean():7.3f} | {t.std():7.3f} | {t.max():7.2f} | {t.min():7.2f} | {sparsity:6.1f}% | {high_signal:6.1f}%")
 
-            if self.remove_main_sqr_l2:
-                log_stats("Main(Raw)",   l2_input[:, 0:31])
-                log_stats("FM(Diff)",    l2_input[:, 31:63])
-                log_stats("FM(Abs_Raw)", l2_input[:, 63:95])
-                log_stats("cross_feat",  l2_input[:, 95:95 + self.cross_output_dimensions])
-            else:
-                log_stats("Main(Sqr)",    l2_input[:, 0:31])
-                log_stats("Main(Raw)",    l2_input[:, 31:62])
-                log_stats("FM(Diff)",     l2_input[:, 62:94])
-                log_stats("FM(Abs_Raw)",  l2_input[:, 94:126])
-            if self.remove_main_sqr_l2:
-                pass
-            elif self.remove_abs_sqr_l2:
-                log_stats("cross_feat", l2_input[:, 126:126 + self.cross_output_dimensions])
-            else:
-                log_stats("FM(Abs_Sqr)", l2_input[:, 126:158])
-                log_stats("cross_feat",  l2_input[:, 158:158 + self.cross_output_dimensions])
+            for section_name, section_tensor in l2_sections.items():
+                log_stats(section_name, section_tensor)
 
             if self.input.v.grad is not None:
                 v_grad_mean = self.input.v.grad.abs().mean().item()
