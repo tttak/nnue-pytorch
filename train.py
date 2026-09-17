@@ -6,6 +6,12 @@ from datetime import datetime
 import hashlib
 import json
 import model as M
+from optimizer_presets import available_optimizer_presets
+from optimizer_layouts import (
+    PARAMETER_SUBGROUPS,
+    available_optimizer_layouts,
+    expand_subgroup_selection,
+)
 import nnue_dataset
 import nnue_bin_dataset
 import pytorch_lightning as pl
@@ -595,6 +601,29 @@ def main():
   parser.add_argument("--end-lambda", default=None, type=float, dest='end_lambda', help="lambda to use at last epoch.")
   parser.add_argument("--gamma", default=0.992, type=float, dest='gamma', help="Multiplicative factor applied to the learning rate after every epoch.")
   parser.add_argument("--lr", default=8.75e-4, type=float, dest='lr', help="Initial learning rate.")
+  parser.add_argument(
+      "--ft-optimizer", default="adamw8bit",
+      choices=available_optimizer_presets(),
+      help="Optimizer preset for input.weight/input.bias/input.v.")
+  parser.add_argument(
+      "--other-optimizer", default="adamw8bit",
+      choices=available_optimizer_presets(),
+      help="Optimizer preset for all non-FT parameters.")
+  parser.add_argument(
+      "--optimizer-layout", choices=available_optimizer_layouts(), default=None,
+      help=("Declarative subgroup optimizer layout. When specified, this "
+            "takes precedence over --ft-optimizer/--other-optimizer."))
+  parser.add_argument(
+      "--reinit-groups", default="",
+      help=("Comma-separated optimizer subgroups to reinitialize using the "
+            "model __init__ rules."))
+  parser.add_argument(
+      "--reinit-seed", type=int, default=None,
+      help="Seed for --reinit-groups (default: --seed).")
+  parser.add_argument(
+      "--freeze-ft-router", action="store_true",
+      help=("Experiment-only: freeze input.weight/input.bias/input.v and "
+            "Router weight/bias, excluding them from the optimizer."))
   parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
@@ -672,6 +701,24 @@ def main():
 
   features.add_argparse_args(parser)
   args = parser.parse_args()
+
+  requested_reinit_groups = tuple(
+      group.strip() for group in args.reinit_groups.split(",")
+      if group.strip())
+  unknown_reinit = set(requested_reinit_groups) - set(PARAMETER_SUBGROUPS)
+  if unknown_reinit:
+    raise ValueError(f"Unknown --reinit-groups: {sorted(unknown_reinit)}")
+  args.reinit_groups = expand_subgroup_selection(requested_reinit_groups)
+  if args.reinit_groups and args.reinit_seed is None:
+    args.reinit_seed = args.seed
+  if args.optimizer_layout and args.freeze_ft_router:
+    raise ValueError(
+        "--optimizer-layout already defines frozen groups; do not combine it "
+        "with --freeze-ft-router")
+  if args.resume_training_state and args.reinit_groups:
+    raise ValueError(
+        "--reinit-groups cannot be used with --resume-training-state; use "
+        "--resume-from-model for weight-only initialization")
 
   if args.resume_training_state:
     if args.resume_from_model and (
@@ -754,7 +801,13 @@ def main():
       offset=args.offset,
       offset1=args.offset1,
       offset2=args.offset2,
-      adjust_loss=args.adjust_loss)
+      adjust_loss=args.adjust_loss,
+      ft_optimizer=args.ft_optimizer,
+      other_optimizer=args.other_optimizer,
+      freeze_ft_router=args.freeze_ft_router,
+      optimizer_layout=args.optimizer_layout,
+      reinit_groups=args.reinit_groups,
+      reinit_seed=args.reinit_seed)
   else:
 
     # 「.pt」の場合
@@ -799,6 +852,12 @@ def main():
                     offset1=args.offset1,
                     offset2=args.offset2,
                     adjust_loss=args.adjust_loss,
+                    ft_optimizer=args.ft_optimizer,
+                    other_optimizer=args.other_optimizer,
+                    freeze_ft_router=args.freeze_ft_router,
+                    optimizer_layout=args.optimizer_layout,
+                    reinit_groups=args.reinit_groups,
+                    reinit_seed=args.reinit_seed,
                     **architecture_kwargs)
       model_dict = nnue.state_dict()
       if architecture is not None:
@@ -868,6 +927,17 @@ def main():
             "offset2": args.offset2,
             "adjust_loss": args.adjust_loss,
         }
+      resume_overrides.update({
+          "ft_optimizer": args.ft_optimizer,
+          "other_optimizer": args.other_optimizer,
+          "freeze_ft_router": args.freeze_ft_router,
+          "enforce_optimizer_checkpoint_match": bool(args.resume_training_state),
+      })
+      if not args.resume_training_state or args.optimizer_layout is not None:
+        resume_overrides["optimizer_layout"] = args.optimizer_layout
+      if not args.resume_training_state or args.reinit_groups:
+        resume_overrides["reinit_groups"] = args.reinit_groups
+        resume_overrides["reinit_seed"] = args.reinit_seed
       nnue = M.NNUE.load_from_checkpoint(
           args.resume_from_model, feature_set=feature_set, strict=False,
           **resume_overrides)
@@ -913,6 +983,21 @@ def main():
     # from .pt the optimizer is only created after the training is started
     nnue.gamma = args.gamma
     nnue.lr = args.lr
+
+  nnue.ft_optimizer_name = args.ft_optimizer
+  nnue.other_optimizer_name = args.other_optimizer
+  if not args.resume_training_state or args.optimizer_layout is not None:
+    nnue.optimizer_layout_name = args.optimizer_layout
+  if not args.resume_training_state or args.reinit_groups:
+    nnue.reinit_groups = tuple(args.reinit_groups)
+    nnue.reinit_seed = args.reinit_seed
+  if nnue.optimizer_layout_name is None:
+    nnue.set_freeze_ft_router(args.freeze_ft_router)
+  else:
+    nnue.apply_optimizer_layout_freeze()
+  if args.reinit_groups:
+    nnue.reinitialize_optimizer_subgroups(
+        args.reinit_groups, args.reinit_seed)
 
   nnue.ranking_disagreement_weight = args.ranking_disagreement_weight
   if (args.ranking_target3

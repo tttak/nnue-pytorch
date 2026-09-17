@@ -14,3 +14,6 @@ PyYAML
 pexpect
 statsmodels
 cpuid
+
+# Experimental optimizer presets (SOAP, LAMB, NovoGrad, SM3, StableAdamW)
+pytorch-optimizer==3.10.1

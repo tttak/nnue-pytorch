@@ -6,6 +6,8 @@ from torch import nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import sys
+import json
+from pathlib import Path
 
 # from feature_transformer import DoubleFeatureTransformerSlice
 from feature_transformer import (
@@ -16,7 +18,20 @@ from feature_transformer import (
     clear_grouped_bw_timing,
 )
 
-import bitsandbytes as bnb
+from optimizer_presets import (
+    CompositeOptimizer,
+    OPTIMIZER_PRESETS,
+    build_optimizer,
+    optimizer_preset_summary,
+)
+from optimizer_layouts import (
+    OPTIMIZER_LAYOUT_SCHEMA_VERSION,
+    PARAMETER_SUBGROUPS,
+    legacy_optimizer_layout,
+    parameter_subgroup,
+    optimizer_layout_lr_scale,
+    resolve_optimizer_layout,
+)
 # import time
 
 # --- 定数定義 ---
@@ -833,7 +848,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None, lca_qk_indices=None, lca_value_indices=None):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None):
         super(NNUE, self).__init__()
         # Optional training-only attenuation for pairs whose raw teacher and
         # alternate ranking teacher order disagree.  1.0 is exactly legacy.
@@ -847,6 +862,14 @@ class NNUE(pl.LightningModule):
         self.consensus_aux_beta = 0.05
         self.last_consensus_aux_stats = None
         self.num_ls_buckets = NUM_LS_BUCKETS
+        self.ft_optimizer_name = ft_optimizer
+        self.other_optimizer_name = other_optimizer
+        self.enforce_optimizer_checkpoint_match = enforce_optimizer_checkpoint_match
+        self.freeze_ft_router = bool(freeze_ft_router)
+        self.optimizer_layout_name = optimizer_layout
+        self.reinit_groups = tuple(reinit_groups or ())
+        self.reinit_seed = reinit_seed
+        self._optimizer_state_size_logged = False
 
         self.input = DoubleFeatureTransformerSlice(feature_set.num_features, L1_MAIN, FM_DIM)
         self.pair_weights = nn.Parameter(torch.zeros(4, 640, 3))
@@ -888,6 +911,12 @@ class NNUE(pl.LightningModule):
             "l2_fm_abs_raw_indices": list(self.l2_fm_abs_raw_indices),
             "lca_qk_indices": list(self.lca_qk_indices),
             "lca_value_indices": list(self.lca_value_indices),
+            "ft_optimizer": self.ft_optimizer_name,
+            "other_optimizer": self.other_optimizer_name,
+            "freeze_ft_router": self.freeze_ft_router,
+            "optimizer_layout": self.optimizer_layout_name,
+            "reinit_groups": list(self.reinit_groups),
+            "reinit_seed": self.reinit_seed,
         })
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
@@ -961,6 +990,10 @@ class NNUE(pl.LightningModule):
         ]
 
         self._zero_virtual_feature_weights()
+        if self.optimizer_layout_name is None:
+            self.set_freeze_ft_router(self.freeze_ft_router)
+        else:
+            self.apply_optimizer_layout_freeze()
 
         self.enable_cuda_timing = False
 
@@ -1013,6 +1046,96 @@ class NNUE(pl.LightningModule):
         # ordinary training.
         self.capture_training_loss_tensors = False
         self.last_training_loss_tensors = None
+
+    def set_freeze_ft_router(self, enabled=True):
+        """Experiment-only FT/Router freeze used by optimizer recovery tests."""
+        self.freeze_ft_router = bool(enabled)
+        frozen = (
+            self.input.weight,
+            self.input.bias,
+            self.input.v,
+            self.layer_stacks.router.weight,
+            self.layer_stacks.router.bias,
+        )
+        for parameter in frozen:
+            parameter.requires_grad_(not self.freeze_ft_router)
+
+    def resolved_optimizer_layout(self):
+        """Return the effective subgroup-to-preset assignment."""
+        if self.optimizer_layout_name is not None:
+            return resolve_optimizer_layout(self.optimizer_layout_name)
+        return legacy_optimizer_layout(
+            self.ft_optimizer_name,
+            self.other_optimizer_name,
+            self.freeze_ft_router,
+        )
+
+    def optimizer_subgroup_inventory(self):
+        """Classify every parameter exactly once, failing on schema drift."""
+        inventory = {group: [] for group in PARAMETER_SUBGROUPS}
+        seen = set()
+        for name, parameter in self.named_parameters():
+            # EMA is attached as a Lightning submodule at fit start but is not
+            # an independently optimized model.
+            if name.startswith("ema_model."):
+                continue
+            if id(parameter) in seen:
+                raise RuntimeError(f"Duplicate named parameter object: {name}")
+            seen.add(id(parameter))
+            subgroup = parameter_subgroup(name)
+            inventory[subgroup].append((name, parameter))
+        classified = sum(len(values) for values in inventory.values())
+        if classified != len(seen):
+            raise RuntimeError(
+                f"Optimizer subgroup classification mismatch: "
+                f"classified={classified}, parameters={len(seen)}")
+        return inventory
+
+    def apply_optimizer_layout_freeze(self):
+        """Apply ``frozen`` assignments before optimizer construction."""
+        layout = self.resolved_optimizer_layout()
+        inventory = self.optimizer_subgroup_inventory()
+        for subgroup, entries in inventory.items():
+            trainable = layout[subgroup] != "frozen"
+            for _, parameter in entries:
+                parameter.requires_grad_(trainable)
+        self.freeze_ft_router = (
+            layout["ft"] == "frozen" and layout["router"] == "frozen")
+
+    def reinitialize_optimizer_subgroups(self, groups, seed):
+        """Restore selected groups to the exact values produced by __init__."""
+        groups = tuple(dict.fromkeys(groups))
+        unknown = set(groups) - set(PARAMETER_SUBGROUPS)
+        if unknown:
+            raise ValueError(f"Unknown reinitialize groups: {sorted(unknown)}")
+        if not groups:
+            return
+        # A fresh same-architecture instance is the single source of truth for
+        # Linear, gate, phase and bucket-replication initialization rules.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(int(seed))
+            fresh = NNUE(
+                feature_set=self.feature_set,
+                remove_abs_sqr_l2=self.remove_abs_sqr_l2,
+                remove_main_sqr_l2=self.remove_main_sqr_l2,
+                phase_output_dimensions=self.phase_output_dimensions,
+                l3_dimensions=self.l3_dimensions,
+                cross_output_dimensions=self.cross_output_dimensions,
+                l2_fm_diff_indices=self.l2_fm_diff_indices,
+                l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
+                lca_qk_indices=self.lca_qk_indices,
+                lca_value_indices=self.lca_value_indices,
+            )
+        source = dict(fresh.named_parameters())
+        with torch.no_grad():
+            for name, parameter in self.named_parameters():
+                if parameter_subgroup(name) in groups:
+                    parameter.copy_(source[name].to(
+                        device=parameter.device, dtype=parameter.dtype))
+        self.reinit_groups = groups
+        self.reinit_seed = int(seed)
+        del fresh
+        self.apply_optimizer_layout_freeze()
 
     def configure_uncertainty_base_weighting(
         self,
@@ -1086,6 +1209,8 @@ class NNUE(pl.LightningModule):
     def _clip_weights(self):
         for group in self.weight_clipping:
             for p in group['params']:
+                if not p.requires_grad:
+                    continue
                 if 'min_weight' in group or 'max_weight' in group:
                     p_data_fp32 = p.data
                     min_weight = group['min_weight']
@@ -4523,6 +4648,7 @@ class NNUE(pl.LightningModule):
 
     def on_before_optimizer_step(self, optimizer):
         self._ft_stat_before_optimizer_step(optimizer)
+        self._qkv_bias_stat_before_optimizer_step()
 
     def on_train_batch_start(self, batch, batch_idx):
 
@@ -4564,6 +4690,28 @@ class NNUE(pl.LightningModule):
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         self._ft_stat_after_optimizer_step()
+        self._qkv_bias_stat_after_optimizer_step()
+
+        if (self.optimizer_layout_name is not None
+                and not self._optimizer_state_size_logged
+                and self.global_step > 0):
+            optimizer = self.optimizers(use_pl_optimizer=False)
+            state_bytes = sum(
+                value.numel() * value.element_size()
+                for state in optimizer.state.values()
+                for value in state.values()
+                if isinstance(value, torch.Tensor))
+            print(f"Optimizer state actual: {state_bytes:,} bytes")
+            log_dir = getattr(self.logger, "log_dir", None)
+            if log_dir:
+                path = Path(log_dir) / "optimizer_layout.json"
+                if path.exists():
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    payload["optimizer_state_actual_bytes_after_first_step"] = state_bytes
+                    path.write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+            self._optimizer_state_size_logged = True
 
         if self.global_step % 100 == 0:
             with torch.no_grad():
@@ -5302,6 +5450,80 @@ class NNUE(pl.LightningModule):
         # ---------------------------------------------------------
         self._ft_stat_cache = caches
 
+    def _qkv_bias_stat_before_optimizer_step(self):
+        """Cache low-frequency Q/K/V bias diagnostics before optimizer.step()."""
+        step = int(self.global_step)
+        if step != 0 and step % 500 != 0:
+            self._qkv_bias_stat_cache = None
+            return
+
+        named_biases = (
+            ("Q", self.layer_stacks.q_proj.bias),
+            ("K", self.layer_stacks.k_proj.bias),
+            ("V", self.layer_stacks.v_proj.bias),
+        )
+        if any(parameter.grad is None for _, parameter in named_biases):
+            self._qkv_bias_stat_cache = None
+            return
+
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in named_biases
+        }
+        grad_norms = {
+            name: torch.linalg.vector_norm(parameter.grad.detach()).item()
+            for name, parameter in named_biases
+        }
+        combined_grad = torch.cat([
+            parameter.grad.detach().reshape(-1)
+            for _, parameter in named_biases
+        ])
+        combined_grad_norm = torch.linalg.vector_norm(combined_grad).item()
+        self._qkv_bias_stat_cache = {
+            "step": step,
+            "before": before,
+            "grad_norms": grad_norms,
+            "combined_grad_norm": combined_grad_norm,
+        }
+
+    def _qkv_bias_stat_after_optimizer_step(self):
+        """Report that all three newly registered projection biases update."""
+        cache = getattr(self, "_qkv_bias_stat_cache", None)
+        if cache is None:
+            return
+
+        named_biases = (
+            ("Q", self.layer_stacks.q_proj.bias),
+            ("K", self.layer_stacks.k_proj.bias),
+            ("V", self.layer_stacks.v_proj.bias),
+        )
+        updates = {
+            name: parameter.detach() - cache["before"][name]
+            for name, parameter in named_biases
+        }
+        update_norms = {
+            name: torch.linalg.vector_norm(update).item()
+            for name, update in updates.items()
+        }
+        combined_update = torch.cat([
+            updates[name].reshape(-1) for name, _ in named_biases
+        ])
+        combined_update_norm = torch.linalg.vector_norm(
+            combined_update).item()
+        print(
+            "[QKV bias optimizer] "
+            f"step={cache['step']} "
+            f"grad_norm={cache['combined_grad_norm']:.6e} "
+            f"update_norm={combined_update_norm:.6e} "
+            "per_projection="
+            + ", ".join(
+                f"{name}(grad={cache['grad_norms'][name]:.6e},"
+                f"update={update_norms[name]:.6e})"
+                for name, _ in named_biases
+            )
+        )
+        self._qkv_bias_stat_cache = None
+
     def _ft_stat_after_optimizer_step(self):
         """
         optimizer.step()後に、
@@ -5578,10 +5800,69 @@ class NNUE(pl.LightningModule):
             for param in self.ema_model.parameters():
                 param.requires_grad = False
 
+        if getattr(self.trainer, "is_global_zero", True):
+            inventory = self.optimizer_subgroup_inventory()
+            layout = self.resolved_optimizer_layout()
+            estimated_state_bytes = 0
+            estimate_complete = True
+            for subgroup, entries in inventory.items():
+                preset_name = layout[subgroup]
+                if preset_name == "frozen":
+                    continue
+                for _, parameter in entries:
+                    estimate = self._estimated_optimizer_state_bytes(
+                        preset_name, parameter)
+                    if estimate is None:
+                        estimate_complete = False
+                    else:
+                        estimated_state_bytes += estimate
+            payload = {
+                "schema_version": OPTIMIZER_LAYOUT_SCHEMA_VERSION,
+                "layout_name": self.optimizer_layout_name,
+                "layout": layout,
+                "reinit_layout": "cli_groups" if self.reinit_groups else None,
+                "reinit_groups": list(self.reinit_groups),
+                "reinit_seed": self.reinit_seed,
+                "subgroups": {
+                    subgroup: {
+                        "tensor_count": len(entries),
+                        "parameter_count": sum(
+                            parameter.numel() for _, parameter in entries),
+                        "parameters": [name for name, _ in entries],
+                    }
+                    for subgroup, entries in inventory.items()
+                },
+                "optimizer_state_estimated_bytes": estimated_state_bytes,
+                "optimizer_state_estimate_complete": estimate_complete,
+            }
+            log_dir = getattr(self.logger, "log_dir", None)
+            if log_dir:
+                output = Path(log_dir) / "optimizer_layout.json"
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8")
+
     def on_save_checkpoint(self, checkpoint):
         """Persist every architecture choice needed for an exact reload."""
         architecture = nnue_architecture_metadata(self)
         checkpoint["nnue_architecture"] = architecture
+        checkpoint["optimizer_configuration"] = {
+            "format_version": OPTIMIZER_LAYOUT_SCHEMA_VERSION,
+            "optimizer_schema_version": OPTIMIZER_LAYOUT_SCHEMA_VERSION,
+            "parameter_schema_version": 2,
+            "ft": self.ft_optimizer_name,
+            "other": self.other_optimizer_name,
+            "freeze_ft_router": self.freeze_ft_router,
+            "layout_name": self.optimizer_layout_name,
+            "layout": self.resolved_optimizer_layout(),
+            "freeze_groups": [
+                group for group, preset in self.resolved_optimizer_layout().items()
+                if preset == "frozen"],
+            "reinit_layout": "cli_groups" if self.reinit_groups else None,
+            "reinit_groups": list(self.reinit_groups),
+            "reinit_seed": self.reinit_seed,
+        }
         checkpoint.setdefault("hyper_parameters", {}).update({
             "remove_abs_sqr_l2": architecture["remove_abs_sqr_l2"],
             "remove_main_sqr_l2": architecture["remove_main_sqr_l2"],
@@ -5592,10 +5873,79 @@ class NNUE(pl.LightningModule):
             "l2_fm_abs_raw_indices": architecture["fm_abs_raw_kept_source_units"],
             "lca_qk_indices": architecture["lca_qk_kept_source_units"],
             "lca_value_indices": architecture["lca_value_kept_source_units"],
+            "ft_optimizer": self.ft_optimizer_name,
+            "other_optimizer": self.other_optimizer_name,
+            "freeze_ft_router": self.freeze_ft_router,
+            "optimizer_layout": self.optimizer_layout_name,
+            "reinit_groups": list(self.reinit_groups),
+            "reinit_seed": self.reinit_seed,
         })
 
     def on_load_checkpoint(self, checkpoint):
         """過去の余分な EMA キーを安全に削除"""
+        if self.enforce_optimizer_checkpoint_match:
+            saved = checkpoint.get("optimizer_configuration")
+            requested_layout = self.resolved_optimizer_layout()
+            if saved is not None and int(saved.get("format_version", 1)) >= 3:
+                saved_layout = saved.get("layout")
+                if saved_layout != requested_layout:
+                    raise ValueError(
+                        "Cannot resume optimizer state with a different "
+                        f"optimizer layout: saved={saved_layout}, "
+                        f"requested={requested_layout}. Use "
+                        "--resume-from-model (without --resume-training-state) "
+                        "to load weights with a new layout.")
+                saved_reinit = tuple(saved.get("reinit_groups", ()))
+                if saved_reinit != tuple(self.reinit_groups):
+                    raise ValueError(
+                        "Cannot resume optimizer state with different reinit "
+                        f"groups: saved={saved_reinit}, "
+                        f"requested={tuple(self.reinit_groups)}.")
+                saved_seed = saved.get("reinit_seed")
+                if saved_seed != self.reinit_seed:
+                    raise ValueError(
+                        "Cannot resume optimizer state with a different reinit "
+                        f"seed: saved={saved_seed}, requested={self.reinit_seed}.")
+            elif self.optimizer_layout_name is not None:
+                raise ValueError(
+                    "This checkpoint predates optimizer-layout metadata. "
+                    "Use --resume-from-model for weight-only migration.")
+            if saved is None:
+                # Checkpoints predating optimizer selection were necessarily
+                # produced by the legacy AdamW8bit/AdamW8bit path.
+                saved_pair = ("adamw8bit", "adamw8bit")
+            else:
+                saved_pair = (saved.get("ft"), saved.get("other"))
+            saved_parameter_schema = (
+                1 if saved is None
+                else int(saved.get("parameter_schema_version", 1))
+            )
+            requested_pair = (self.ft_optimizer_name, self.other_optimizer_name)
+            if (self.optimizer_layout_name is None
+                    and saved_pair != requested_pair):
+                raise ValueError(
+                    "Cannot resume optimizer state with a different optimizer "
+                    f"configuration: saved={saved_pair}, requested={requested_pair}. "
+                    "Use --resume-from-model (without --resume-training-state) "
+                    "to load weights and initialize new optimizer state."
+                )
+            if saved_parameter_schema != 2:
+                raise ValueError(
+                    "Cannot resume optimizer state from the legacy optimizer "
+                    "parameter schema: saved schema="
+                    f"{saved_parameter_schema}, requested schema=2. The legacy "
+                    "state has no Q/K/V projection-bias optimizer entries. "
+                    "Use --resume-from-model (without --resume-training-state) "
+                    "to load weights and initialize complete optimizer state."
+                )
+            saved_freeze = False if saved is None else bool(
+                saved.get("freeze_ft_router", False))
+            if saved_freeze != self.freeze_ft_router:
+                raise ValueError(
+                    "Cannot resume optimizer state with a different FT/Router "
+                    f"freeze mode: saved={saved_freeze}, "
+                    f"requested={self.freeze_ft_router}."
+                )
         saved_architecture = checkpoint_architecture_metadata(checkpoint)
         if saved_architecture is not None:
             saved_kwargs = nnue_architecture_kwargs(saved_architecture)
@@ -5612,24 +5962,15 @@ class NNUE(pl.LightningModule):
                 and self.phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR):
             migrate_phase_proj_state_dict_to_five(state_dict)
 
-    def configure_optimizers(self):
-        # =========================================================
-        # 【一時的】Routerの重みとバイアスを再初期化
-        # =========================================================
-        """
-        with torch.no_grad():
-          nn.init.normal_(self.layer_stacks.router.weight, std=0.01)
-          nn.init.constant_(self.layer_stacks.router.bias, 0.0)
-          print("Routerの重みとバイアスを再初期化")
-        """
-        # =========================================================
-
+    def _optimizer_parameter_groups(self):
+        """Return disjoint FT/Other groups in the exact legacy order."""
         LR = self.lr
-
-        train_params = [
+        ft_groups = [
             {'params': [self.input.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.input.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.input.v], 'lr': LR * 1.5, 'weight_decay': 0.0},
+        ]
+        other_groups = [
             {'params': [self.pair_weights], 'lr': LR * 1.0, 'weight_decay': 1e-5},
             {'params': [self.main_aux_head.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.main_aux_head.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
@@ -5646,9 +5987,9 @@ class NNUE(pl.LightningModule):
             {'params': [self.layer_stacks.fm_abs.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.cross_proj.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.cross_proj.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
-            {'params': [self.layer_stacks.q_proj.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
-            {'params': [self.layer_stacks.k_proj.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
-            {'params': [self.layer_stacks.v_proj.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
+            {'params': [self.layer_stacks.q_proj.weight, self.layer_stacks.q_proj.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
+            {'params': [self.layer_stacks.k_proj.weight, self.layer_stacks.k_proj.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
+            {'params': [self.layer_stacks.v_proj.weight, self.layer_stacks.v_proj.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.lca_temp], 'lr': LR * 0.1, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.phase_proj.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.phase_proj.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
@@ -5658,6 +5999,166 @@ class NNUE(pl.LightningModule):
             {'params': [self.layer_stacks.output.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.blend], 'lr': LR * 1.0, 'weight_decay': 0.0},
         ]
+
+        classified = [
+            parameter
+            for group in ft_groups + other_groups
+            for parameter in group['params']
+        ]
+        classified_ids = [id(parameter) for parameter in classified]
+        if len(classified_ids) != len(set(classified_ids)):
+            raise RuntimeError("Optimizer parameter classification has duplicates")
+        model_parameters = [
+            parameter for parameter in self.parameters()
+            if parameter.requires_grad
+        ]
+        classified = [parameter for parameter in classified if parameter.requires_grad]
+        classified_ids = [id(parameter) for parameter in classified]
+        missing = {id(parameter) for parameter in model_parameters} - set(classified_ids)
+        extra = set(classified_ids) - {id(parameter) for parameter in model_parameters}
+        if missing or extra:
+            missing_names = [
+                name for name, parameter in self.named_parameters()
+                if id(parameter) in missing
+            ]
+            raise RuntimeError(
+                "Optimizer parameter classification is incomplete: "
+                f"missing={missing_names}, extra_count={len(extra)}"
+            )
+        def only_trainable(groups):
+            active = []
+            for group in groups:
+                parameters = [p for p in group['params'] if p.requires_grad]
+                if parameters:
+                    copied = dict(group)
+                    copied['params'] = parameters
+                    active.append(copied)
+            return active
+
+        return only_trainable(ft_groups), only_trainable(other_groups)
+
+    @staticmethod
+    def _parameter_group_counts(groups):
+        parameters = [parameter for group in groups for parameter in group['params']]
+        trainable = [parameter for parameter in parameters if parameter.requires_grad]
+        return {
+            "tensors": len(parameters),
+            "elements": sum(parameter.numel() for parameter in parameters),
+            "trainable_tensors": len(trainable),
+            "trainable_elements": sum(parameter.numel() for parameter in trainable),
+        }
+
+    @staticmethod
+    def _format_optimizer_preset(summary):
+        fields = []
+        for key in ("lr", "betas", "eps", "weight_decay", "min_8bit_size",
+                    "beta2_decay", "d", "alpha", "t_alpha", "t_beta3",
+                    "decoupled_weight_decay", "assignment", "radam_lr",
+                    "adabeliefw_lr"):
+            if key in summary:
+                fields.append(f"{key}={summary[key]}")
+        return ", ".join(fields)
+
+    @staticmethod
+    def _estimated_optimizer_state_bytes(preset_name, parameter):
+        """Conservative first-order state estimate (tensor payload only)."""
+        if preset_name in (
+                "adamw", "radam", "nadamw", "adabeliefw",
+                "lamb", "stableadamw"):
+            return parameter.numel() * 8  # two FP32 moments
+        if preset_name == "adamw8bit":
+            threshold = OPTIMIZER_PRESETS[preset_name]["kwargs"].get(
+                "min_8bit_size", 4096)
+            bytes_per_state = 1 if parameter.numel() >= threshold else 4
+            return parameter.numel() * bytes_per_state * 2
+        if preset_name in ("lion8bit", "lion_other"):
+            threshold = OPTIMIZER_PRESETS[preset_name]["kwargs"].get(
+                "min_8bit_size", 4096)
+            bytes_per_state = 1 if parameter.numel() >= threshold else 4
+            return parameter.numel() * bytes_per_state
+        return None
+
+    def configure_optimizers(self):
+        # =========================================================
+        # 【一時的】Routerの重みとバイアスを再初期化
+        # =========================================================
+        """
+        with torch.no_grad():
+          nn.init.normal_(self.layer_stacks.router.weight, std=0.01)
+          nn.init.constant_(self.layer_stacks.router.bias, 0.0)
+          print("Routerの重みとバイアスを再初期化")
+        """
+        # =========================================================
+
+        LR = self.lr
+        if self.optimizer_layout_name is not None:
+            self.apply_optimizer_layout_freeze()
+        ft_groups, other_groups = self._optimizer_parameter_groups()
+        parameter_names = {
+            id(parameter): name for name, parameter in self.named_parameters()
+        }
+        ft_counts = self._parameter_group_counts(ft_groups)
+        other_counts = self._parameter_group_counts(other_groups)
+        total_trainable = sum(
+            parameter.numel() for parameter in self.parameters()
+            if parameter.requires_grad)
+        if (ft_counts["trainable_elements"]
+                + other_counts["trainable_elements"] != total_trainable):
+            raise RuntimeError("Trainable parameter count does not add up")
+
+        if self.optimizer_layout_name is None:
+            ft_summary = optimizer_preset_summary(self.ft_optimizer_name, LR)
+            other_summary = optimizer_preset_summary(self.other_optimizer_name, LR)
+            print("[Optimizer configuration]")
+            print(f"FT optimizer    : {self.ft_optimizer_name} ({ft_summary['class']})")
+            print(f"FT params       : {ft_counts['trainable_elements']:,}")
+            print(f"FT param count  : {ft_counts['trainable_tensors']}")
+            print(f"FT logical      : ft_main=input.weight/input.bias; fm_embedding=input.v")
+            print(f"FT preset       : {self._format_optimizer_preset(ft_summary)}")
+            print(f"Other optimizer : {self.other_optimizer_name} ({other_summary['class']})")
+            print(f"Other params    : {other_counts['trainable_elements']:,}")
+            print(f"Other count     : {other_counts['trainable_tensors']}")
+            print(f"Other preset    : {self._format_optimizer_preset(other_summary)}")
+            print(f"Total trainable : {total_trainable:,}")
+        else:
+            layout = self.resolved_optimizer_layout()
+            inventory = self.optimizer_subgroup_inventory()
+            print("[Optimizer layout]")
+            print(f"name             : {self.optimizer_layout_name}")
+            frozen_elements = 0
+            estimated_state_bytes = 0
+            estimate_complete = True
+            for subgroup in PARAMETER_SUBGROUPS:
+                entries = inventory[subgroup]
+                elements = sum(parameter.numel() for _, parameter in entries)
+                preset_name = layout[subgroup]
+                if preset_name == "frozen":
+                    frozen_elements += elements
+                    preset_text = "frozen"
+                else:
+                    summary = optimizer_preset_summary(preset_name, LR)
+                    preset_text = (
+                        f"{preset_name} ({summary['class']}; "
+                        f"{self._format_optimizer_preset(summary)})")
+                    for _, parameter in entries:
+                        estimate = self._estimated_optimizer_state_bytes(
+                            preset_name, parameter)
+                        if estimate is None:
+                            estimate_complete = False
+                        else:
+                            estimated_state_bytes += estimate
+                print(
+                    f"{subgroup}: {preset_text}; tensors={len(entries)}, "
+                    f"params={elements:,}")
+                for parameter_name, _ in entries:
+                    print(f"  - {parameter_name}")
+            print(f"Trainable params : {total_trainable:,}")
+            print(f"Frozen params    : {frozen_elements:,}")
+            estimate_text = (
+                f"{estimated_state_bytes:,} bytes"
+                if estimate_complete else
+                f">= {estimated_state_bytes:,} bytes (partial estimate)")
+            print(f"Optimizer state estimate: {estimate_text}")
 
         """
     optimizer = ranger.Ranger(train_params, lr=LR, betas=(0.9, 0.999), eps=1e-8)
@@ -5672,16 +6173,76 @@ class NNUE(pl.LightningModule):
         }
     """
 
-        # --- SECTION 2: オプティマイザの構築 (AdamW 8-bit) ---
-        # メモリ節約と学習速度向上のため 8-bit AdamW を採用。
-        optimizer = bnb.optim.AdamW8bit(
-            train_params,
-            lr=LR,
-            betas=(0.9, 0.995),
-            eps=1e-7,
-            weight_decay=1e-6,
-            min_8bit_size=1000000
-        )
+        if self.optimizer_layout_name is not None:
+            layout = self.resolved_optimizer_layout()
+            groups_by_preset = {}
+            # Split the exact legacy param-group sequence, retaining relative
+            # LR and weight-decay overrides while merging equal presets.
+            for original in ft_groups + other_groups:
+                split = {}
+                for parameter in original["params"]:
+                    name = parameter_names[id(parameter)]
+                    subgroup = parameter_subgroup(name)
+                    preset_name = layout[subgroup]
+                    if preset_name == "frozen":
+                        raise RuntimeError(
+                            f"Frozen parameter reached optimizer: {name}")
+                    lr_override = optimizer_layout_lr_scale(
+                        self.optimizer_layout_name, subgroup)
+                    split.setdefault(
+                        (preset_name, lr_override), []).append(parameter)
+                for (preset_name, lr_override), parameters in split.items():
+                    copied = dict(original)
+                    copied["params"] = parameters
+                    if "lr" in copied:
+                        copied["lr"] = float(copied["lr"]) * lr_override
+                    groups_by_preset.setdefault(preset_name, []).append(copied)
+            children = []
+            for preset_name, groups in groups_by_preset.items():
+                children.append((
+                    preset_name,
+                    build_optimizer(
+                        preset_name, groups, LR,
+                        parameter_names=parameter_names),
+                ))
+            if len(children) == 1:
+                optimizer = children[0][1]
+            else:
+                optimizer = CompositeOptimizer(children)
+            actual = sum(
+                parameter.numel()
+                for group in optimizer.param_groups
+                for parameter in group["params"])
+            if actual != total_trainable:
+                raise RuntimeError(
+                    f"Optimizer registration mismatch: {actual} != "
+                    f"{total_trainable}")
+            print(f"Child optimizers : {len(children)}")
+            print("Optimizer state  : 0 bytes allocated before first step")
+        elif not ft_groups:
+            optimizer = build_optimizer(
+                self.other_optimizer_name, other_groups, LR,
+                parameter_names=parameter_names)
+            print("Optimizer layout : Other only (FT/Router frozen)")
+        elif self.ft_optimizer_name == self.other_optimizer_name:
+            # Default adamw8bit/adamw8bit follows the exact legacy group order
+            # and constructor arguments, preserving optimizer state layout.
+            optimizer = build_optimizer(
+                self.ft_optimizer_name, ft_groups + other_groups, LR,
+                parameter_names=parameter_names)
+            print("Optimizer layout : single optimizer (legacy-compatible)")
+        else:
+            ft_optimizer = build_optimizer(
+                self.ft_optimizer_name, ft_groups, LR,
+                parameter_names=parameter_names)
+            other_optimizer = build_optimizer(
+                self.other_optimizer_name, other_groups, LR,
+                parameter_names=parameter_names)
+            optimizer = CompositeOptimizer((
+                (f"ft:{self.ft_optimizer_name}", ft_optimizer),
+                (f"other:{self.other_optimizer_name}", other_optimizer),
+            ))
+            print("Optimizer layout : composite FT/Other; one Lightning optimizer")
 
         # --- SECTION 3: スケジューラの設定 ---
         scheduler = {
