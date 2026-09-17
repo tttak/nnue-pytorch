@@ -119,8 +119,41 @@ OPTIMIZER_LAYOUTS = {
     # AdamW8bit baseline and change only the dense Other parameters.
     "other_lamb": _layout("lamb", ft="adamw8bit"),
     "other_novograd": _layout("novograd", ft="adamw8bit"),
+    "other_ranger": _layout("ranger", ft="adamw8bit"),
     "other_sm3": _layout("sm3", ft="adamw8bit"),
     "other_stableadamw": _layout("stableadamw", ft="adamw8bit"),
+
+    "mixed_optimizer_sample": _layout(
+        "adamw",
+
+        ft="adamw8bit",
+
+        router="radam",
+
+        pair_weights="lion_other",
+
+        main_gates="lamb",
+        main_gates_control="adabeliefw",
+
+        l2_fc1_output="stableadamw",
+        l2_fc1_output_control="adabeliefw",
+
+        fm="novograd",
+        fm_control="adamw",
+
+        lca_cross="ranger",
+        lca_cross_control="adabeliefw",
+
+        qkv="radam",
+        qkv_control="adamw",
+
+        phase="sm3",
+        phase_control="adamw",
+
+        aux="lamb",
+        aux_control="adamw",
+    ),
+
 }
 
 # Reserved extension point.  Keeping LR multipliers separate from layouts

@@ -6066,6 +6066,8 @@ class NNUE(pl.LightningModule):
                 "adamw", "radam", "nadamw", "adabeliefw",
                 "lamb", "stableadamw"):
             return parameter.numel() * 8  # two FP32 moments
+        if preset_name == "ranger":
+            return parameter.numel() * 12  # two moments + Lookahead slow copy
         if preset_name == "adamw8bit":
             threshold = OPTIMIZER_PRESETS[preset_name]["kwargs"].get(
                 "min_8bit_size", 4096)

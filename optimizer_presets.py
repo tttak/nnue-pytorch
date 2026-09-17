@@ -14,9 +14,9 @@ import torch
 from adabelief import AdaBelief
 
 try:
-    from pytorch_optimizer import Lamb, NovoGrad, SM3, SOAP, StableAdamW
+    from pytorch_optimizer import Lamb, NovoGrad, Ranger, SM3, SOAP, StableAdamW
 except ImportError:  # Optional experiment dependency; default path stays usable.
-    Lamb = NovoGrad = SM3 = SOAP = StableAdamW = None
+    Lamb = NovoGrad = Ranger = SM3 = SOAP = StableAdamW = None
 
 
 OPTIMIZER_PRESETS = {
@@ -149,6 +149,24 @@ OPTIMIZER_PRESETS = {
             "weight_decouple": True,
             "fixed_decay": False,
             "grad_averaging": False,
+        },
+    },
+    "ranger": {
+        # RAdam + Lookahead from pytorch-optimizer.  The preset is intended
+        # first for the relatively small dense Other group; applying its FP32
+        # state to the 267M-parameter FT requires a separate memory study.
+        "class": Ranger,
+        "lr_scale": 1.0,
+        "kwargs": {
+            "betas": (0.95, 0.999),
+            "eps": 1e-5,
+            "weight_decay": 1e-6,
+            "weight_decouple": True,
+            "fixed_decay": False,
+            "alpha": 0.5,
+            "k": 6,
+            "use_gc": True,
+            "gc_conv_only": False,
         },
     },
     "sm3": {
