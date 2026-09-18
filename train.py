@@ -808,6 +808,7 @@ def main():
       optimizer_layout=args.optimizer_layout,
       reinit_groups=args.reinit_groups,
       reinit_seed=args.reinit_seed)
+    print("Fresh NNUE architecture:", M.nnue_architecture_metadata(nnue))
   else:
 
     # 「.pt」の場合

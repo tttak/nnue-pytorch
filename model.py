@@ -47,6 +47,17 @@ L3_LEGACY = 96
 L2_IN_TOTAL = 192
 L2_IN_TOTAL_WITHOUT_ABS_SQR = 160
 L2_IN_TOTAL_WITHOUT_MAIN_SQR = 128
+# Production compact128 layout.  These ordered source units must stay exactly
+# synchronized with the C++ USE_NNUE_L2_PHYSICAL_128 architecture.
+COMPACT128_CROSS_OUTPUT_DIMENSIONS = 16
+COMPACT128_FM_DIFF_UNITS = (
+    2, 10, 14, 13, 8, 6, 5, 28, 11, 3, 1, 15,
+    7, 9, 12, 4, 0, 23, 27, 24, 20, 16, 22, 17,
+)
+COMPACT128_FM_ABS_RAW_UNITS = (
+    10, 20, 28, 21, 8, 15, 4, 9, 19, 13, 17, 18,
+    3, 1, 6, 25, 24, 0, 14, 12, 2, 22, 5, 31,
+)
 NUM_LS_BUCKETS = 12
 PHASE_CHANNELS_LEGACY = 6
 PHASE_CHANNELS_NO_ABS_SQR = 5
@@ -315,8 +326,10 @@ def get_parameters(layers):
 class LayerStacks(nn.Module):
     def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
                  phase_output_dimensions=None, l3_dimensions=L3,
-                 cross_output_dimensions=32, l2_fm_diff_indices=None,
-                 l2_fm_abs_raw_indices=None, lca_qk_indices=None,
+                 cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS,
+                 l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS,
+                 l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS,
+                 lca_qk_indices=None,
                  lca_value_indices=None):
         super(LayerStacks, self).__init__()
         self.count = count
@@ -848,7 +861,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=32, l2_fm_diff_indices=None, l2_fm_abs_raw_indices=None, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None):
         super(NNUE, self).__init__()
         # Optional training-only attenuation for pairs whose raw teacher and
         # alternate ranking teacher order disagree.  1.0 is exactly legacy.
