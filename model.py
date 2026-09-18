@@ -4599,12 +4599,45 @@ class NNUE(pl.LightningModule):
         self.step_(batch, batch_idx, 'val_loss_lambda0.5')
         self.step_(batch, batch_idx, 'val_loss_lambda0.8')
 
-        optimizer = self.optimizers()
-        current_lr = optimizer.param_groups[0]['lr']
-        self.log('current_lr', current_lr, on_step=False, on_epoch=True)
-
     def test_step(self, batch, batch_idx):
         self.step_(batch, batch_idx, 'test_loss')
+
+    def on_validation_epoch_start(self):
+        optimizer = self.optimizers()
+        param_groups = optimizer.param_groups
+        if not param_groups:
+            return
+
+        # TensorBoardには代表値として先頭groupのLRだけを記録する。
+        current_lr = float(param_groups[0]["lr"])
+
+        print("[Optimizer parameter-group learning rates]")
+        parameter_names = {
+            id(parameter): name for name, parameter in self.named_parameters()
+        }
+        for group_index, group in enumerate(param_groups):
+            names = [
+                parameter_names.get(id(parameter), "<unknown>")
+                for parameter in group["params"]
+            ]
+            subgroups = list(dict.fromkeys(
+                parameter_subgroup(name)
+                for name in names
+                if name != "<unknown>"
+            ))
+            subgroup_text = "+".join(subgroups) if subgroups else "unknown"
+            parameter_text = ", ".join(names)
+            print(
+                f"  group {group_index:02d} [{subgroup_text}]: "
+                f"lr={float(group['lr']):.12g}; {parameter_text}"
+            )
+
+        if self.logger is not None:
+            self.logger.experiment.add_scalar(
+                "current_lr",
+                current_lr,
+                global_step=self.global_step,
+            )
 
     def on_validation_epoch_end(self):
         if hasattr(self, 'bucket_stats'):
