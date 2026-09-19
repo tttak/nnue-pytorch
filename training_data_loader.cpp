@@ -185,6 +185,70 @@ struct HalfKA_KSDG3 {
     }
 };
 
+// Experiment 69 variant D:
+//   HalfKA_hm1 + merged gold/promoted-minor rows for both HalfKA and KSDG3.
+//
+// Keep this as an explicit remap of the proven production extractor. This
+// guarantees that A (HalfKA_KSDG3) remains bit-for-bit unchanged while D can
+// be selected solely by the Python --features name.
+struct HalfKA_HM1_NoDG_KSDG3_NoDG {
+    static constexpr int KSDG_INPUTS = 12672;
+    static constexpr int OLD_BONA = 2358;
+    static constexpr int NODG_BONA = 1710;
+    static constexpr int INPUTS = KSDG_INPUTS + 45 * NODG_BONA;
+    static constexpr int MAX_ACTIVE_FEATURES = HalfKA_KSDG3::MAX_ACTIVE_FEATURES;
+
+    static int mirror_square(int sq) {
+        return (8 - sq / 9) * 9 + sq % 9;
+    }
+
+    static int map_bona(int p, bool mirror) {
+        if (mirror && p >= 90) {
+            const int q = p - 90;
+            p = 90 + (q / 81) * 81 + mirror_square(q % 81);
+        }
+        if (p >= 1548 && p < 2196)
+            p = 738 + (p - 1548) % 162;
+        if (p >= 2196)
+            p -= 648;
+        return p;
+    }
+
+    static int map_index(int index) {
+        if (index < KSDG_INPUTS) {
+            const int effect2 = index % 4;
+            int x = index / 4;
+            const int effect1 = x % 4;
+            x /= 4;
+            int pc = x % 33;
+            const int direct = x / 33;
+            if (pc >= 9 && pc <= 12)
+                pc = 7;
+            if (pc >= 25 && pc <= 28)
+                pc = 23;
+            return ((direct * 33 + pc) * 4 + effect1) * 4 + effect2;
+        }
+
+        const int h = index - KSDG_INPUTS;
+        int king = h / OLD_BONA;
+        int p = h % OLD_BONA;
+        const bool mirror = king >= 45;
+        if (mirror)
+            king = mirror_square(king);
+        p = map_bona(p, mirror);
+        return KSDG_INPUTS + king * NODG_BONA + p;
+    }
+
+    static std::pair<int, int> fill_features_sparse(
+        const TrainingDataEntry& e, int* features, float* values, Color color) {
+        auto result = HalfKA_KSDG3::fill_features_sparse(
+            e, features, values, color);
+        for (int i = 0; i < result.first; ++i)
+            features[i] = map_index(features[i]);
+        return {result.first, INPUTS};
+    }
+};
+
 struct HalfKA_KSDG3_Factorized {
     // RelKA
     static constexpr int NUN_PIECE_KINDS = (Eval::fe_end2 - Eval::fe_hand_end) / 81; // 28
@@ -669,6 +733,11 @@ extern "C" {
         {
             return new SparseBatch(FeatureSet<HalfKA_KSDG3_Factorized>{}, entries);
         }
+        else if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+        {
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>{}, entries);
+        }
 
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
@@ -712,6 +781,14 @@ extern "C" {
         {
             return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, skipPredicate);
         }
+        else if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+        {
+            return new FeaturedBatchStream<
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
+                    concurrency, filename1, filename2, filename3, train1_rate,
+                    train2_rate, skiprate, mirror, batch_size, cyclic,
+                    skipPredicate);
+        }
 
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
@@ -739,6 +816,12 @@ extern "C" {
                 ranking_target3_filename);
         if (feature_set == "HalfKA_KSDG3^")
             return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename);
+        if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+            return new FeaturedBatchStream<
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
                 concurrency, filename1, filename2, filename3, train1_rate,
                 train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
                 ranking_target3_filename);
