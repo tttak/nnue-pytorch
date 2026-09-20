@@ -8,6 +8,11 @@ import pytorch_lightning as pl
 import sys
 import json
 from pathlib import Path
+from side_input import (
+    SIDE_INPUT_SCHEMA_VERSION, SideInputType, SideInputFusion,
+    input_dimensions as side_input_dimensions,
+    normalize_side_input, normalize_side_input_fusion,
+)
 
 # from feature_transformer import DoubleFeatureTransformerSlice
 from feature_transformer import (
@@ -62,7 +67,7 @@ NUM_LS_BUCKETS = 12
 PHASE_CHANNELS_LEGACY = 6
 PHASE_CHANNELS_NO_ABS_SQR = 5
 PHASE5_KEEP_ROWS = (0, 1, 2, 3, 5)
-NNUE_ARCHITECTURE_METADATA_VERSION = 1
+NNUE_ARCHITECTURE_METADATA_VERSION = 2
 
 PHASE_CHANNEL_NAMES = {
     PHASE_CHANNELS_NO_ABS_SQR:
@@ -159,6 +164,12 @@ def nnue_architecture_metadata(model):
             model, "lca_value_indices",
             getattr(stacks, "lca_value_indices", tuple(range(32))))),
         "l2_input_physical": int(stacks.l2_in_total),
+        "side_input_type": str(getattr(model, "side_input_type", "none")),
+        "side_input_dim": int(getattr(model, "side_input_dim", 8)),
+        "side_input_fusion": str(getattr(
+            model, "side_input_fusion", "l2_residual")),
+        "side_input_schema_version": int(getattr(
+            model, "side_input_schema_version", SIDE_INPUT_SCHEMA_VERSION)),
     }
 
 
@@ -167,7 +178,7 @@ def nnue_architecture_kwargs(metadata):
     if not metadata:
         return {}
     version = int(metadata.get("version", NNUE_ARCHITECTURE_METADATA_VERSION))
-    if version != NNUE_ARCHITECTURE_METADATA_VERSION:
+    if version not in (1, NNUE_ARCHITECTURE_METADATA_VERSION):
         raise ValueError(f"unsupported NNUE architecture metadata version: {version}")
 
     saved_width = metadata.get("l2_input_physical")
@@ -193,6 +204,10 @@ def nnue_architecture_kwargs(metadata):
             "lca_qk_kept_source_units", range(32))),
         "lca_value_indices": tuple(int(v) for v in metadata.get(
             "lca_value_kept_source_units", range(32))),
+        "side_input_type": metadata.get("side_input_type", "none"),
+        "side_input_dim": int(metadata.get("side_input_dim", 8)),
+        "side_input_fusion": metadata.get(
+            "side_input_fusion", "l2_residual"),
     }
 
     # Validate the redundant physical width before any weights are loaded.
@@ -248,6 +263,12 @@ def checkpoint_architecture_metadata(checkpoint):
             "lca_value_kept_source_units": hparams.get(
                 "lca_value_indices", tuple(range(32))),
             "l2_input_physical": hparams.get("l2_input_physical"),
+            "side_input_type": hparams.get("side_input_type", "none"),
+            "side_input_dim": hparams.get("side_input_dim", 8),
+            "side_input_fusion": hparams.get(
+                "side_input_fusion", "l2_residual"),
+            "side_input_schema_version": hparams.get(
+                "side_input_schema_version", SIDE_INPUT_SCHEMA_VERSION),
         }
     return None
 
@@ -330,8 +351,22 @@ class LayerStacks(nn.Module):
                  l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS,
                  l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS,
                  lca_qk_indices=None,
-                 lca_value_indices=None):
+                 lca_value_indices=None, side_input_type="none",
+                 side_input_dim=8, side_input_fusion="l2_residual",
+                 safe_escape_experiment=False):
         super(LayerStacks, self).__init__()
+        # Experiment 76 only. Disabled by default, so the production parameter
+        # schema, forward result, serializer, and checkpoints remain unchanged.
+        # safe_escape_experiment is a weight-only migration alias for the
+        # Experiment 76 checkpoints. New code uses the generic side schema.
+        if safe_escape_experiment and side_input_type == "none":
+            side_input_type = "safe_escape"
+        self.side_input_type = normalize_side_input(side_input_type)
+        self.side_input_dim = int(side_input_dim)
+        self.side_input_fusion = normalize_side_input_fusion(side_input_fusion)
+        self.side_input_enabled = self.side_input_type != "none"
+        # Compatibility alias for Experiment 76 weight-only packages.
+        self.safe_escape_experiment = self.side_input_enabled
         self.count = count
         if l3_dimensions <= 0:
             raise ValueError("l3_dimensions must be positive")
@@ -410,6 +445,18 @@ class LayerStacks(nn.Module):
 
         # --- l2, output
         self.l2 = nn.Linear(self.l2_in_total, self.l3_dimensions * count)
+        if self.side_input_enabled:
+            if self.side_input_dim <= 0:
+                raise ValueError("side_input_dim must be positive")
+            self.side_input_encode = nn.Linear(
+                side_input_dimensions(self.side_input_type), self.side_input_dim)
+            self.side_input_l2_residual = nn.Linear(
+                self.side_input_dim, self.l2_in_total, bias=True)
+            # Baseline-preserving initialization: the side path is exactly zero
+            # until its own parameters are trained.
+            nn.init.zeros_(self.side_input_l2_residual.weight)
+            nn.init.zeros_(self.side_input_l2_residual.bias)
+
         self.output = nn.Linear(self.l3_dimensions, 1 * count)
 
         # --- blend
@@ -460,7 +507,43 @@ class LayerStacks(nn.Module):
         self.idx_offset = None
         self._init_layers()
 
+        # Runtime-only diagnostic cadence.  This deliberately is not a
+        # Parameter or persistent buffer, so old checkpoints need no migration.
         self.step_counter = 0
+        self.last_side_input_diagnostics = None
+        self.last_side_input_eval_delta = None
+        self.last_side_input_safe_count = None
+
+    def project_side_input(self, side_input, dtype, return_encoded=False):
+        if not self.side_input_enabled:
+            return (None, None) if return_encoded else None
+        if side_input is None:
+            raise RuntimeError(
+                f"{self.side_input_type} side input is enabled but missing")
+        encoded = self.side_input_encode(side_input.to(dtype=dtype))
+        residual = self.side_input_l2_residual(F.silu(encoded))
+        if return_encoded:
+            return encoded, residual
+        return residual
+
+    def fuse_side_input(self, l2_input, side_residual):
+        if side_residual is None:
+            return l2_input
+        if self.side_input_fusion != "l2_residual":
+            raise RuntimeError(
+                f"unsupported side-input fusion: {self.side_input_fusion}")
+        return torch.clamp(
+            l2_input + side_residual.unsqueeze(1), 0.0, 1.0)
+
+    @property
+    def safe_escape_encode(self):
+        """Experiment 76 source compatibility; not a second registered module."""
+        return self.side_input_encode
+
+    @property
+    def safe_escape_l2_residual(self):
+        """Experiment 76 source compatibility; not a second registered module."""
+        return self.side_input_l2_residual
 
     def _init_layers(self):
         with torch.no_grad():
@@ -511,7 +594,8 @@ class LayerStacks(nn.Module):
                 self.output.weight.data[i:i+1, :].copy_(self.output.weight.data[0:1, :])
                 self.output.bias.data[i:i+1].copy_(self.output.bias.data[0:1])
 
-    def forward(self, l1_main, diff_in, abs_in, ls_indices=None):
+    def forward(self, l1_main, diff_in, abs_in, ls_indices=None,
+                safe_escape_mask=None):
         if self.training:
             self.step_counter += 1
 
@@ -753,6 +837,116 @@ class LayerStacks(nn.Module):
 
         l2_input_all = torch.clamp(l2_input_all, 0.0, 1.0)
 
+        zero_mask_l2_input_for_diagnostics = None
+        if self.side_input_enabled:
+            side_encoded, side_residual = self.project_side_input(
+                safe_escape_mask, l2_input_all.dtype,
+                return_encoded=True)
+            if self.training and self.step_counter % 500 == 0:
+                # Scalars only: do not retain a batch-sized autograd graph or
+                # L2 tensor between diagnostics.  Side residual is broadcast
+                # over the 12 buckets, so its per-element abs mean is directly
+                # comparable to the base L2 per-element abs mean.
+                with torch.no_grad():
+                    mask = safe_escape_mask.detach().float()
+                    encoded_abs = side_encoded.detach().float().abs()
+                    residual_abs = side_residual.detach().float().abs()
+                    base_l2_abs_mean = (
+                        l2_input_all.detach().float().abs().mean().item())
+                    residual_abs_mean = residual_abs.mean().item()
+                    # Per-position ratio.  The side residual is shared by all
+                    # buckets, while the denominator averages the existing
+                    # pre-fusion L2 input over buckets and channels for that
+                    # position.  This exposes rare high-impact positions that
+                    # an aggregate ratio would hide.
+                    side_abs_per_position = residual_abs.mean(dim=1)
+                    base_abs_per_position = (
+                        l2_input_all.detach().float().abs().mean(dim=(1, 2)))
+                    ratio_per_position = (
+                        side_abs_per_position /
+                        (base_abs_per_position + 1e-12))
+                    ratio_quantiles = torch.quantile(
+                        ratio_per_position,
+                        torch.tensor(
+                            [0.5, 0.9, 0.99],
+                            device=ratio_per_position.device,
+                            dtype=ratio_per_position.dtype,
+                        ),
+                    )
+
+                    # Match the C2 cohorts used by Experiments 75/76.  The
+                    # low byte is the side-to-move king's safe-escape mask;
+                    # the high byte is the opponent's mask.  Keep the sample
+                    # count alongside the distribution because safe_count=0
+                    # can be sparse in an individual training batch.
+                    safe_count = (mask[:, :8] > 0.5).sum(dim=1)
+                    safe_count_cohorts = {}
+                    for label, selected in (
+                            ("0", safe_count == 0),
+                            ("1", safe_count == 1),
+                            (">=2", safe_count >= 2)):
+                        values = ratio_per_position[selected]
+                        if values.numel() == 0:
+                            safe_count_cohorts[label] = {
+                                "count": 0,
+                                "mean": float("nan"),
+                                "median": float("nan"),
+                                "p90": float("nan"),
+                                "p99": float("nan"),
+                            }
+                            continue
+                        quantiles = torch.quantile(
+                            values,
+                            torch.tensor(
+                                [0.5, 0.9, 0.99],
+                                device=values.device,
+                                dtype=values.dtype,
+                            ),
+                        )
+                        safe_count_cohorts[label] = {
+                            "count": values.numel(),
+                            "mean": values.mean().item(),
+                            "median": quantiles[0].item(),
+                            "p90": quantiles[1].item(),
+                            "p99": quantiles[2].item(),
+                        }
+                    self.last_side_input_diagnostics = {
+                        "mask_bit_on_rate": mask.mean().item(),
+                        "encoded_abs_mean": encoded_abs.mean().item(),
+                        "encoded_abs_std": encoded_abs.std(
+                            unbiased=False).item(),
+                        "residual_abs_mean": residual_abs_mean,
+                        "residual_abs_std": residual_abs.std(
+                            unbiased=False).item(),
+                        "base_l2_abs_mean": base_l2_abs_mean,
+                        "side_base_l2_ratio": (
+                            residual_abs_mean /
+                            (base_l2_abs_mean + 1e-12)),
+                        "side_base_ratio_mean": (
+                            ratio_per_position.mean().item()),
+                        "side_base_ratio_median": ratio_quantiles[0].item(),
+                        "side_base_ratio_p90": ratio_quantiles[1].item(),
+                        "side_base_ratio_p99": ratio_quantiles[2].item(),
+                        "safe_count_cohorts": safe_count_cohorts,
+                    }
+
+                    # Counterfactual input for the effective-eval diagnostic.
+                    # Only the mask tensor is zeroed: both side-path biases and
+                    # every other model parameter remain unchanged.  Reuse all
+                    # upstream activations and routing decisions, then evaluate
+                    # only the L2/output tail below.  This avoids a recursive
+                    # model forward and cannot overwrite Router/FM debug state.
+                    zero_mask = torch.zeros_like(safe_escape_mask)
+                    zero_mask_residual = self.project_side_input(
+                        zero_mask, l2_input_all.dtype)
+                    zero_mask_l2_input_for_diagnostics = (
+                        self.fuse_side_input(
+                            l2_input_all.detach(), zero_mask_residual)
+                    )
+                    self.last_side_input_safe_count = safe_count.detach()
+            l2_input_all = self.fuse_side_input(
+                l2_input_all, side_residual)
+
         # --- PHASE 6: Output (einsum による L2 & Output の高速一括計算) ---
         # ★ einsum による L2層の計算 [B, 12, L2_IN_DIM] -> [B, 12, L3]
         W_l2 = self.l2.weight.view(self.count, self.l3_dimensions, -1)
@@ -781,6 +975,34 @@ class LayerStacks(nn.Module):
 
         # 3. Router の選択重み（routing_weights: [B, count]）を掛けて本命の出力を算出: Shape [B, 1]
         final_output = (all_final_outputs * routing_weights).sum(dim=-1, keepdim=True)
+
+        if zero_mask_l2_input_for_diagnostics is not None:
+            # The normal result is reused from the real training forward.  The
+            # zero-mask branch is diagnostics-only and creates no autograd
+            # graph.  It deliberately uses the same routing weights, bypass,
+            # blend, and parameters as the normal result.
+            with torch.no_grad():
+                zero_l2c_all = torch.einsum(
+                    "bci,coi->bco",
+                    zero_mask_l2_input_for_diagnostics,
+                    W_l2,
+                ) + b_l2
+                zero_l2x_all = torch.clamp(zero_l2c_all, 0.0, 1.0)
+                zero_l3c_all = torch.einsum(
+                    "bci,coi->bco", zero_l2x_all, W_out
+                ) + b_out
+                zero_all_final_outputs = (
+                    zero_l3c_all * alpha_all
+                    + l1_main_bp_all.detach() * (1.0 - alpha_all)
+                ).squeeze(-1)
+                zero_final_output = (
+                    zero_all_final_outputs
+                    * routing_weights.detach()
+                ).sum(dim=-1, keepdim=True)
+                self.last_side_input_eval_delta = (
+                    final_output.detach().view(-1)
+                    - zero_final_output.view(-1)
+                )
 
         # --- PHASE 7: ログ・デバッグ用変数の抽出（ルーティング選択された1本のストリーム） ---
         w_expand = routing_weights.unsqueeze(-1)  # [B, 12, 1]
@@ -861,7 +1083,7 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False):
         super(NNUE, self).__init__()
         # Optional training-only attenuation for pairs whose raw teacher and
         # alternate ranking teacher order disagree.  1.0 is exactly legacy.
@@ -874,6 +1096,9 @@ class NNUE(pl.LightningModule):
         self.consensus_aux_strength = 0.0
         self.consensus_aux_beta = 0.05
         self.last_consensus_aux_stats = None
+        self._last_aux_debug_step = None
+        self._last_router_pairwise_debug_step = None
+        self._last_fm_pairwise_debug_step = None
         self.num_ls_buckets = NUM_LS_BUCKETS
         self.ft_optimizer_name = ft_optimizer
         self.other_optimizer_name = other_optimizer
@@ -890,6 +1115,13 @@ class NNUE(pl.LightningModule):
         self.feature_set = feature_set
         self.remove_abs_sqr_l2 = remove_abs_sqr_l2
         self.remove_main_sqr_l2 = remove_main_sqr_l2
+        if safe_escape_experiment and side_input_type == "none":
+            side_input_type = "safe_escape"
+        self.side_input_type = normalize_side_input(side_input_type)
+        self.side_input_dim = int(side_input_dim)
+        self.side_input_fusion = normalize_side_input_fusion(side_input_fusion)
+        self.side_input_schema_version = SIDE_INPUT_SCHEMA_VERSION
+        self.safe_escape_experiment = self.side_input_type != "none"
         self.phase_output_dimensions = (
             PHASE_CHANNELS_NO_ABS_SQR
             if phase_output_dimensions is None and remove_abs_sqr_l2
@@ -930,6 +1162,10 @@ class NNUE(pl.LightningModule):
             "optimizer_layout": self.optimizer_layout_name,
             "reinit_groups": list(self.reinit_groups),
             "reinit_seed": self.reinit_seed,
+            "side_input_type": self.side_input_type,
+            "side_input_dim": self.side_input_dim,
+            "side_input_fusion": self.side_input_fusion,
+            "side_input_schema_version": self.side_input_schema_version,
         })
         self.layer_stacks = LayerStacks(
             self.num_ls_buckets,
@@ -942,6 +1178,9 @@ class NNUE(pl.LightningModule):
             l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
             lca_qk_indices=self.lca_qk_indices,
             lca_value_indices=self.lca_value_indices,
+            side_input_type=self.side_input_type,
+            side_input_dim=self.side_input_dim,
+            side_input_fusion=self.side_input_fusion,
         )
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
@@ -1051,6 +1290,11 @@ class NNUE(pl.LightningModule):
         self.uncertainty_mid_threshold = 0.08444935
         self.uncertainty_high_threshold = 0.13851012
         self.last_teacher_uncertainty = None
+        # Runtime-only reference used by the 500-forward side-input
+        # diagnostic.  It is populated immediately before the student
+        # forward and cleared immediately afterwards; it is never serialized
+        # and never participates in the loss graph.
+        self._side_input_teacher_for_diagnostics = None
         self.last_uncertainty_weight = None
         self.capture_training_loss_components = False
         self.last_training_loss_components = None
@@ -1138,6 +1382,9 @@ class NNUE(pl.LightningModule):
                 l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
                 lca_qk_indices=self.lca_qk_indices,
                 lca_value_indices=self.lca_value_indices,
+                side_input_type=self.side_input_type,
+                side_input_dim=self.side_input_dim,
+                side_input_fusion=self.side_input_fusion,
             )
         source = dict(fresh.named_parameters())
         with torch.no_grad():
@@ -1265,7 +1512,7 @@ class NNUE(pl.LightningModule):
         else:
             raise Exception('Cannot change feature set from {} to {}.'.format(self.feature_set.name, new_feature_set.name))
 
-    def forward(self, us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices):
+    def forward(self, us, them, white_indices, white_values, black_indices, black_values, layer_stack_indices, safe_escape_mask=None):
 
         # --- PHASE 1: 入力埋め込みと特徴量分離 ---
         t_w, t_b, v_w, v_b = self.input(white_indices, white_values, black_indices, black_values)
@@ -1378,7 +1625,9 @@ class NNUE(pl.LightningModule):
         # --- PHASE 4: LayerStacks による深層処理 ---
         # ★ 途中から router の結果 (router_indices) を受け取る
         final_output, l3_out, l1_main_bp, l2_input, diff_gated, abs_gated, gate_d, gate_a, channel_stats, router_indices, router_logits, all_final_outputs, l1c_diff_gated_all, l1c_abs_gated_all = self.layer_stacks(
-            l1_main_input, diff_input, abs_input, ls_indices=layer_stack_indices
+            l1_main_input, diff_input, abs_input,
+            ls_indices=layer_stack_indices,
+            safe_escape_mask=safe_escape_mask,
         )
 
         # Main Auxiliary Head
@@ -1555,6 +1804,304 @@ class NNUE(pl.LightningModule):
             for section_name, section_tensor in l2_sections.items():
                 log_stats(section_name, section_tensor)
 
+            if self.layer_stacks.side_input_enabled:
+                side_stats = self.layer_stacks.last_side_input_diagnostics
+                if side_stats is not None:
+                    ratio = side_stats["side_base_l2_ratio"]
+                    cohort_lines = []
+                    for label in ("0", "1", ">=2"):
+                        cohort = side_stats["safe_count_cohorts"][label]
+                        if cohort["count"] == 0:
+                            cohort_lines.append(
+                                f"    safe_count {label:>3}: n=0 (N/A)")
+                        else:
+                            cohort_lines.append(
+                                f"    safe_count {label:>3}: "
+                                f"n={cohort['count']:5d}  "
+                                f"mean={cohort['mean'] * 100:.4f}%  "
+                                f"median={cohort['median'] * 100:.4f}%  "
+                                f"p90={cohort['p90'] * 100:.4f}%  "
+                                f"p99={cohort['p99'] * 100:.4f}%")
+                    print(
+                        # This diagnostic is triggered by dbg_cnt every 500
+                        # training forwards.  During the 500th forward,
+                        # Lightning's completed optimizer-step counter is
+                        # still 499, so label it with the matching diagnostic
+                        # cadence rather than the pre-step global_step.
+                        f"[Side Input Diagnostics](Step {self.dbg_cnt})\n"
+                        f"  Mask bit ON rate            : "
+                        f"{side_stats['mask_bit_on_rate'] * 100:7.3f}%\n"
+                        f"  Side_Encode abs mean/std    : "
+                        f"{side_stats['encoded_abs_mean']:.6e} / "
+                        f"{side_stats['encoded_abs_std']:.6e} "
+                        f"(pre-SiLU)\n"
+                        f"  Side_L2 residual abs mean/std: "
+                        f"{side_stats['residual_abs_mean']:.6e} / "
+                        f"{side_stats['residual_abs_std']:.6e}\n"
+                        f"  Existing L2 input abs mean  : "
+                        f"{side_stats['base_l2_abs_mean']:.6e}\n"
+                        f"  Side / base L2 ratio        : "
+                        f"{ratio:.6e} ({ratio * 100:.4f}%) "
+                        f"(aggregate)\n"
+                        f"  Ratio/position mean         : "
+                        f"{side_stats['side_base_ratio_mean']:.6e} "
+                        f"({side_stats['side_base_ratio_mean'] * 100:.4f}%)\n"
+                        f"  Ratio/position median       : "
+                        f"{side_stats['side_base_ratio_median']:.6e} "
+                        f"({side_stats['side_base_ratio_median'] * 100:.4f}%)\n"
+                        f"  Ratio/position p90          : "
+                        f"{side_stats['side_base_ratio_p90']:.6e} "
+                        f"({side_stats['side_base_ratio_p90'] * 100:.4f}%)\n"
+                        f"  Ratio/position p99          : "
+                        f"{side_stats['side_base_ratio_p99']:.6e} "
+                        f"({side_stats['side_base_ratio_p99'] * 100:.4f}%)\n"
+                        f"  Ratio by safe_count (side-to-move mask):\n"
+                        + "\n".join(cohort_lines)
+                    )
+
+                    eval_delta = (
+                        self.layer_stacks.last_side_input_eval_delta)
+                    eval_safe_count = (
+                        self.layer_stacks.last_side_input_safe_count)
+                    if eval_delta is not None and eval_safe_count is not None:
+                        delta_cp = (
+                            eval_delta.detach().float() * self.nnue2score)
+                        safe_count = eval_safe_count.detach().float()
+
+                        def contribution_summary(values, counts):
+                            if values.numel() == 0:
+                                return {
+                                    "count": 0,
+                                    "mean": float("nan"),
+                                    "abs_mean": float("nan"),
+                                    "abs_median": float("nan"),
+                                    "abs_p90": float("nan"),
+                                    "abs_p99": float("nan"),
+                                    "positive": float("nan"),
+                                    "negative": float("nan"),
+                                    "near_zero": float("nan"),
+                                    "normalized_abs_mean": float("nan"),
+                                }
+                            absolute = values.abs()
+                            quantiles = torch.quantile(
+                                absolute,
+                                torch.tensor(
+                                    [0.5, 0.9, 0.99],
+                                    device=absolute.device,
+                                    dtype=absolute.dtype,
+                                ),
+                            )
+                            return {
+                                "count": values.numel(),
+                                "mean": values.mean().item(),
+                                "abs_mean": absolute.mean().item(),
+                                "abs_median": quantiles[0].item(),
+                                "abs_p90": quantiles[1].item(),
+                                "abs_p99": quantiles[2].item(),
+                                # Keep these mutually exclusive.  Values with
+                                # |delta| < 0.5 cp belong to near-zero.
+                                "positive": (values >= 0.5).float().mean().item(),
+                                "negative": (values <= -0.5).float().mean().item(),
+                                "near_zero": (absolute < 0.5).float().mean().item(),
+                                "normalized_abs_mean": (
+                                    absolute / counts.clamp_min(1.0)
+                                ).mean().item(),
+                            }
+
+                        def pearson(x, y):
+                            x = x.float()
+                            y = y.float()
+                            x_centered = x - x.mean()
+                            y_centered = y - y.mean()
+                            denominator = torch.sqrt(
+                                x_centered.square().sum()
+                                * y_centered.square().sum())
+                            if denominator.item() <= 0.0:
+                                return float("nan")
+                            return (
+                                (x_centered * y_centered).sum()
+                                / denominator
+                            ).item()
+
+                        all_contribution = contribution_summary(
+                            delta_cp, safe_count)
+                        contribution_cohorts = {}
+                        for label, selected in (
+                                ("0", safe_count == 0),
+                                ("1", safe_count == 1),
+                                (">=2", safe_count >= 2)):
+                            contribution_cohorts[label] = (
+                                contribution_summary(
+                                    delta_cp[selected], safe_count[selected])
+                            )
+
+                        corr_signed = pearson(delta_cp, safe_count)
+                        corr_absolute = pearson(delta_cp.abs(), safe_count)
+                        contribution_lines = []
+                        for label in ("0", "1", ">=2"):
+                            cohort = contribution_cohorts[label]
+                            if cohort["count"] == 0:
+                                contribution_lines.append(
+                                    f"    safe_count {label:>3}: n=0 (N/A)")
+                                continue
+                            contribution_lines.append(
+                                f"    safe_count {label:>3}: "
+                                f"n={cohort['count']:5d}  "
+                                f"mean={cohort['mean']:+.3f}cp  "
+                                f"abs_mean={cohort['abs_mean']:.3f}cp  "
+                                f"median={cohort['abs_median']:.3f}cp  "
+                                f"p90={cohort['abs_p90']:.3f}cp  "
+                                f"p99={cohort['abs_p99']:.3f}cp  "
+                                f"pos={cohort['positive'] * 100:.2f}%  "
+                                f"neg={cohort['negative'] * 100:.2f}%  "
+                                f"abs/popcount="
+                                f"{cohort['normalized_abs_mean']:.3f}cp")
+
+                        print(
+                            f"[Side Input Effective Eval Contribution]"
+                            f"(Step {self.dbg_cnt})\n"
+                            f"  All:\n"
+                            f"    Delta cp mean       : "
+                            f"{all_contribution['mean']:+.4f}\n"
+                            f"    |Delta cp| mean     : "
+                            f"{all_contribution['abs_mean']:.4f}\n"
+                            f"    |Delta cp| median   : "
+                            f"{all_contribution['abs_median']:.4f}\n"
+                            f"    |Delta cp| p90      : "
+                            f"{all_contribution['abs_p90']:.4f}\n"
+                            f"    |Delta cp| p99      : "
+                            f"{all_contribution['abs_p99']:.4f}\n"
+                            f"    positive            : "
+                            f"{all_contribution['positive'] * 100:.3f}%\n"
+                            f"    negative            : "
+                            f"{all_contribution['negative'] * 100:.3f}%\n"
+                            f"    near-zero (<0.5cp)  : "
+                            f"{all_contribution['near_zero'] * 100:.3f}%\n"
+                            f"  By safe_count (side-to-move mask):\n"
+                            + "\n".join(contribution_lines)
+                            + "\n"
+                            f"  Corr:\n"
+                            f"    corr(delta_cp, safe_count)   = "
+                            f"{corr_signed:+.6f}\n"
+                            f"    corr(|delta_cp|, safe_count) = "
+                            f"{corr_absolute:+.6f}"
+                        )
+
+                        teacher_cp = getattr(
+                            self,
+                            "_side_input_teacher_for_diagnostics",
+                            None,
+                        )
+                        if teacher_cp is not None:
+                            teacher_cp = teacher_cp.detach().float()
+                            normal_cp = (
+                                final_output.detach().float().view(-1)
+                                * self.nnue2score
+                            )
+                            if teacher_cp.numel() != normal_cp.numel():
+                                raise RuntimeError(
+                                    "side-input teacher diagnostic batch "
+                                    "size mismatch: "
+                                    f"teacher={teacher_cp.numel()} "
+                                    f"prediction={normal_cp.numel()}"
+                                )
+                            zero_cp = normal_cp - delta_cp
+                            zero_error = (zero_cp - teacher_cp).abs()
+                            normal_error = (normal_cp - teacher_cp).abs()
+                            # Positive means that using the real mask moves
+                            # the prediction closer to the training teacher.
+                            teacher_improvement = zero_error - normal_error
+
+                            def teacher_improvement_summary(selected):
+                                gain = teacher_improvement[selected]
+                                error_zero = zero_error[selected]
+                                error_normal = normal_error[selected]
+                                if gain.numel() == 0:
+                                    return {
+                                        "count": 0,
+                                        "zero_mae": float("nan"),
+                                        "normal_mae": float("nan"),
+                                        "mean": float("nan"),
+                                        "median": float("nan"),
+                                        "p10": float("nan"),
+                                        "p90": float("nan"),
+                                        "improved": float("nan"),
+                                        "worsened": float("nan"),
+                                        "near_tie": float("nan"),
+                                    }
+                                quantiles = torch.quantile(
+                                    gain,
+                                    torch.tensor(
+                                        [0.1, 0.5, 0.9],
+                                        device=gain.device,
+                                        dtype=gain.dtype,
+                                    ),
+                                )
+                                # 0.01 cp avoids classifying floating-point
+                                # roundoff as a useful/harmful teacher move.
+                                near_tie = gain.abs() < 0.01
+                                return {
+                                    "count": gain.numel(),
+                                    "zero_mae": error_zero.mean().item(),
+                                    "normal_mae": error_normal.mean().item(),
+                                    "mean": gain.mean().item(),
+                                    "median": quantiles[1].item(),
+                                    "p10": quantiles[0].item(),
+                                    "p90": quantiles[2].item(),
+                                    "improved": (gain >= 0.01).float().mean().item(),
+                                    "worsened": (gain <= -0.01).float().mean().item(),
+                                    "near_tie": near_tie.float().mean().item(),
+                                }
+
+                            all_selected = torch.ones_like(
+                                safe_count, dtype=torch.bool)
+                            teacher_all = teacher_improvement_summary(
+                                all_selected)
+                            teacher_cohort_lines = []
+                            for label, selected in (
+                                    ("0", safe_count == 0),
+                                    ("1", safe_count == 1),
+                                    (">=2", safe_count >= 2)):
+                                cohort = teacher_improvement_summary(selected)
+                                if cohort["count"] == 0:
+                                    teacher_cohort_lines.append(
+                                        f"    safe_count {label:>3}: n=0 (N/A)")
+                                    continue
+                                teacher_cohort_lines.append(
+                                    f"    safe_count {label:>3}: "
+                                    f"n={cohort['count']:5d}  "
+                                    f"gain_mean={cohort['mean']:+.4f}cp  "
+                                    f"median={cohort['median']:+.4f}cp  "
+                                    f"p10={cohort['p10']:+.4f}cp  "
+                                    f"p90={cohort['p90']:+.4f}cp  "
+                                    f"improved={cohort['improved'] * 100:.2f}%  "
+                                    f"worsened={cohort['worsened'] * 100:.2f}%")
+
+                            print(
+                                "  Teacher MAE effect:\n"
+                                "    gain definition       : "
+                                "|zero-teacher|-|normal-teacher| "
+                                "(positive is better)\n"
+                                f"    zero-mask MAE         : "
+                                f"{teacher_all['zero_mae']:.4f}cp\n"
+                                f"    normal-mask MAE       : "
+                                f"{teacher_all['normal_mae']:.4f}cp\n"
+                                f"    gain mean             : "
+                                f"{teacher_all['mean']:+.4f}cp\n"
+                                f"    gain median           : "
+                                f"{teacher_all['median']:+.4f}cp\n"
+                                f"    gain p10 / p90        : "
+                                f"{teacher_all['p10']:+.4f} / "
+                                f"{teacher_all['p90']:+.4f}cp\n"
+                                f"    improved / worsened   : "
+                                f"{teacher_all['improved'] * 100:.3f}% / "
+                                f"{teacher_all['worsened'] * 100:.3f}%\n"
+                                f"    near-tie (<0.01cp)    : "
+                                f"{teacher_all['near_tie'] * 100:.3f}%\n"
+                                "  Teacher gain by safe_count:\n"
+                                + "\n".join(teacher_cohort_lines)
+                            )
+
             if self.input.v.grad is not None:
                 v_grad_mean = self.input.v.grad.abs().mean().item()
                 m_grad_mean = self.input.weight.grad.abs().mean().item()
@@ -1628,6 +2175,29 @@ class NNUE(pl.LightningModule):
                 ("L2_Weight (Sum) ", self.layer_stacks.l2.weight.detach().cpu(), self.layer_stacks.l2.weight.grad.detach().cpu() if self.layer_stacks.l2.weight.grad is not None else None, self.layer_stacks.l2.bias.detach().cpu()),
                 ("Output_Weight   ", self.layer_stacks.output.weight.detach().cpu(), self.layer_stacks.output.weight.grad.detach().cpu() if self.layer_stacks.output.weight.grad is not None else None, self.layer_stacks.output.bias.detach().cpu())
             ]
+
+            # Optional dense/context input parameters use the same statistics
+            # definition as every other row.  Keep the production/default
+            # table byte-for-byte unchanged when side input is disabled.
+            if self.layer_stacks.side_input_enabled:
+                side_encode = self.layer_stacks.side_input_encode
+                side_residual = self.layer_stacks.side_input_l2_residual
+                parts.extend([
+                    (
+                        "Side_Encode",
+                        side_encode.weight.detach().cpu(),
+                        side_encode.weight.grad.detach().cpu()
+                        if side_encode.weight.grad is not None else None,
+                        side_encode.bias.detach().cpu(),
+                    ),
+                    (
+                        "Side_L2_Residual",
+                        side_residual.weight.detach().cpu(),
+                        side_residual.weight.grad.detach().cpu()
+                        if side_residual.weight.grad is not None else None,
+                        side_residual.bias.detach().cpu(),
+                    ),
+                ])
 
             phase_names = ["Open", "Mid1", "Mid2", "End "]
             for p in range(4):
@@ -1900,6 +2470,11 @@ class NNUE(pl.LightningModule):
             ply,
             *optional_ranking_target,
         ) = batch
+        safe_escape_mask = None
+        if self.side_input_type != "none":
+            if not optional_ranking_target:
+                raise RuntimeError("side-input batch tensor is missing")
+            safe_escape_mask = optional_ranking_target.pop()
         ranking_score = (
             optional_ranking_target[0]
             if optional_ranking_target else score
@@ -1916,16 +2491,30 @@ class NNUE(pl.LightningModule):
         self.print_mem("Before Student Forward")
 
         # Studentモデル推論
-        with torch.profiler.record_function("NNUE/student_forward"):
-            scorenet, router_logits, all_final_outputs, main_score, residual_pred = self(
-                us,
-                them,
-                white_indices,
-                white_values,
-                black_indices,
-                black_values,
-                layer_stack_indices,
-            )
+        side_diagnostic_due = (
+            self.training
+            and self.side_input_type != "none"
+            and (self.layer_stacks.step_counter + 1) % 500 == 0
+        )
+        self._side_input_teacher_for_diagnostics = (
+            score.detach().view(-1) if side_diagnostic_due else None
+        )
+        try:
+            with torch.profiler.record_function("NNUE/student_forward"):
+                scorenet, router_logits, all_final_outputs, main_score, residual_pred = self(
+                    us,
+                    them,
+                    white_indices,
+                    white_values,
+                    black_indices,
+                    black_values,
+                    layer_stack_indices,
+                    safe_escape_mask=safe_escape_mask,
+                )
+        finally:
+            # Do not retain a full batch tensor past this one diagnostic
+            # forward, including when forward raises an exception.
+            self._side_input_teacher_for_diagnostics = None
         self.print_mem("After Student Forward")  # 活性化値（中間テンソル）の保持量を計測
 
         scorenet = scorenet * self.nnue2score
@@ -2133,6 +2722,7 @@ class NNUE(pl.LightningModule):
                 black_indices,
                 black_values,
                 layer_stack_indices,
+                safe_escape_mask,
             )
 
         # --- 3-3. Router 関連損失 ---
@@ -2758,6 +3348,7 @@ class NNUE(pl.LightningModule):
         black_indices,
         black_values,
         layer_stack_indices,
+        safe_escape_mask=None,
     ) -> torch.Tensor:
         """EMA (Teacher) モデルとの Consistency Loss を計算する。"""
 
@@ -2772,6 +3363,7 @@ class NNUE(pl.LightningModule):
                 black_indices,
                 black_values,
                 layer_stack_indices,
+                safe_escape_mask=safe_escape_mask,
             )
             # ★ cp 単位への変換 (* self.nnue2score) は EMA Loss の計算では行わない
 
@@ -3222,8 +3814,14 @@ class NNUE(pl.LightningModule):
                     mean_logit_diff = torch.tensor(0.0, device=device)
                     mean_error_diff = torch.tensor(0.0, device=device)
 
-        if collect_diagnostics and (self.global_step % 500 == 0):
-            print(f"[Router Pairwise](Step {self.global_step})")
+        router_pairwise_debug_step = int(self.global_step)
+        if (collect_diagnostics
+                and self.training
+                and router_pairwise_debug_step % 500 == 0
+                and self._last_router_pairwise_debug_step
+                    != router_pairwise_debug_step):
+            self._last_router_pairwise_debug_step = router_pairwise_debug_step
+            print(f"[Router Pairwise](Step {router_pairwise_debug_step})")
             print(
                 f"  Pairwise Loss: {pairwise_loss.item():.6f}"
             )
@@ -3854,9 +4452,19 @@ class NNUE(pl.LightningModule):
         corr_bucket = torch.stack(corr_bucket)
 
         # ---- Console ----
-        if self.global_step % 500 == 0:
+        # Validation sanity batches all run while global_step is still zero.
+        # Without the training guard and per-step latch this block prints the
+        # same "Step 0" report once for every validation batch.  TensorBoard
+        # metrics above remain collected for both train/validation; only the
+        # verbose console report is throttled here.
+        aux_debug_step = int(self.global_step)
+        if (self.training
+                and aux_debug_step % 500 == 0
+                and getattr(self, "_last_aux_debug_step", None)
+                    != aux_debug_step):
+            self._last_aux_debug_step = aux_debug_step
             # ---- 全bucketをまとめた統計
-            print(f"\n[AUX DEBUG](Step {self.global_step})")
+            print(f"\n[AUX DEBUG](Step {aux_debug_step})")
             print(
                 f"  Main score       : "
                 f"{main_score_flat.mean():.4f} ± {main_score_flat.std():.4f}"
@@ -4024,9 +4632,13 @@ class NNUE(pl.LightningModule):
         # --------------------------------------------------
         # Debug
         # --------------------------------------------------
-        if collect_diagnostics and (
-            self.global_step % 500 == 0
-        ):
+        fm_pairwise_debug_step = int(self.global_step)
+        if (collect_diagnostics
+                and self.training
+                and fm_pairwise_debug_step % 500 == 0
+                and self._last_fm_pairwise_debug_step
+                    != fm_pairwise_debug_step):
+            self._last_fm_pairwise_debug_step = fm_pairwise_debug_step
             (
                 debug_loss,
                 debug_agreement,
@@ -4041,7 +4653,7 @@ class NNUE(pl.LightningModule):
                 res_std.detach().float(),
             ]).cpu().tolist()
             print(
-                f"\n[DEBUG FM Pairwise](Step {self.global_step}) "
+                f"\n[DEBUG FM Pairwise](Step {fm_pairwise_debug_step}) "
                 f"Loss: {debug_loss:.6f} | "
                 f"Agr: {debug_agreement:.2%} | "
                 f"Corr: {debug_corr:.4f} | "
@@ -5838,6 +6450,9 @@ class NNUE(pl.LightningModule):
                 l2_fm_abs_raw_indices=self.l2_fm_abs_raw_indices,
                 lca_qk_indices=self.lca_qk_indices,
                 lca_value_indices=self.lca_value_indices,
+                side_input_type=self.side_input_type,
+                side_input_dim=self.side_input_dim,
+                side_input_fusion=self.side_input_fusion,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
@@ -5908,6 +6523,11 @@ class NNUE(pl.LightningModule):
             "reinit_layout": "cli_groups" if self.reinit_groups else None,
             "reinit_groups": list(self.reinit_groups),
             "reinit_seed": self.reinit_seed,
+            "side_input_type": architecture["side_input_type"],
+            "side_input_dim": architecture["side_input_dim"],
+            "side_input_fusion": architecture["side_input_fusion"],
+            "side_input_schema_version": architecture[
+                "side_input_schema_version"],
         }
         checkpoint.setdefault("hyper_parameters", {}).update({
             "remove_abs_sqr_l2": architecture["remove_abs_sqr_l2"],
@@ -5925,6 +6545,11 @@ class NNUE(pl.LightningModule):
             "optimizer_layout": self.optimizer_layout_name,
             "reinit_groups": list(self.reinit_groups),
             "reinit_seed": self.reinit_seed,
+            "side_input_type": architecture["side_input_type"],
+            "side_input_dim": architecture["side_input_dim"],
+            "side_input_fusion": architecture["side_input_fusion"],
+            "side_input_schema_version": architecture[
+                "side_input_schema_version"],
         })
 
     def on_load_checkpoint(self, checkpoint):
@@ -5998,9 +6623,34 @@ class NNUE(pl.LightningModule):
             current_kwargs = nnue_architecture_kwargs(
                 nnue_architecture_metadata(self))
             if saved_kwargs != current_kwargs:
-                raise ValueError(
-                    "checkpoint NNUE architecture does not match the "
-                    "constructed model")
+                differing_keys = {
+                    key for key in set(saved_kwargs) | set(current_kwargs)
+                    if saved_kwargs.get(key) != current_kwargs.get(key)
+                }
+                side_only_migration = differing_keys.issubset({
+                    "side_input_type",
+                    "side_input_dim",
+                    "side_input_fusion",
+                })
+                # ``load_from_checkpoint(strict=False)`` is also used by
+                # train.py for an explicitly weight-only architecture
+                # migration.  Adding/removing the optional side path is safe:
+                # every pre-existing tensor keeps the same name and shape,
+                # while a newly added path retains its baseline-preserving
+                # zero initialization.  A training-state resume remains
+                # strict because optimizer/loop state must use an identical
+                # parameter schema.
+                if not (side_only_migration
+                        and not self.enforce_optimizer_checkpoint_match):
+                    raise ValueError(
+                        "checkpoint NNUE architecture does not match the "
+                        "constructed model; differing fields="
+                        f"{sorted(differing_keys)}")
+                print(
+                    "Weight-only optional side-input migration: "
+                    f"saved={saved_kwargs.get('side_input_type', 'none')} "
+                    f"-> current={current_kwargs.get('side_input_type', 'none')}; "
+                    "new side parameters keep their zero initialization.")
         state_dict = checkpoint.get("state_dict", {})
         for k in [k for k in state_dict.keys() if k.startswith("ema_model.")]:
             del state_dict[k]
@@ -6045,6 +6695,22 @@ class NNUE(pl.LightningModule):
             {'params': [self.layer_stacks.output.bias], 'lr': LR * 1.0, 'weight_decay': 0.0},
             {'params': [self.layer_stacks.blend], 'lr': LR * 1.0, 'weight_decay': 0.0},
         ]
+        # Optional dense/context paths are logically part of Other.  Keep
+        # this legacy FT/Other inventory complete even when an optimizer
+        # layout is selected: configure_optimizers() uses it for the global
+        # no-missing/no-duplicate invariant before dispatching parameters to
+        # the layout's child optimizers.
+        if self.side_input_type != "none":
+            other_groups.extend([
+                {'params': [self.layer_stacks.side_input_encode.weight],
+                 'lr': LR * 1.0, 'weight_decay': 0.0},
+                {'params': [self.layer_stacks.side_input_encode.bias],
+                 'lr': LR * 1.0, 'weight_decay': 0.0},
+                {'params': [self.layer_stacks.side_input_l2_residual.weight],
+                 'lr': LR * 1.0, 'weight_decay': 0.0},
+                {'params': [self.layer_stacks.side_input_l2_residual.bias],
+                 'lr': LR * 1.0, 'weight_decay': 0.0},
+            ])
 
         classified = [
             parameter

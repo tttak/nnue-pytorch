@@ -85,6 +85,8 @@ UNCERTAINTY_DESCRIPTION_SUFFIX = "-UncertaintyBucket12x64"
 UNCERTAINTY_FC_HASH_XOR = 0x00554E43
 HAO_RISK_DESCRIPTION_SUFFIX = "-HaoSearchRiskContextFc1V1"
 HAO_RISK_FC_HASH_XOR = 0x48414F52
+SIDE_SAFE_DESCRIPTION_SUFFIX = "-SideSafe8"
+SIDE_SAFE_FC_HASH_XOR = 0x53414645
 # Keep serializer detection tied to the same source-unit ordering used by a
 # freshly constructed Python production model.
 COMPACT128_FM_DIFF_UNITS = M.COMPACT128_FM_DIFF_UNITS
@@ -150,9 +152,22 @@ class NNUEWriter():
     if (hao_risk_heads is not None
         and not description.endswith(HAO_RISK_DESCRIPTION_SUFFIX)):
       description += HAO_RISK_DESCRIPTION_SUFFIX
+    side_enabled = getattr(model, 'side_input_type', 'none') != 'none'
+    if side_enabled:
+      if (model.side_input_type != 'safe_escape'
+          or model.side_input_dim != 8
+          or model.side_input_fusion != 'l2_residual'):
+        raise ValueError('nn.bin supports only safe_escape/dim8/l2_residual')
+      if not description.endswith(SIDE_SAFE_DESCRIPTION_SUFFIX):
+        description += SIDE_SAFE_DESCRIPTION_SUFFIX
+      if uncertainty_head is not None or hao_risk_heads is not None:
+        raise ValueError(
+            "side-input variants cannot be combined with legacy diagnostic "
+            "trailing heads in schema version 1")
     if uncertainty_head is not None and hao_risk_heads is not None:
       raise ValueError("legacy uncertainty and Hao risk heads are mutually exclusive")
     architecture_description = description.removesuffix(
+        SIDE_SAFE_DESCRIPTION_SUFFIX).removesuffix(
         UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     description_is_fc1x64 = (
         PHASE5_FC1X64_DESCRIPTION in architecture_description
@@ -283,6 +298,16 @@ class NNUEWriter():
         self.write_blend_param(bucket_blend)
       print(f"Bucket Blend END [Pos: {len(self.buf)}]")
 
+      if side_enabled:
+        for tensor in (
+            model.layer_stacks.side_input_encode.weight,
+            model.layer_stacks.side_input_encode.bias,
+            model.layer_stacks.side_input_l2_residual.weight,
+            model.layer_stacks.side_input_l2_residual.bias):
+          self.buf.extend(to_numpy(tensor).astype(
+              np.float32, copy=False).tobytes())
+        print(f"Side Input SAFE_ESCAPE END [Pos: {len(self.buf)}]")
+
       if uncertainty_head is not None:
         weight = to_numpy(uncertainty_weight[bucket_index]).astype(
             np.float32, copy=False)
@@ -348,6 +373,8 @@ class NNUEWriter():
       layer_hash ^= LCA24_FC_HASH_XOR
     elif lca_width == 16:
       layer_hash ^= LCA16_FC_HASH_XOR
+    if getattr(model, 'side_input_type', 'none') != 'none':
+      layer_hash ^= SIDE_SAFE_FC_HASH_XOR
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
@@ -576,9 +603,11 @@ class NNUEReader():
         UNCERTAINTY_DESCRIPTION_SUFFIX)
     self.has_hao_risk_heads = self.description.endswith(
         HAO_RISK_DESCRIPTION_SUFFIX)
+    self.has_side_input = SIDE_SAFE_DESCRIPTION_SUFFIX in self.description
     if self.has_uncertainty_head and self.has_hao_risk_heads:
       raise Exception('Conflicting diagnostic head suffixes')
     architecture_description = self.description.removesuffix(
+        SIDE_SAFE_DESCRIPTION_SUFFIX).removesuffix(
         UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     is_compact128 = architecture_description in (
         COMPACT128_DESCRIPTION, LCA24_DESCRIPTION, LCA16_DESCRIPTION)
@@ -619,7 +648,9 @@ class NNUEReader():
         l2_fm_abs_raw_indices=(
             COMPACT128_FM_ABS_RAW_UNITS if is_compact128 else None),
         lca_qk_indices=lca_qk_indices,
-        lca_value_indices=lca_value_indices)
+        lca_value_indices=lca_value_indices,
+        side_input_type='safe_escape' if self.has_side_input else 'none',
+        side_input_dim=8, side_input_fusion='l2_residual')
     fc_hash = NNUEWriter.fc_hash(self.model)
     if self.has_uncertainty_head:
       fc_hash ^= UNCERTAINTY_FC_HASH_XOR
@@ -719,6 +750,26 @@ class NNUEReader():
       int_alpha = self.read_int32() 
       serialized_bucket_blend_alpha.append(int_alpha)
       bucket_blend_val = float(int_alpha) / 16384.0
+      if self.has_side_input:
+        side_values = (
+            self.tensor(np.float32, [8, 16]),
+            self.tensor(np.float32, [8]),
+            self.tensor(np.float32, [self.model.layer_stacks.l2_in_total, 8]),
+            self.tensor(np.float32, [self.model.layer_stacks.l2_in_total]),
+        )
+        targets = (
+            self.model.layer_stacks.side_input_encode.weight,
+            self.model.layer_stacks.side_input_encode.bias,
+            self.model.layer_stacks.side_input_l2_residual.weight,
+            self.model.layer_stacks.side_input_l2_residual.bias,
+        )
+        if i == 0:
+          for target, value in zip(targets, side_values):
+            target.data.copy_(value)
+        else:
+          for target, value in zip(targets, side_values):
+            if not torch.equal(target.data, value):
+              raise Exception('side-input parameters differ between buckets')
       if self.has_uncertainty_head:
         uncertainty_weight[i] = self.tensor(np.float32, [64])
         uncertainty_bias[i] = struct.unpack('<f', self.f.read(4))[0]
@@ -1038,7 +1089,11 @@ def main():
             l2_fm_diff_indices=l2_fm_diff_indices,
             l2_fm_abs_raw_indices=l2_fm_abs_raw_indices,
             lca_qk_indices=lca_qk_indices,
-            lca_value_indices=lca_value_indices)
+            lca_value_indices=lca_value_indices,
+            side_input_type=architecture.get('side_input_type', 'none'),
+            side_input_dim=int(architecture.get('side_input_dim', 8)),
+            side_input_fusion=architecture.get(
+                'side_input_fusion', 'l2_residual'))
         state_dict = saved['state_dict']
         if l2_input_physical != M.L2_IN_TOTAL:
           M.migrate_phase_proj_state_dict_to_five(state_dict)

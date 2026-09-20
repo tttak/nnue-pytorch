@@ -15,6 +15,9 @@
 #include "lib/nnue_training_data_formats.h"
 #include "lib/nnue_training_data_stream.h"
 #include "lib/rng.h"
+#define NNUE_SIDE_INPUT_KING_SQUARE(pos, color) (pos).king_square(color)
+#include "lib/nnue_side_input.h"
+#undef NNUE_SIDE_INPUT_KING_SQUARE
 
 #if defined (__x86_64__)
 #define EXPORT
@@ -412,6 +415,7 @@ struct SparseBatch
         material = new float[size];
         kif_group_id = new int[size];
         ply = new int[size];
+        side_input_safe_escape = new std::uint16_t[size];
 
         num_active_white_features = 0;
         num_active_black_features = 0;
@@ -450,6 +454,7 @@ struct SparseBatch
     float* material;
     int* kif_group_id;
     int* ply;
+    std::uint16_t* side_input_safe_escape;
 
     ~SparseBatch()
     {
@@ -465,6 +470,7 @@ struct SparseBatch
         delete[] material;
         delete[] kif_group_id;
         delete[] ply;
+        delete[] side_input_safe_escape;
     }
 
 private:
@@ -480,6 +486,8 @@ private:
         material[i] = e.material;
         kif_group_id[i] = e.kif_group_id;
         ply[i] = e.ply;
+        side_input_safe_escape[i] =
+            NnueSideInput::safe_escape_mask16(*e.pos);
         fill_features(FeatureSet<Ts...>{}, i, e);
     }
 
@@ -843,6 +851,14 @@ extern "C" {
     EXPORT void CDECL destroy_sparse_batch(SparseBatch* e)
     {
         delete e;
+    }
+
+    // Accessor keeps the historical SparseBatch C ABI unchanged. Python only
+    // calls it when an optional side input is requested.
+    EXPORT const std::uint16_t* CDECL get_sparse_batch_safe_escape(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->side_input_safe_escape : nullptr;
     }
 
 }

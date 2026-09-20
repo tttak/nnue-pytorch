@@ -34,7 +34,8 @@ class SparseBatch(ctypes.Structure):
         ('ply', ctypes.POINTER(ctypes.c_int)),
     ]
 
-    def get_tensors(self, device, include_ranking_target=False):
+    def get_tensors(self, device, include_ranking_target=False,
+                    side_input="none"):
         white_values = torch.from_numpy(np.ctypeslib.as_array(self.white_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         black_values = torch.from_numpy(np.ctypeslib.as_array(self.black_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         white_indices = torch.from_numpy(np.ctypeslib.as_array(self.white, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
@@ -53,7 +54,20 @@ class SparseBatch(ctypes.Structure):
         result = (us, them, white_indices, white_values, black_indices,
                   black_values, outcome, score, layer_stack_indices, material,
                   kif_group_id, ply)
-        return result + (ranking_target,) if include_ranking_target else result
+        if include_ranking_target:
+            result += (ranking_target,)
+        if side_input == "safe_escape":
+            if get_sparse_batch_safe_escape is None:
+                raise RuntimeError(
+                    "training_data_loader lacks safe-escape side-input ABI; "
+                    "rebuild training_data_loader.dll")
+            pointer = get_sparse_batch_safe_escape(ctypes.byref(self))
+            packed = np.ctypeslib.as_array(pointer, shape=(self.size,)).copy()
+            bits = ((packed[:, None] >> np.arange(16, dtype=np.uint16)) & 1)
+            side = torch.from_numpy(bits.astype(np.float32)).pin_memory().to(
+                device=device, non_blocking=True)
+            result += (side,)
+        return result
 
 
 SparseBatchPtr = ctypes.POINTER(SparseBatch)
@@ -79,7 +93,7 @@ class TrainingDataProvider:
         filtered=False,
         random_fen_skipping=0,
         device='cpu',
-        ranking_target3=None):
+        ranking_target3=None, side_input="none"):
 
         self.feature_set = feature_set.encode('utf-8')
         self.create_stream = create_stream
@@ -100,6 +114,7 @@ class TrainingDataProvider:
         self.random_fen_skipping = random_fen_skipping
         self.device = device
         self.ranking_target3 = ranking_target3
+        self.side_input = side_input
 
         if batch_size:
             if ranking_target3:
@@ -122,7 +137,8 @@ class TrainingDataProvider:
 
         if v:
             tensors = v.contents.get_tensors(
-                self.device, include_ranking_target=bool(self.ranking_target3))
+                self.device, include_ranking_target=bool(self.ranking_target3),
+                side_input=self.side_input)
             self.destroy_part(v)
             return tensors
         else:
@@ -151,6 +167,13 @@ fetch_next_sparse_batch.restype = SparseBatchPtr
 fetch_next_sparse_batch.argtypes = [ctypes.c_void_p]
 destroy_sparse_batch = dll.destroy_sparse_batch
 
+try:
+    get_sparse_batch_safe_escape = dll.get_sparse_batch_safe_escape
+    get_sparse_batch_safe_escape.restype = ctypes.POINTER(ctypes.c_uint16)
+    get_sparse_batch_safe_escape.argtypes = [SparseBatchPtr]
+except AttributeError:
+    get_sparse_batch_safe_escape = None
+
 get_sparse_batch_from_fens = dll.get_sparse_batch_from_fens
 get_sparse_batch_from_fens.restype = SparseBatchPtr
 get_sparse_batch_from_fens.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
@@ -171,7 +194,7 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results):
     return b
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None):
+    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none"):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
@@ -191,10 +214,10 @@ class SparseBatchProvider(TrainingDataProvider):
             filtered,
             random_fen_skipping,
             device,
-            ranking_target3)
+            ranking_target3, side_input)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None):
+  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none"):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
     self.filename1 = filename1
@@ -211,9 +234,10 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.random_fen_skipping = random_fen_skipping
     self.device = device
     self.ranking_target3 = ranking_target3
+    self.side_input = side_input
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3)
+    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):

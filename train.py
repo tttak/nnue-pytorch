@@ -486,14 +486,14 @@ class TextLogPrintTee:
       self._stream.close()
       self._closed = True
 
-def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None):
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none"):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
   train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename1, train_filename2, train_filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -624,6 +624,16 @@ def main():
       "--freeze-ft-router", action="store_true",
       help=("Experiment-only: freeze input.weight/input.bias/input.v and "
             "Router weight/bias, excluding them from the optimizer."))
+  parser.add_argument(
+      "--side-input", choices=("none", "safe_escape"), default=None,
+      help=("Optional dense/context side input. Omitted means none for a new "
+            "model and preserves the saved architecture when resuming."))
+  parser.add_argument(
+      "--side-input-dim", type=int, default=8,
+      help="Hidden width of the optional side-input projection (default: 8).")
+  parser.add_argument(
+      "--side-input-fusion", choices=("l2_residual",),
+      default="l2_residual", help="Side-input fusion preset.")
   parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
@@ -783,6 +793,12 @@ def main():
         "--position-milestones and --position-milestone-dir must be used together")
 
   feature_set = features.get_feature_set_from_name(args.features)
+  requested_side_input = args.side_input
+  new_side_input = requested_side_input or "none"
+  if args.py_data and new_side_input != "none":
+    raise ValueError(
+        "optional side inputs require the C++ training data loader; "
+        "remove --py-data")
 
   start_lambda = args.start_lambda or args.lambda_
   end_lambda = args.end_lambda or args.lambda_
@@ -807,7 +823,10 @@ def main():
       freeze_ft_router=args.freeze_ft_router,
       optimizer_layout=args.optimizer_layout,
       reinit_groups=args.reinit_groups,
-      reinit_seed=args.reinit_seed)
+      reinit_seed=args.reinit_seed,
+      side_input_type=new_side_input,
+      side_input_dim=args.side_input_dim,
+      side_input_fusion=args.side_input_fusion)
     print("Fresh NNUE architecture:", M.nnue_architecture_metadata(nnue))
   else:
 
@@ -839,6 +858,12 @@ def main():
           checkpoint_dict = checkpoint
 
       architecture_kwargs = M.nnue_architecture_kwargs(architecture)
+      if requested_side_input is not None:
+          architecture_kwargs.update({
+              "side_input_type": requested_side_input,
+              "side_input_dim": args.side_input_dim,
+              "side_input_fusion": args.side_input_fusion,
+          })
       nnue = M.NNUE(feature_set=feature_set,
                     start_lambda=start_lambda,
                     max_epoch=max_epoch,
@@ -934,6 +959,12 @@ def main():
           "freeze_ft_router": args.freeze_ft_router,
           "enforce_optimizer_checkpoint_match": bool(args.resume_training_state),
       })
+      if not args.resume_training_state and requested_side_input is not None:
+        resume_overrides.update({
+            "side_input_type": requested_side_input,
+            "side_input_dim": args.side_input_dim,
+            "side_input_fusion": args.side_input_fusion,
+        })
       if not args.resume_training_state or args.optimizer_layout is not None:
         resume_overrides["optimizer_layout"] = args.optimizer_layout
       if not args.resume_training_state or args.reinit_groups:
@@ -942,6 +973,13 @@ def main():
       nnue = M.NNUE.load_from_checkpoint(
           args.resume_from_model, feature_set=feature_set, strict=False,
           **resume_overrides)
+      if (args.resume_training_state and requested_side_input is not None
+          and nnue.side_input_type != requested_side_input):
+        raise ValueError(
+            "--resume-training-state side-input mismatch: "
+            f"checkpoint={nnue.side_input_type}, requested={requested_side_input}. "
+            "Use --resume-from-model without --resume-training-state for "
+            "weight-only architecture migration.")
 
       """
       # 1. まず、新しい構造のモデルを普通に作る
@@ -1111,7 +1149,7 @@ def main():
     train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, nnue.side_input_type)
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()

@@ -67,6 +67,10 @@ def parameter_subgroup(name: str) -> str:
     if name.startswith(("layer_stacks.l2.", "layer_stacks.output.")):
         return ("l2_fc1_output_control" if name.endswith(".bias")
                 else "l2_fc1_output")
+    if name.startswith(("layer_stacks.side_input_encode.",
+                        "layer_stacks.side_input_l2_residual.")):
+        return ("l2_fc1_output_control" if name.endswith(".bias")
+                else "l2_fc1_output")
     if name.startswith(("layer_stacks.fm_diff.", "layer_stacks.fm_abs.")):
         return "fm_control" if name.endswith(".bias") else "fm"
     if name.startswith("layer_stacks.cross_proj."):
