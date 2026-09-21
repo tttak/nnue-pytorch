@@ -6,10 +6,20 @@ if(NOT DEFINED CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-set(CMAKE_CXX_FLAGS "-DYANEURAOU_ENGINE_NNUE -DEVAL_LEARN -DUNICODE -DUSE_AVX2 -msse4.1 -mbmi -mbmi2 -mavx2")
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-Ofast")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -Ofast")
+if(MSVC)
+    # training_data_loader.cpp is UTF-8.  Without /utf-8, Japanese comments
+    # can be decoded as a DBCS trail-byte backslash and accidentally splice
+    # the following source line.  Use the native AVX2 spelling as well.
+    set(CMAKE_CXX_FLAGS "/utf-8 /DYANEURAOU_ENGINE_NNUE /DEVAL_LEARN /DUNICODE /DUSE_AVX2 /arch:AVX2")
+    set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi")
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/O2 /Zi")
+else()
+    set(CMAKE_CXX_FLAGS "-DYANEURAOU_ENGINE_NNUE -DEVAL_LEARN -DUNICODE -DUSE_AVX2 -msse4.1 -mbmi -mbmi2 -mavx2")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g")
+    set(CMAKE_CXX_FLAGS_RELEASE "-Ofast")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -Ofast")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED 17)

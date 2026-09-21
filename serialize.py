@@ -87,6 +87,29 @@ HAO_RISK_DESCRIPTION_SUFFIX = "-HaoSearchRiskContextFc1V1"
 HAO_RISK_FC_HASH_XOR = 0x48414F52
 SIDE_SAFE_DESCRIPTION_SUFFIX = "-SideSafe8"
 SIDE_SAFE_FC_HASH_XOR = 0x53414645
+PAIR_RELATION_DESCRIPTION_SUFFIX_V2 = "-PairRel784x32-FC1PreR64-v2"
+PAIR_RELATION_DESCRIPTION_SUFFIX_V3 = "-PairRel784x32-FC1PreR64-S8-v3"
+PAIR_RELATION_FC_HASH_XOR_V2 = 0x50524932
+PAIR_RELATION_FC_HASH_XOR_V3 = 0x50524938
+PAIR_RELATION_DESCRIPTION_SUFFIXES = (
+    PAIR_RELATION_DESCRIPTION_SUFFIX_V2,
+    PAIR_RELATION_DESCRIPTION_SUFFIX_V3,
+)
+
+
+def pair_relation_description_suffix(schema_version):
+  schema_version = int(schema_version)
+  if schema_version == M.PAIR_RELATION_LEGACY_SCHEMA_VERSION:
+    return PAIR_RELATION_DESCRIPTION_SUFFIX_V2
+  if schema_version == M.PAIR_RELATION_SCHEMA_VERSION:
+    return PAIR_RELATION_DESCRIPTION_SUFFIX_V3
+  raise ValueError(f'unsupported Pair relation schema: {schema_version}')
+
+
+def remove_pair_relation_suffix(description):
+  for suffix in PAIR_RELATION_DESCRIPTION_SUFFIXES:
+    description = description.removesuffix(suffix)
+  return description
 # Keep serializer detection tied to the same source-unit ordering used by a
 # freshly constructed Python production model.
 COMPACT128_FM_DIFF_UNITS = M.COMPACT128_FM_DIFF_UNITS
@@ -153,6 +176,10 @@ class NNUEWriter():
         and not description.endswith(HAO_RISK_DESCRIPTION_SUFFIX)):
       description += HAO_RISK_DESCRIPTION_SUFFIX
     side_enabled = getattr(model, 'side_input_type', 'none') != 'none'
+    pair_relation_enabled = bool(getattr(
+        model, 'pair_relation_side_input', False))
+    pair_relation_suffix = pair_relation_description_suffix(getattr(
+        model, 'pair_relation_schema_version', M.PAIR_RELATION_SCHEMA_VERSION))
     if side_enabled:
       if (model.side_input_type != 'safe_escape'
           or model.side_input_dim != 8
@@ -164,9 +191,17 @@ class NNUEWriter():
         raise ValueError(
             "side-input variants cannot be combined with legacy diagnostic "
             "trailing heads in schema version 1")
+    if pair_relation_enabled:
+      if getattr(model, 'l3_dimensions', M.L3) != 64:
+        raise ValueError('pair relation v1 requires FC1 width 64')
+      if not description.endswith(pair_relation_suffix):
+        description += pair_relation_suffix
+      if uncertainty_head is not None or hao_risk_heads is not None:
+        raise ValueError(
+            'pair relation variants cannot be combined with diagnostic heads')
     if uncertainty_head is not None and hao_risk_heads is not None:
       raise ValueError("legacy uncertainty and Hao risk heads are mutually exclusive")
-    architecture_description = description.removesuffix(
+    architecture_description = remove_pair_relation_suffix(description).removesuffix(
         SIDE_SAFE_DESCRIPTION_SUFFIX).removesuffix(
         UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     description_is_fc1x64 = (
@@ -308,6 +343,18 @@ class NNUEWriter():
               np.float32, copy=False).tobytes())
         print(f"Side Input SAFE_ESCAPE END [Pos: {len(self.buf)}]")
 
+      if pair_relation_enabled:
+        for tensor in (
+            model.layer_stacks.pair_relation_embedding.weight,
+            model.layer_stacks.pair_relation_ln.weight,
+            model.layer_stacks.pair_relation_ln.bias,
+            model.layer_stacks.pair_relation_proj.weight,
+            model.layer_stacks.pair_relation_proj.bias,
+            model.layer_stacks.pair_relation_gate):
+          self.buf.extend(to_numpy(tensor).astype(
+              np.float32, copy=False).tobytes())
+        print(f"Pair Relation v1 END [Pos: {len(self.buf)}]")
+
       if uncertainty_head is not None:
         weight = to_numpy(uncertainty_weight[bucket_index]).astype(
             np.float32, copy=False)
@@ -375,6 +422,12 @@ class NNUEWriter():
       layer_hash ^= LCA16_FC_HASH_XOR
     if getattr(model, 'side_input_type', 'none') != 'none':
       layer_hash ^= SIDE_SAFE_FC_HASH_XOR
+    if bool(getattr(model, 'pair_relation_side_input', False)):
+      schema = int(getattr(
+          model, 'pair_relation_schema_version', M.PAIR_RELATION_SCHEMA_VERSION))
+      layer_hash ^= (PAIR_RELATION_FC_HASH_XOR_V2
+                     if schema == M.PAIR_RELATION_LEGACY_SCHEMA_VERSION
+                     else PAIR_RELATION_FC_HASH_XOR_V3)
     return layer_hash
 
   def write_header(self, model, fc_hash, description):
@@ -604,9 +657,17 @@ class NNUEReader():
     self.has_hao_risk_heads = self.description.endswith(
         HAO_RISK_DESCRIPTION_SUFFIX)
     self.has_side_input = SIDE_SAFE_DESCRIPTION_SUFFIX in self.description
+    self.pair_relation_schema_version = (
+        M.PAIR_RELATION_SCHEMA_VERSION
+        if PAIR_RELATION_DESCRIPTION_SUFFIX_V3 in self.description
+        else M.PAIR_RELATION_LEGACY_SCHEMA_VERSION
+        if PAIR_RELATION_DESCRIPTION_SUFFIX_V2 in self.description
+        else None)
+    self.has_pair_relation = self.pair_relation_schema_version is not None
     if self.has_uncertainty_head and self.has_hao_risk_heads:
       raise Exception('Conflicting diagnostic head suffixes')
-    architecture_description = self.description.removesuffix(
+    architecture_description = remove_pair_relation_suffix(
+        self.description).removesuffix(
         SIDE_SAFE_DESCRIPTION_SUFFIX).removesuffix(
         UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     is_compact128 = architecture_description in (
@@ -650,7 +711,11 @@ class NNUEReader():
         lca_qk_indices=lca_qk_indices,
         lca_value_indices=lca_value_indices,
         side_input_type='safe_escape' if self.has_side_input else 'none',
-        side_input_dim=8, side_input_fusion='l2_residual')
+        side_input_dim=8, side_input_fusion='l2_residual',
+        pair_relation_side_input=self.has_pair_relation,
+        pair_relation_schema_version=(
+            self.pair_relation_schema_version
+            if self.has_pair_relation else M.PAIR_RELATION_SCHEMA_VERSION))
     fc_hash = NNUEWriter.fc_hash(self.model)
     if self.has_uncertainty_head:
       fc_hash ^= UNCERTAINTY_FC_HASH_XOR
@@ -770,6 +835,33 @@ class NNUEReader():
           for target, value in zip(targets, side_values):
             if not torch.equal(target.data, value):
               raise Exception('side-input parameters differ between buckets')
+      if self.has_pair_relation:
+        pair_values = (
+            self.tensor(np.float32, [M.PAIR_RELATION_TYPE_COUNT,
+                                     M.PAIR_RELATION_EMBEDDING_DIM]),
+            self.tensor(np.float32, [M.PAIR_RELATION_EMBEDDING_DIM]),
+            self.tensor(np.float32, [M.PAIR_RELATION_EMBEDDING_DIM]),
+            self.tensor(np.float32, [M.PAIR_RELATION_PROJECTION_WIDTH,
+                                     M.PAIR_RELATION_EMBEDDING_DIM]),
+            self.tensor(np.float32, [M.PAIR_RELATION_PROJECTION_WIDTH]),
+            self.tensor(np.float32, []),
+        )
+        pair_targets = (
+            self.model.layer_stacks.pair_relation_embedding.weight,
+            self.model.layer_stacks.pair_relation_ln.weight,
+            self.model.layer_stacks.pair_relation_ln.bias,
+            self.model.layer_stacks.pair_relation_proj.weight,
+            self.model.layer_stacks.pair_relation_proj.bias,
+            self.model.layer_stacks.pair_relation_gate,
+        )
+        if i == 0:
+          for target, value in zip(pair_targets, pair_values):
+            target.data.copy_(value)
+        else:
+          for target, value in zip(pair_targets, pair_values):
+            if not torch.equal(target.data, value):
+              raise Exception(
+                  'pair-relation parameters differ between buckets')
       if self.has_uncertainty_head:
         uncertainty_weight[i] = self.tensor(np.float32, [64])
         uncertainty_bias[i] = struct.unpack('<f', self.f.read(4))[0]

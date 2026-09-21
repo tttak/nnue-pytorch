@@ -486,14 +486,14 @@ class TextLogPrintTee:
       self._stream.close()
       self._closed = True
 
-def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none"):
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
   train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename1, train_filename2, train_filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input, pair_relation_side_input=pair_relation_side_input)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input, pair_relation_side_input=pair_relation_side_input)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -634,6 +634,15 @@ def main():
   parser.add_argument(
       "--side-input-fusion", choices=("l2_residual",),
       default="l2_residual", help="Side-input fusion preset.")
+  parser.add_argument(
+      "--pair-relation-side-input", action=argparse.BooleanOptionalAction,
+      default=None,
+      help=("Enable Pair Relation Side Input: exact 784 relation types, "
+            "32d sum embedding and gated FC1 residual."))
+  parser.add_argument(
+      "--pair-relation-schema-version", type=int, choices=(2, 3), default=None,
+      help=("Pair architecture schema. New Pair branches default to v3 "
+            "(fixed PAIR_SCALE=8); v2 retains unit scale."))
   parser.add_argument("--num-workers", default=1, type=int, dest='num_workers', help="Number of worker threads to use for data loading. Currently only works well for binpack.")
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
@@ -799,6 +808,10 @@ def main():
     raise ValueError(
         "optional side inputs require the C++ training data loader; "
         "remove --py-data")
+  if args.py_data and args.pair_relation_side_input:
+    raise ValueError(
+        "pair relation side input requires the C++ training data loader; "
+        "remove --py-data")
 
   start_lambda = args.start_lambda or args.lambda_
   end_lambda = args.end_lambda or args.lambda_
@@ -826,7 +839,12 @@ def main():
       reinit_seed=args.reinit_seed,
       side_input_type=new_side_input,
       side_input_dim=args.side_input_dim,
-      side_input_fusion=args.side_input_fusion)
+      side_input_fusion=args.side_input_fusion,
+      pair_relation_side_input=bool(args.pair_relation_side_input),
+      pair_relation_schema_version=(
+          args.pair_relation_schema_version
+          if args.pair_relation_schema_version is not None
+          else M.PAIR_RELATION_SCHEMA_VERSION))
     print("Fresh NNUE architecture:", M.nnue_architecture_metadata(nnue))
   else:
 
@@ -864,6 +882,12 @@ def main():
               "side_input_dim": args.side_input_dim,
               "side_input_fusion": args.side_input_fusion,
           })
+      if args.pair_relation_side_input is not None:
+          architecture_kwargs["pair_relation_side_input"] = bool(
+              args.pair_relation_side_input)
+      if args.pair_relation_schema_version is not None:
+          architecture_kwargs["pair_relation_schema_version"] = int(
+              args.pair_relation_schema_version)
       nnue = M.NNUE(feature_set=feature_set,
                     start_lambda=start_lambda,
                     max_epoch=max_epoch,
@@ -965,6 +989,26 @@ def main():
             "side_input_dim": args.side_input_dim,
             "side_input_fusion": args.side_input_fusion,
         })
+      if (not args.resume_training_state
+          and args.pair_relation_side_input is not None):
+        resume_overrides["pair_relation_side_input"] = bool(
+            args.pair_relation_side_input)
+        if (args.pair_relation_side_input
+            and args.pair_relation_schema_version is None):
+          # Attaching a new branch to an old Pair-OFF checkpoint uses the new
+          # default schema. Existing Pair checkpoints retain saved metadata.
+          source_checkpoint = torch.load(
+              args.resume_from_model, map_location="cpu", weights_only=False)
+          source_architecture = M.checkpoint_architecture_metadata(
+              source_checkpoint) or {}
+          if not source_architecture.get("pair_relation_side_input", False):
+            resume_overrides["pair_relation_schema_version"] = (
+                M.PAIR_RELATION_SCHEMA_VERSION)
+          del source_checkpoint
+      if (not args.resume_training_state
+          and args.pair_relation_schema_version is not None):
+        resume_overrides["pair_relation_schema_version"] = int(
+            args.pair_relation_schema_version)
       if not args.resume_training_state or args.optimizer_layout is not None:
         resume_overrides["optimizer_layout"] = args.optimizer_layout
       if not args.resume_training_state or args.reinit_groups:
@@ -980,6 +1024,20 @@ def main():
             f"checkpoint={nnue.side_input_type}, requested={requested_side_input}. "
             "Use --resume-from-model without --resume-training-state for "
             "weight-only architecture migration.")
+      if (args.resume_training_state
+          and args.pair_relation_side_input is not None
+          and nnue.pair_relation_side_input
+              != bool(args.pair_relation_side_input)):
+        raise ValueError(
+            "--resume-training-state pair-relation architecture mismatch")
+      if (args.resume_training_state
+          and args.pair_relation_schema_version is not None
+          and nnue.pair_relation_schema_version
+              != args.pair_relation_schema_version):
+        raise ValueError(
+            "--resume-training-state Pair schema mismatch: "
+            f"checkpoint={nnue.pair_relation_schema_version}, "
+            f"requested={args.pair_relation_schema_version}")
 
       """
       # 1. まず、新しい構造のモデルを普通に作る
@@ -1149,7 +1207,7 @@ def main():
     train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, nnue.side_input_type)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, nnue.side_input_type, nnue.pair_relation_side_input)
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()

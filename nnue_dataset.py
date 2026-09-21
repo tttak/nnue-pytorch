@@ -6,7 +6,11 @@ import sys
 import glob
 from torch.utils.data import Dataset
 
-local_dllpath = [n for n in glob.glob('./*training_data_loader.*') if n.endswith('.so') or n.endswith('.dll') or n.endswith('.dylib')]
+loader_override = os.environ.get('NNUE_TRAINING_DATA_LOADER')
+local_dllpath = ([loader_override] if loader_override else
+                 [n for n in glob.glob('./*training_data_loader.*')
+                  if n.endswith('.so') or n.endswith('.dll')
+                  or n.endswith('.dylib')])
 if not local_dllpath:
     print('Cannot find data_loader shared library.')
     sys.exit(1)
@@ -35,7 +39,7 @@ class SparseBatch(ctypes.Structure):
     ]
 
     def get_tensors(self, device, include_ranking_target=False,
-                    side_input="none"):
+                    side_input="none", pair_relation_side_input=False):
         white_values = torch.from_numpy(np.ctypeslib.as_array(self.white_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         black_values = torch.from_numpy(np.ctypeslib.as_array(self.black_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         white_indices = torch.from_numpy(np.ctypeslib.as_array(self.white, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
@@ -67,6 +71,32 @@ class SparseBatch(ctypes.Structure):
             side = torch.from_numpy(bits.astype(np.float32)).pin_memory().to(
                 device=device, non_blocking=True)
             result += (side,)
+        if pair_relation_side_input:
+            if (get_sparse_batch_pair_relation_count is None
+                    or get_sparse_batch_pair_relation_indices is None
+                    or get_sparse_batch_pair_relation_batch_indices is None):
+                raise RuntimeError(
+                    "training_data_loader lacks pair-relation v1 ABI; "
+                    "rebuild training_data_loader.dll")
+            count = int(get_sparse_batch_pair_relation_count(
+                ctypes.byref(self)))
+            if count:
+                indices_pointer = get_sparse_batch_pair_relation_indices(
+                    ctypes.byref(self))
+                batch_pointer = get_sparse_batch_pair_relation_batch_indices(
+                    ctypes.byref(self))
+                indices_np = np.ctypeslib.as_array(
+                    indices_pointer, shape=(count,)).copy()
+                batch_np = np.ctypeslib.as_array(
+                    batch_pointer, shape=(count,)).copy()
+            else:
+                indices_np = np.empty((0,), dtype=np.int32)
+                batch_np = np.empty((0,), dtype=np.int32)
+            pair_indices = torch.from_numpy(indices_np).long().pin_memory().to(
+                device=device, non_blocking=True)
+            pair_batch_indices = torch.from_numpy(batch_np).long().pin_memory().to(
+                device=device, non_blocking=True)
+            result += (pair_indices, pair_batch_indices)
         return result
 
 
@@ -93,7 +123,8 @@ class TrainingDataProvider:
         filtered=False,
         random_fen_skipping=0,
         device='cpu',
-        ranking_target3=None, side_input="none"):
+        ranking_target3=None, side_input="none",
+        pair_relation_side_input=False):
 
         self.feature_set = feature_set.encode('utf-8')
         self.create_stream = create_stream
@@ -115,17 +146,33 @@ class TrainingDataProvider:
         self.device = device
         self.ranking_target3 = ranking_target3
         self.side_input = side_input
+        self.pair_relation_side_input = bool(pair_relation_side_input)
 
         if batch_size:
             if ranking_target3:
-                self.stream = create_sparse_batch_stream_with_ranking_target3(
+                create = (
+                    create_sparse_batch_stream_with_ranking_target3_pair_relation
+                    if self.pair_relation_side_input else
+                    create_sparse_batch_stream_with_ranking_target3)
+                if create is None:
+                    raise RuntimeError(
+                        "training_data_loader lacks pair-relation v1 stream ABI; "
+                        "rebuild training_data_loader.dll")
+                self.stream = create(
                     self.feature_set, self.num_workers, self.filename1,
                     self.filename2, self.filename3,
                     os.fsencode(ranking_target3), train1_rate, train2_rate,
                     skiprate, mirror, batch_size, cyclic, filtered,
                     random_fen_skipping)
             else:
-                self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename1, self.filename2, self.filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, filtered, random_fen_skipping)
+                create = (create_sparse_batch_stream_pair_relation
+                          if self.pair_relation_side_input
+                          else self.create_stream)
+                if create is None:
+                    raise RuntimeError(
+                        "training_data_loader lacks pair-relation v1 stream ABI; "
+                        "rebuild training_data_loader.dll")
+                self.stream = create(self.feature_set, self.num_workers, self.filename1, self.filename2, self.filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic, filtered, random_fen_skipping)
         else:
             self.stream = self.create_stream(self.feature_set, self.num_workers, self.filename1, self.filename2, self.filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, filtered, random_fen_skipping)
 
@@ -138,7 +185,8 @@ class TrainingDataProvider:
         if v:
             tensors = v.contents.get_tensors(
                 self.device, include_ranking_target=bool(self.ranking_target3),
-                side_input=self.side_input)
+                side_input=self.side_input,
+                pair_relation_side_input=self.pair_relation_side_input)
             self.destroy_part(v)
             return tensors
         else:
@@ -174,11 +222,57 @@ try:
 except AttributeError:
     get_sparse_batch_safe_escape = None
 
+try:
+    create_sparse_batch_stream_pair_relation = (
+        dll.create_sparse_batch_stream_pair_relation)
+    create_sparse_batch_stream_pair_relation.restype = ctypes.c_void_p
+    create_sparse_batch_stream_pair_relation.argtypes = (
+        create_sparse_batch_stream.argtypes)
+    create_sparse_batch_stream_with_ranking_target3_pair_relation = (
+        dll.create_sparse_batch_stream_with_ranking_target3_pair_relation)
+    create_sparse_batch_stream_with_ranking_target3_pair_relation.restype = (
+        ctypes.c_void_p)
+    create_sparse_batch_stream_with_ranking_target3_pair_relation.argtypes = (
+        create_sparse_batch_stream_with_ranking_target3.argtypes)
+    get_sparse_batch_pair_relation_count = (
+        dll.get_sparse_batch_pair_relation_count)
+    get_sparse_batch_pair_relation_count.restype = ctypes.c_size_t
+    get_sparse_batch_pair_relation_count.argtypes = [SparseBatchPtr]
+    get_sparse_batch_pair_relation_indices = (
+        dll.get_sparse_batch_pair_relation_indices)
+    get_sparse_batch_pair_relation_indices.restype = (
+        ctypes.POINTER(ctypes.c_int32))
+    get_sparse_batch_pair_relation_indices.argtypes = [SparseBatchPtr]
+    get_sparse_batch_pair_relation_batch_indices = (
+        dll.get_sparse_batch_pair_relation_batch_indices)
+    get_sparse_batch_pair_relation_batch_indices.restype = (
+        ctypes.POINTER(ctypes.c_int32))
+    get_sparse_batch_pair_relation_batch_indices.argtypes = [SparseBatchPtr]
+    get_sparse_batch_source_sfen = dll.get_sparse_batch_source_sfen
+    get_sparse_batch_source_sfen.restype = ctypes.c_char_p
+    get_sparse_batch_source_sfen.argtypes = [SparseBatchPtr, ctypes.c_size_t]
+except AttributeError:
+    create_sparse_batch_stream_pair_relation = None
+    create_sparse_batch_stream_with_ranking_target3_pair_relation = None
+    get_sparse_batch_pair_relation_count = None
+    get_sparse_batch_pair_relation_indices = None
+    get_sparse_batch_pair_relation_batch_indices = None
+    get_sparse_batch_source_sfen = None
+
 get_sparse_batch_from_fens = dll.get_sparse_batch_from_fens
 get_sparse_batch_from_fens.restype = SparseBatchPtr
 get_sparse_batch_from_fens.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+try:
+    get_sparse_batch_from_fens_pair_relation = (
+        dll.get_sparse_batch_from_fens_pair_relation)
+    get_sparse_batch_from_fens_pair_relation.restype = SparseBatchPtr
+    get_sparse_batch_from_fens_pair_relation.argtypes = (
+        get_sparse_batch_from_fens.argtypes)
+except AttributeError:
+    get_sparse_batch_from_fens_pair_relation = None
 
-def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results):
+def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results,
+                                pair_relation_side_input=False):
     results_ = (ctypes.c_int*len(scores))()
     scores_ = (ctypes.c_int*len(plies))()
     plies_ = (ctypes.c_int*len(results))()
@@ -190,11 +284,15 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results):
         plies_[i] = v
     for i, v in enumerate(results):
         results_[i] = v
-    b = get_sparse_batch_from_fens(feature_set.name.encode('utf-8'), len(fens), fens_, scores_, plies_, results_)
+    create = (get_sparse_batch_from_fens_pair_relation
+              if pair_relation_side_input else get_sparse_batch_from_fens)
+    if create is None:
+        raise RuntimeError("training_data_loader lacks pair-relation v1 ABI")
+    b = create(feature_set.name.encode('utf-8'), len(fens), fens_, scores_, plies_, results_)
     return b
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none"):
+    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
@@ -214,10 +312,10 @@ class SparseBatchProvider(TrainingDataProvider):
             filtered,
             random_fen_skipping,
             device,
-            ranking_target3, side_input)
+            ranking_target3, side_input, pair_relation_side_input)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none"):
+  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
     self.filename1 = filename1
@@ -235,9 +333,10 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.device = device
     self.ranking_target3 = ranking_target3
     self.side_input = side_input
+    self.pair_relation_side_input = bool(pair_relation_side_input)
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input)
+    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):

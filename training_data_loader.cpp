@@ -2,12 +2,14 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
 #include <future>
 #include <mutex>
 #include <thread>
 #include <deque>
 #include <random>
+#include <vector>
 
 #include "YaneuraOu/source/config.h"
 #include "YaneuraOu/source/usi.h"
@@ -34,6 +36,78 @@
 
 using namespace binpack;
 //using namespace chess;
+
+namespace PairRelationSideInput {
+
+constexpr int kPieceTypeCount = 14;
+constexpr int kOwnerDirectionCount = 4;
+constexpr int kRelationTypeCount =
+    kPieceTypeCount * kPieceTypeCount * kOwnerDirectionCount;
+
+// Compact v1 order is deliberately independent from YaneuraOu's PieceType
+// numeric order (where Gold/Bishop/Rook/King have a different placement).
+inline int compact_piece_type(const PieceType pt) {
+    switch (pt) {
+    case PAWN:       return 0;
+    case LANCE:      return 1;
+    case KNIGHT:     return 2;
+    case SILVER:     return 3;
+    case GOLD:       return 4;
+    case BISHOP:     return 5;
+    case ROOK:       return 6;
+    case PRO_PAWN:   return 7;
+    case PRO_LANCE:  return 8;
+    case PRO_KNIGHT: return 9;
+    case PRO_SILVER: return 10;
+    case HORSE:      return 11;
+    case DRAGON:     return 12;
+    case KING:       return 13;
+    default:         return -1;
+    }
+}
+
+inline int owner_direction(const Color attacker, const Color target,
+                           const Color us) {
+    if (attacker == us)
+        return target == us ? 0 : 1;
+    return target == us ? 3 : 2;
+}
+
+inline int relation_index(const Piece attacker, const Piece target,
+                          const Color us) {
+    const int attacker_type = compact_piece_type(type_of(attacker));
+    const int target_type = compact_piece_type(type_of(target));
+    const int direction = owner_direction(
+        color_of(attacker), color_of(target), us);
+    if (attacker_type < 0 || target_type < 0)
+        return -1;
+    return attacker_type + kPieceTypeCount
+        * (target_type + kPieceTypeCount * direction);
+}
+
+inline void append(const Position& pos, const int batch_index,
+                   std::vector<std::int32_t>& indices,
+                   std::vector<std::int32_t>& batch_indices) {
+    const Color us = pos.side_to_move();
+    const Bitboard occupied = pos.pieces();
+    Bitboard attackers = occupied;
+    while (attackers) {
+        const Square from = attackers.pop();
+        const Piece attacker = pos.piece_on(from);
+        Bitboard targets = effects_from(attacker, from, occupied) & occupied;
+        while (targets) {
+            const Square to = targets.pop();
+            const int index = relation_index(
+                attacker, pos.piece_on(to), us);
+            if (index >= 0) {
+                indices.push_back(index);
+                batch_indices.push_back(batch_index);
+            }
+        }
+    }
+}
+
+}  // namespace PairRelationSideInput
 
 static Square orient(Color color, Square sq)
 {
@@ -72,7 +146,7 @@ struct HalfKA_KSDG3 {
 
     // ----- KingSafety_DistinguishGolds
 
-    // ï«ÇÃPieceílÇíËã`
+    // Â£Å„ÅÆPieceÂÄ§„ÇíÂÆöÁæ©
     static constexpr Piece PIECE_WALL = PIECE_NB;
     static constexpr Piece PIECE_WALL_NB = static_cast<Piece>(PIECE_WALL + 1);
 
@@ -123,15 +197,16 @@ struct HalfKA_KSDG3 {
 
         // ----- KingSafety_DistinguishGolds
 
-        // colorë§ÇÃã ÇÃÉ}ÉXÅiêÊéËñ⁄ê¸Åj
+        // colorÂÅ¥„ÅÆÁéâ„ÅÆ„Éû„ÇπÔºàÂÖàÊâãÁõÆÁ∑öÔºâ
         SquareWithWall sqww_king = to_sqww(pos.king_square(color));
 
-        // 24ãﬂñTÇÉãÅ[Év
-        for (Effect24::Direct dir : Effect24::Direct()) {
+        // 24ËøëÂÇç„Çí„É´„Éº„Éó
+        for (int dir_int = 0; dir_int < int(Effect24::DIRECT_NB); ++dir_int) {
+            const auto dir = static_cast<Effect24::Direct>(dir_int);
             SquareWithWall sqww = sqww_king + DirectToDeltaWW(dir);
             int index_caluculated = -1;
 
-            // î’ì‡ÇÃèÍçá
+            // Áõ§ÂÜÖ„ÅÆÂ†¥Âêà
             if (is_ok(sqww)) {
                 Square sq = sqww_to_sq(sqww);
                 index_caluculated = MakeIndex(color, dir, pos.piece_on(sq)
@@ -140,9 +215,9 @@ struct HalfKA_KSDG3 {
                     );
             }
 
-            // î’äOÇÃèÍçá
+            // Áõ§Â§ñ„ÅÆÂ†¥Âêà
             else {
-                // KSDG3ÇÃèÍçáÅAâΩÇ‡ÇµÇ»Ç¢
+                // KSDG3„ÅÆÂ†¥Âêà„ÄÅ‰Ωï„ÇÇ„Åó„Å™„ÅÑ
                 //index_caluculated = MakeIndex(color, dir, PIECE_WALL, 0, 0);
             }
 
@@ -165,7 +240,7 @@ struct HalfKA_KSDG3 {
         auto sq_target_k = static_cast<Square>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
 
         for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
-            // 40Å®39
+            // 40‚Üí39
             if (i == target) {
                 continue;
             }
@@ -291,10 +366,10 @@ struct HalfKA_KSDG3_Factorized {
 
 
         // ----- A_GOLDS
-        // ÅEKAÇAÇ≈éüå≥â∫Ç∞
-        // ÅEÅuÇ∆ã‡Å`ê¨ã‚ÅvÇã‡Ç∆ìØàÍéãÇ∑ÇÈ
+        // „ÉªKA„ÇíA„ÅßÊ¨°ÂÖÉ‰∏ã„Åí
+        // „Éª„Äå„Å®ÈáëÔΩûÊàêÈäÄ„Äç„ÇíÈáë„Å®Âêå‰∏ÄË¶ñ„Åô„Çã
         for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
-            // 40Å®39
+            // 40‚Üí39
             if (i == target) {
                 continue;
             }
@@ -313,10 +388,10 @@ struct HalfKA_KSDG3_Factorized {
 
 
         // ----- HalfRelKAGOLDS
-        // ÅEKAÇÅuKÇ∆AÅiî’ì‡ÇÃãÓÇÃÇ›ÅjÇÃëäëŒà íuÅvÇ≈éüå≥â∫Ç∞
-        // ÅEAÇ≈ÅuÇ∆ã‡Å`ê¨ã‚ÅvÇã‡Ç∆ìØàÍéãÇ∑ÇÈ
+        // „ÉªKA„Çí„ÄåK„Å®AÔºàÁõ§ÂÜÖ„ÅÆÈßí„ÅÆ„ÅøÔºâ„ÅÆÁõ∏ÂØæ‰ΩçÁΩÆ„Äç„ÅßÊ¨°ÂÖÉ‰∏ã„Åí
+        // „ÉªA„Åß„Äå„Å®ÈáëÔΩûÊàêÈäÄ„Äç„ÇíÈáë„Å®Âêå‰∏ÄË¶ñ„Åô„Çã
         for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
-            // 40Å®39
+            // 40‚Üí39
             if (i == target) {
                 continue;
             }
@@ -335,18 +410,19 @@ struct HalfKA_KSDG3_Factorized {
 
 
         // ----- KSDGE00_GOLDS
-        // ÅEKSDG3ÇÅuóòÇ´êîÇÃëäà·ÇÕñ≥éãÅvÇ≈éüå≥â∫Ç∞
-        // ÅEÅuÇ∆ã‡Å`ê¨ã‚ÅvÇã‡Ç∆ìØàÍéãÇ∑ÇÈ
+        // „ÉªKSDG3„Çí„ÄåÂà©„ÅçÊï∞„ÅÆÁõ∏ÈÅï„ÅØÁÑ°Ë¶ñ„Äç„ÅßÊ¨°ÂÖÉ‰∏ã„Åí
+        // „Éª„Äå„Å®ÈáëÔΩûÊàêÈäÄ„Äç„ÇíÈáë„Å®Âêå‰∏ÄË¶ñ„Åô„Çã
 
-        // colorë§ÇÃã ÇÃÉ}ÉXÅiêÊéËñ⁄ê¸Åj
+        // colorÂÅ¥„ÅÆÁéâ„ÅÆ„Éû„ÇπÔºàÂÖàÊâãÁõÆÁ∑öÔºâ
         SquareWithWall sqww_king = to_sqww(pos.king_square(color));
 
-        // 24ãﬂñTÇÉãÅ[Év
-        for (Effect24::Direct dir : Effect24::Direct()) {
+        // 24ËøëÂÇç„Çí„É´„Éº„Éó
+        for (int dir_int = 0; dir_int < int(Effect24::DIRECT_NB); ++dir_int) {
+            const auto dir = static_cast<Effect24::Direct>(dir_int);
             SquareWithWall sqww = sqww_king + DirectToDeltaWW(dir);
             int index_caluculated = -1;
 
-            // î’ì‡ÇÃèÍçá
+            // Áõ§ÂÜÖ„ÅÆÂ†¥Âêà
             if (is_ok(sqww)) {
                 Square sq = sqww_to_sq(sqww);
 
@@ -361,9 +437,9 @@ struct HalfKA_KSDG3_Factorized {
                 index_caluculated = HalfKA_KSDG3::MakeIndex(color, dir, pc, 0, 0);
             }
 
-            // î’äOÇÃèÍçá
+            // Áõ§Â§ñ„ÅÆÂ†¥Âêà
             else {
-                // KSDG3ÇÃèÍçáÅAâΩÇ‡ÇµÇ»Ç¢
+                // KSDG3„ÅÆÂ†¥Âêà„ÄÅ‰Ωï„ÇÇ„Åó„Å™„ÅÑ
                 //index_caluculated = HalfKA_KSDG::MakeIndex(color, dir, HalfKA_KSDG::PIECE_WALL, 0, 0);
             }
 
@@ -399,7 +475,8 @@ struct SparseBatch
     static constexpr bool IS_BATCH = true;
 
     template <typename... Ts>
-    SparseBatch(FeatureSet<Ts...>, const std::vector<TrainingDataEntry>& entries)
+    SparseBatch(FeatureSet<Ts...>, const std::vector<TrainingDataEntry>& entries,
+                const bool generate_pair_relations = false)
     {
         num_inputs = FeatureSet<Ts...>::INPUTS;
         size = entries.size();
@@ -432,7 +509,9 @@ struct SparseBatch
 
         for (int i = 0; i < entries.size(); ++i)
         {
-            fill_entry(FeatureSet<Ts...>{}, i, entries[i]);
+            source_sfens.emplace_back(entries[i].pos->sfen());
+            fill_entry(FeatureSet<Ts...>{}, i, entries[i],
+                       generate_pair_relations);
         }
     }
 
@@ -455,6 +534,11 @@ struct SparseBatch
     int* kif_group_id;
     int* ply;
     std::uint16_t* side_input_safe_escape;
+    std::vector<std::int32_t> pair_relation_indices;
+    std::vector<std::int32_t> pair_relation_batch_indices;
+    // Diagnostic provenance for Python/C++ parity tests. This member is not
+    // part of the stable ctypes prefix and is exposed only through an accessor.
+    std::vector<std::string> source_sfens;
 
     ~SparseBatch()
     {
@@ -476,7 +560,8 @@ struct SparseBatch
 private:
 
     template <typename... Ts>
-    void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e)
+    void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e,
+                    const bool generate_pair_relations)
     {
         is_white[i] = static_cast<float>(e.pos->side_to_move() == Color::BLACK);
         outcome[i] = (e.result + 1.0f) / 2.0f;
@@ -488,6 +573,10 @@ private:
         ply[i] = e.ply;
         side_input_safe_escape[i] =
             NnueSideInput::safe_escape_mask16(*e.pos);
+        if (generate_pair_relations)
+            PairRelationSideInput::append(
+                *e.pos, i, pair_relation_indices,
+                pair_relation_batch_indices);
         fill_features(FeatureSet<Ts...>{}, i, e);
     }
 
@@ -496,7 +585,7 @@ private:
     {
         const int offset = i * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES;
 
-        // Color::BLACKÇ∆Color::WHITEÇãtÇ…ÇµÇΩ
+        // Color::BLACK„Å®Color::WHITE„ÇíÈÄÜ„Å´„Åó„Åü
         num_active_white_features +=
             FeatureSet<Ts...>::fill_features_sparse(e, white + offset, white_values + offset, Color::BLACK)
             .first;
@@ -559,7 +648,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr) :
+    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false) :
         BaseType(
             std::max(
                 1,
@@ -577,7 +666,8 @@ struct FeaturedBatchStream : Stream<StorageT>
             ranking_target3_filename
         ),
         m_concurrency(concurrency),
-        m_batch_size(batch_size)
+        m_batch_size(batch_size),
+        m_generate_pair_relations(generate_pair_relations)
     {
         m_stop_flag.store(false);
 
@@ -599,7 +689,8 @@ struct FeaturedBatchStream : Stream<StorageT>
                     }
                 }
 
-                auto batch = new StorageT(FeatureSet{}, entries);
+                auto batch = new StorageT(
+                    FeatureSet{}, entries, m_generate_pair_relations);
 
                 {
                     std::unique_lock lock(m_batch_mutex);
@@ -673,6 +764,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 private:
     int m_batch_size;
     int m_concurrency;
+    bool m_generate_pair_relations;
     std::deque<StorageT*> m_batches;
     std::mutex m_batch_mutex;
     std::mutex m_stream_mutex;
@@ -706,6 +798,24 @@ static void EnsureInitialize()
 }
 
 extern "C" {
+
+    // Diagnostic/reference ABI for Pair Relation Side Input v1.  This path
+    // intentionally does not build NNUE sparse FT features, so compact
+    // handcrafted SFENs containing only the pieces under test are valid.
+    EXPORT std::size_t CDECL get_pair_relation_indices_from_sfen(
+        const char* sfen, std::int32_t* output, std::size_t capacity)
+    {
+        EnsureInitialize();
+        Position pos;
+        StateInfo state;
+        pos.set(sfen, &state, Threads.main());
+        std::vector<std::int32_t> indices;
+        std::vector<std::int32_t> batch_indices;
+        PairRelationSideInput::append(pos, 0, indices, batch_indices);
+        const std::size_t copied = std::min(indices.size(), capacity);
+        std::copy_n(indices.begin(), copied, output);
+        return indices.size();
+    }
 
     EXPORT SparseBatch* get_sparse_batch_from_fens(
         const char* feature_set_c,
@@ -747,6 +857,34 @@ extern "C" {
                 FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>{}, entries);
         }
 
+        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
+    EXPORT SparseBatch* get_sparse_batch_from_fens_pair_relation(
+        const char* feature_set_c, int num_fens, const char* const* fens,
+        int* scores, int* plies, int* results)
+    {
+        EnsureInitialize();
+        std::vector<TrainingDataEntry> entries;
+        entries.reserve(num_fens);
+        for (int i = 0; i < num_fens; ++i) {
+            auto& e = entries.emplace_back();
+            e.pos->set(fens[i], &e.stateInfo, Threads.main());
+            e.move = MOVE_NONE;
+            e.score = scores[i];
+            e.ply = plies[i];
+            e.result = results[i];
+        }
+        std::string_view feature_set(feature_set_c);
+        if (feature_set == "HalfKA_KSDG3")
+            return new SparseBatch(FeatureSet<HalfKA_KSDG3>{}, entries, true);
+        if (feature_set == "HalfKA_KSDG3^")
+            return new SparseBatch(
+                FeatureSet<HalfKA_KSDG3_Factorized>{}, entries, true);
+        if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>{}, entries, true);
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -838,6 +976,92 @@ extern "C" {
         return nullptr;
     }
 
+    // Pair-relation v1 stream ABI.  Separate entry points keep every existing
+    // caller and the default OFF path byte-for-byte compatible with the old
+    // argument list and avoid relation generation when the branch is disabled.
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_pair_relation(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [
+                random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered
+            ](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                auto do_filter = [&]() {
+                    return e.isCapturingMove() || e.isInCheck();
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && do_filter());
+            };
+        }
+
+        std::string_view feature_set(feature_set_c);
+        if (feature_set == "HalfKA_KSDG3")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, true);
+        if (feature_set == "HalfKA_KSDG3^")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, true);
+        if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+            return new FeaturedBatchStream<
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
+                    concurrency, filename1, filename2, filename3, train1_rate,
+                    train2_rate, skiprate, mirror, batch_size, cyclic,
+                    skipPredicate, nullptr, true);
+        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_pair_relation(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        std::string_view feature_set(feature_set_c);
+        if (feature_set == "HalfKA_KSDG3")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, true);
+        if (feature_set == "HalfKA_KSDG3^")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, true);
+        if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+            return new FeaturedBatchStream<
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
+                    concurrency, filename1, filename2, filename3, train1_rate,
+                    train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                    ranking_target3_filename, true);
+        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
     EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
     {
         delete stream;
@@ -859,6 +1083,33 @@ extern "C" {
         const SparseBatch* batch)
     {
         return batch ? batch->side_input_safe_escape : nullptr;
+    }
+
+    EXPORT std::size_t CDECL get_sparse_batch_pair_relation_count(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->pair_relation_indices.size() : 0;
+    }
+
+    EXPORT const std::int32_t* CDECL get_sparse_batch_pair_relation_indices(
+        const SparseBatch* batch)
+    {
+        return batch && !batch->pair_relation_indices.empty()
+            ? batch->pair_relation_indices.data() : nullptr;
+    }
+
+    EXPORT const std::int32_t* CDECL
+    get_sparse_batch_pair_relation_batch_indices(const SparseBatch* batch)
+    {
+        return batch && !batch->pair_relation_batch_indices.empty()
+            ? batch->pair_relation_batch_indices.data() : nullptr;
+    }
+
+    EXPORT const char* CDECL get_sparse_batch_source_sfen(
+        const SparseBatch* batch, const std::size_t index)
+    {
+        return batch && index < batch->source_sfens.size()
+            ? batch->source_sfens[index].c_str() : nullptr;
     }
 
 }
