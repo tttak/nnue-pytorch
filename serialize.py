@@ -87,6 +87,10 @@ HAO_RISK_DESCRIPTION_SUFFIX = "-HaoSearchRiskContextFc1V1"
 HAO_RISK_FC_HASH_XOR = 0x48414F52
 SIDE_SAFE_DESCRIPTION_SUFFIX = "-SideSafe8"
 SIDE_SAFE_FC_HASH_XOR = 0x53414645
+SIDE_MOBILITY_TACTICAL_DESCRIPTION_SUFFIX = "-SideMobTac8x128-v1"
+SIDE_MOBILITY_TACTICAL_FC_HASH_XOR = 0x4D543831
+SIDE_MOBILITY_TACTICAL_V2_DESCRIPTION_SUFFIX = "-SideMobTac8x128-S8-v2"
+SIDE_MOBILITY_TACTICAL_V2_FC_HASH_XOR = 0x4D543832
 PAIR_RELATION_DESCRIPTION_SUFFIX_V2 = "-PairRel784x32-FC1PreR64-v2"
 PAIR_RELATION_DESCRIPTION_SUFFIX_V3 = "-PairRel784x32-FC1PreR64-S8-v3"
 PAIR_RELATION_FC_HASH_XOR_V2 = 0x50524932
@@ -181,12 +185,18 @@ class NNUEWriter():
     pair_relation_suffix = pair_relation_description_suffix(getattr(
         model, 'pair_relation_schema_version', M.PAIR_RELATION_SCHEMA_VERSION))
     if side_enabled:
-      if (model.side_input_type != 'safe_escape'
-          or model.side_input_dim != 8
-          or model.side_input_fusion != 'l2_residual'):
-        raise ValueError('nn.bin supports only safe_escape/dim8/l2_residual')
-      if not description.endswith(SIDE_SAFE_DESCRIPTION_SUFFIX):
-        description += SIDE_SAFE_DESCRIPTION_SUFFIX
+      if model.side_input_fusion != 'l2_residual':
+        raise ValueError('nn.bin side input requires l2_residual fusion')
+      if model.side_input_type == 'safe_escape' and model.side_input_dim == 8:
+        side_suffix = SIDE_SAFE_DESCRIPTION_SUFFIX
+      elif model.side_input_type == 'mobility_tactical_v1':
+        side_suffix = SIDE_MOBILITY_TACTICAL_DESCRIPTION_SUFFIX
+      elif model.side_input_type == 'mobility_tactical_v2':
+        side_suffix = SIDE_MOBILITY_TACTICAL_V2_DESCRIPTION_SUFFIX
+      else:
+        raise ValueError(f'unsupported nn.bin side input: {model.side_input_type}')
+      if not description.endswith(side_suffix):
+        description += side_suffix
       if uncertainty_head is not None or hao_risk_heads is not None:
         raise ValueError(
             "side-input variants cannot be combined with legacy diagnostic "
@@ -203,6 +213,8 @@ class NNUEWriter():
       raise ValueError("legacy uncertainty and Hao risk heads are mutually exclusive")
     architecture_description = remove_pair_relation_suffix(description).removesuffix(
         SIDE_SAFE_DESCRIPTION_SUFFIX).removesuffix(
+        SIDE_MOBILITY_TACTICAL_V2_DESCRIPTION_SUFFIX).removesuffix(
+        SIDE_MOBILITY_TACTICAL_DESCRIPTION_SUFFIX).removesuffix(
         UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     description_is_fc1x64 = (
         PHASE5_FC1X64_DESCRIPTION in architecture_description
@@ -334,14 +346,18 @@ class NNUEWriter():
       print(f"Bucket Blend END [Pos: {len(self.buf)}]")
 
       if side_enabled:
-        for tensor in (
-            model.layer_stacks.side_input_encode.weight,
-            model.layer_stacks.side_input_encode.bias,
-            model.layer_stacks.side_input_l2_residual.weight,
-            model.layer_stacks.side_input_l2_residual.bias):
+        tensors = (
+            (model.layer_stacks.side_input_encode.weight,
+             model.layer_stacks.side_input_encode.bias,
+             model.layer_stacks.side_input_l2_residual.weight,
+             model.layer_stacks.side_input_l2_residual.bias)
+            if model.side_input_type == 'safe_escape' else
+            (model.layer_stacks.side_input_l2_residual.weight,
+             model.layer_stacks.side_input_l2_residual.bias))
+        for tensor in tensors:
           self.buf.extend(to_numpy(tensor).astype(
               np.float32, copy=False).tobytes())
-        print(f"Side Input SAFE_ESCAPE END [Pos: {len(self.buf)}]")
+        print(f"Side Input {model.side_input_type} END [Pos: {len(self.buf)}]")
 
       if pair_relation_enabled:
         for tensor in (
@@ -420,8 +436,13 @@ class NNUEWriter():
       layer_hash ^= LCA24_FC_HASH_XOR
     elif lca_width == 16:
       layer_hash ^= LCA16_FC_HASH_XOR
-    if getattr(model, 'side_input_type', 'none') != 'none':
+    side_type = getattr(model, 'side_input_type', 'none')
+    if side_type == 'safe_escape':
       layer_hash ^= SIDE_SAFE_FC_HASH_XOR
+    elif side_type == 'mobility_tactical_v1':
+      layer_hash ^= SIDE_MOBILITY_TACTICAL_FC_HASH_XOR
+    elif side_type == 'mobility_tactical_v2':
+      layer_hash ^= SIDE_MOBILITY_TACTICAL_V2_FC_HASH_XOR
     if bool(getattr(model, 'pair_relation_side_input', False)):
       schema = int(getattr(
           model, 'pair_relation_schema_version', M.PAIR_RELATION_SCHEMA_VERSION))
@@ -656,7 +677,14 @@ class NNUEReader():
         UNCERTAINTY_DESCRIPTION_SUFFIX)
     self.has_hao_risk_heads = self.description.endswith(
         HAO_RISK_DESCRIPTION_SUFFIX)
-    self.has_side_input = SIDE_SAFE_DESCRIPTION_SUFFIX in self.description
+    self.side_input_type = (
+        'mobility_tactical_v2'
+        if SIDE_MOBILITY_TACTICAL_V2_DESCRIPTION_SUFFIX in self.description else
+        'mobility_tactical_v1'
+        if SIDE_MOBILITY_TACTICAL_DESCRIPTION_SUFFIX in self.description else
+        'safe_escape' if SIDE_SAFE_DESCRIPTION_SUFFIX in self.description else
+        'none')
+    self.has_side_input = self.side_input_type != 'none'
     self.pair_relation_schema_version = (
         M.PAIR_RELATION_SCHEMA_VERSION
         if PAIR_RELATION_DESCRIPTION_SUFFIX_V3 in self.description
@@ -669,6 +697,8 @@ class NNUEReader():
     architecture_description = remove_pair_relation_suffix(
         self.description).removesuffix(
         SIDE_SAFE_DESCRIPTION_SUFFIX).removesuffix(
+        SIDE_MOBILITY_TACTICAL_V2_DESCRIPTION_SUFFIX).removesuffix(
+        SIDE_MOBILITY_TACTICAL_DESCRIPTION_SUFFIX).removesuffix(
         UNCERTAINTY_DESCRIPTION_SUFFIX).removesuffix(HAO_RISK_DESCRIPTION_SUFFIX)
     is_compact128 = architecture_description in (
         COMPACT128_DESCRIPTION, LCA24_DESCRIPTION, LCA16_DESCRIPTION)
@@ -710,7 +740,7 @@ class NNUEReader():
             COMPACT128_FM_ABS_RAW_UNITS if is_compact128 else None),
         lca_qk_indices=lca_qk_indices,
         lca_value_indices=lca_value_indices,
-        side_input_type='safe_escape' if self.has_side_input else 'none',
+        side_input_type=self.side_input_type,
         side_input_dim=8, side_input_fusion='l2_residual',
         pair_relation_side_input=self.has_pair_relation,
         pair_relation_schema_version=(
@@ -816,18 +846,30 @@ class NNUEReader():
       serialized_bucket_blend_alpha.append(int_alpha)
       bucket_blend_val = float(int_alpha) / 16384.0
       if self.has_side_input:
-        side_values = (
-            self.tensor(np.float32, [8, 16]),
-            self.tensor(np.float32, [8]),
-            self.tensor(np.float32, [self.model.layer_stacks.l2_in_total, 8]),
-            self.tensor(np.float32, [self.model.layer_stacks.l2_in_total]),
-        )
-        targets = (
-            self.model.layer_stacks.side_input_encode.weight,
-            self.model.layer_stacks.side_input_encode.bias,
-            self.model.layer_stacks.side_input_l2_residual.weight,
-            self.model.layer_stacks.side_input_l2_residual.bias,
-        )
+        if self.side_input_type == 'safe_escape':
+          side_values = (
+              self.tensor(np.float32, [8, 16]),
+              self.tensor(np.float32, [8]),
+              self.tensor(np.float32, [self.model.layer_stacks.l2_in_total, 8]),
+              self.tensor(np.float32, [self.model.layer_stacks.l2_in_total]),
+          )
+          targets = (
+              self.model.layer_stacks.side_input_encode.weight,
+              self.model.layer_stacks.side_input_encode.bias,
+              self.model.layer_stacks.side_input_l2_residual.weight,
+              self.model.layer_stacks.side_input_l2_residual.bias,
+          )
+        else:
+          side_values = (
+              self.tensor(np.float32,
+                          [self.model.layer_stacks.l2_in_total, 8]),
+              self.tensor(np.float32,
+                          [self.model.layer_stacks.l2_in_total]),
+          )
+          targets = (
+              self.model.layer_stacks.side_input_l2_residual.weight,
+              self.model.layer_stacks.side_input_l2_residual.bias,
+          )
         if i == 0:
           for target, value in zip(targets, side_values):
             target.data.copy_(value)

@@ -11,6 +11,8 @@ from pathlib import Path
 from side_input import (
     SIDE_INPUT_SCHEMA_VERSION, SideInputType, SideInputFusion,
     input_dimensions as side_input_dimensions,
+    schema_version as side_input_schema_version,
+    fixed_scale as side_input_fixed_scale,
     normalize_side_input, normalize_side_input_fusion,
 )
 
@@ -190,6 +192,9 @@ def nnue_architecture_metadata(model):
             model, "side_input_fusion", "l2_residual")),
         "side_input_schema_version": int(getattr(
             model, "side_input_schema_version", SIDE_INPUT_SCHEMA_VERSION)),
+        "side_input_scale": float(getattr(
+            model, "side_input_scale", side_input_fixed_scale(getattr(
+                model, "side_input_type", "none")))),
         "pair_relation_side_input": bool(getattr(
             model, "pair_relation_side_input", False)),
         "pair_relation_schema_version": int(getattr(
@@ -244,6 +249,14 @@ def nnue_architecture_kwargs(metadata):
         "pair_relation_schema_version": int(metadata.get(
             "pair_relation_schema_version", PAIR_RELATION_SCHEMA_VERSION)),
     }
+    expected_side_scale = side_input_fixed_scale(kwargs["side_input_type"])
+    saved_side_scale = float(metadata.get(
+        "side_input_scale", expected_side_scale))
+    if saved_side_scale != expected_side_scale:
+        raise ValueError(
+            "inconsistent side-input scale metadata: "
+            f"type={kwargs['side_input_type']}, saved={saved_side_scale}, "
+            f"expected={expected_side_scale}")
 
     # Validate the redundant physical width before any weights are loaded.
     base = (
@@ -304,6 +317,9 @@ def checkpoint_architecture_metadata(checkpoint):
                 "side_input_fusion", "l2_residual"),
             "side_input_schema_version": hparams.get(
                 "side_input_schema_version", SIDE_INPUT_SCHEMA_VERSION),
+            "side_input_scale": hparams.get(
+                "side_input_scale", side_input_fixed_scale(hparams.get(
+                    "side_input_type", "none"))),
             "pair_relation_side_input": bool(hparams.get(
                 "pair_relation_side_input", False)),
             "pair_relation_schema_version": hparams.get(
@@ -412,6 +428,7 @@ class LayerStacks(nn.Module):
         self.side_input_type = normalize_side_input(side_input_type)
         self.side_input_dim = int(side_input_dim)
         self.side_input_fusion = normalize_side_input_fusion(side_input_fusion)
+        self.side_input_scale = side_input_fixed_scale(self.side_input_type)
         self.side_input_enabled = self.side_input_type != "none"
         # Compatibility alias for Experiment 76 weight-only packages.
         self.safe_escape_experiment = self.side_input_enabled
@@ -500,10 +517,23 @@ class LayerStacks(nn.Module):
         if self.side_input_enabled:
             if self.side_input_dim <= 0:
                 raise ValueError("side_input_dim must be positive")
-            self.side_input_encode = nn.Linear(
-                side_input_dimensions(self.side_input_type), self.side_input_dim)
-            self.side_input_l2_residual = nn.Linear(
-                self.side_input_dim, self.l2_in_total, bias=True)
+            if self.side_input_type == SideInputType.SAFE_ESCAPE.value:
+                self.side_input_encode = nn.Linear(
+                    side_input_dimensions(self.side_input_type),
+                    self.side_input_dim)
+                self.side_input_l2_residual = nn.Linear(
+                    self.side_input_dim, self.l2_in_total, bias=True)
+            elif self.side_input_type in (
+                    SideInputType.MOBILITY_TACTICAL_V1.value,
+                    SideInputType.MOBILITY_TACTICAL_V2.value):
+                # Formal Experiment 84 fusion B: normalized8 -> Linear 8x128.
+                # No extra activation or hidden projection is present.
+                self.side_input_encode = nn.Identity()
+                self.side_input_l2_residual = nn.Linear(
+                    side_input_dimensions(self.side_input_type),
+                    self.l2_in_total, bias=True)
+            else:
+                raise ValueError(self.side_input_type)
             # Baseline-preserving initialization: the side path is exactly zero
             # until its own parameters are trained.
             nn.init.zeros_(self.side_input_l2_residual.weight)
@@ -586,6 +616,19 @@ class LayerStacks(nn.Module):
         self.last_side_input_diagnostics = None
         self.last_side_input_eval_delta = None
         self.last_side_input_safe_count = None
+        # Offline evaluators may request the same scalar diagnostics without
+        # putting the network in training mode (which would enable branch
+        # dropout).  This flag changes diagnostic state only, never outputs.
+        self.capture_side_input_diagnostics = False
+        # Diagnostic-only inference ablation.  This suppresses the complete
+        # learned residual (including its bias) without modifying parameters.
+        self.force_side_input_residual_zero = False
+        # Offline fixed-point studies may retain the selected pre-fusion L2
+        # input and the dense side residual for the current batch.  Disabled
+        # by default so training/production evaluation keeps no extra tensor.
+        self.capture_side_input_l2_tensors = False
+        self.last_side_input_base_l2_selected = None
+        self.last_side_input_residual_tensor = None
         self.last_pair_relation_diagnostics = None
 
     def project_pair_relations(self, pair_indices, pair_batch_indices,
@@ -612,7 +655,22 @@ class LayerStacks(nn.Module):
             raise RuntimeError(
                 f"{self.side_input_type} side input is enabled but missing")
         encoded = self.side_input_encode(side_input.to(dtype=dtype))
-        residual = self.side_input_l2_residual(F.silu(encoded))
+        if self.side_input_type == SideInputType.SAFE_ESCAPE.value:
+            projected = F.silu(encoded)
+        elif self.side_input_type in (
+                SideInputType.MOBILITY_TACTICAL_V1.value,
+                SideInputType.MOBILITY_TACTICAL_V2.value):
+            projected = encoded
+        else:
+            raise RuntimeError(self.side_input_type)
+        residual = self.side_input_l2_residual(projected)
+        if self.side_input_type == SideInputType.MOBILITY_TACTICAL_V2.value:
+            # Schema-v2: the fixed scale is part of the train-time model, not
+            # a C++-only quantization workaround.  Zero-init keeps the first
+            # output exactly baseline-neutral despite the multiplier.
+            residual = residual * self.side_input_scale
+        if self.force_side_input_residual_zero:
+            residual = torch.zeros_like(residual)
         if return_encoded:
             return encoded, residual
         return residual
@@ -934,9 +992,16 @@ class LayerStacks(nn.Module):
             side_encoded, side_residual = self.project_side_input(
                 safe_escape_mask, l2_input_all.dtype,
                 return_encoded=True)
+            if self.capture_side_input_l2_tensors:
+                batch_indices = torch.arange(
+                    l2_input_all.shape[0], device=l2_input_all.device)
+                self.last_side_input_base_l2_selected = (
+                    l2_input_all[batch_indices, router_indices].detach())
+                self.last_side_input_residual_tensor = side_residual.detach()
             pair_diagnostic_due = (
-                self.training
-                and (self.step_counter % 500 == 0
+                (self.training or self.capture_side_input_diagnostics)
+                and (self.capture_side_input_diagnostics
+                     or self.step_counter % 500 == 0
                      or (self.pair_relation_schema_version == 3
                          and self.step_counter in (1, 10, 25, 50, 100)))
             )
@@ -946,7 +1011,7 @@ class LayerStacks(nn.Module):
                 # over the 12 buckets, so its per-element abs mean is directly
                 # comparable to the base L2 per-element abs mean.
                 with torch.no_grad():
-                    mask = safe_escape_mask.detach().float()
+                    side_values = safe_escape_mask.detach().float()
                     encoded_abs = side_encoded.detach().float().abs()
                     residual_abs = side_residual.detach().float().abs()
                     base_l2_abs_mean = (
@@ -977,39 +1042,48 @@ class LayerStacks(nn.Module):
                     # the high byte is the opponent's mask.  Keep the sample
                     # count alongside the distribution because safe_count=0
                     # can be sparse in an individual training batch.
-                    safe_count = (mask[:, :8] > 0.5).sum(dim=1)
+                    safe_count = None
                     safe_count_cohorts = {}
-                    for label, selected in (
-                            ("0", safe_count == 0),
-                            ("1", safe_count == 1),
-                            (">=2", safe_count >= 2)):
-                        values = ratio_per_position[selected]
-                        if values.numel() == 0:
+                    if self.side_input_type == SideInputType.SAFE_ESCAPE.value:
+                        safe_count = (side_values[:, :8] > 0.5).sum(dim=1)
+                        for label, selected in (
+                                ("0", safe_count == 0),
+                                ("1", safe_count == 1),
+                                (">=2", safe_count >= 2)):
+                            values = ratio_per_position[selected]
+                            if values.numel() == 0:
+                                safe_count_cohorts[label] = {
+                                    "count": 0,
+                                    "mean": float("nan"),
+                                    "median": float("nan"),
+                                    "p90": float("nan"),
+                                    "p99": float("nan"),
+                                }
+                                continue
+                            quantiles = torch.quantile(
+                                values,
+                                torch.tensor(
+                                    [0.5, 0.9, 0.99],
+                                    device=values.device,
+                                    dtype=values.dtype,
+                                ),
+                            )
                             safe_count_cohorts[label] = {
-                                "count": 0,
-                                "mean": float("nan"),
-                                "median": float("nan"),
-                                "p90": float("nan"),
-                                "p99": float("nan"),
+                                "count": values.numel(),
+                                "mean": values.mean().item(),
+                                "median": quantiles[0].item(),
+                                "p90": quantiles[1].item(),
+                                "p99": quantiles[2].item(),
                             }
-                            continue
-                        quantiles = torch.quantile(
-                            values,
-                            torch.tensor(
-                                [0.5, 0.9, 0.99],
-                                device=values.device,
-                                dtype=values.dtype,
-                            ),
-                        )
-                        safe_count_cohorts[label] = {
-                            "count": values.numel(),
-                            "mean": values.mean().item(),
-                            "median": quantiles[0].item(),
-                            "p90": quantiles[1].item(),
-                            "p99": quantiles[2].item(),
-                        }
                     self.last_side_input_diagnostics = {
-                        "mask_bit_on_rate": mask.mean().item(),
+                        "side_input_type": self.side_input_type,
+                        "input_mean": side_values.mean(dim=0).cpu().tolist(),
+                        "input_std": side_values.std(
+                            dim=0, unbiased=False).cpu().tolist(),
+                        "mask_bit_on_rate": (
+                            side_values.mean().item()
+                            if self.side_input_type == SideInputType.SAFE_ESCAPE.value
+                            else float("nan")),
                         "encoded_abs_mean": encoded_abs.mean().item(),
                         "encoded_abs_std": encoded_abs.std(
                             unbiased=False).item(),
@@ -1041,7 +1115,8 @@ class LayerStacks(nn.Module):
                         self.fuse_side_input(
                             l2_input_all.detach(), zero_mask_residual)
                     )
-                    self.last_side_input_safe_count = safe_count.detach()
+                    self.last_side_input_safe_count = (
+                        safe_count.detach() if safe_count is not None else None)
             l2_input_all = self.fuse_side_input(
                 l2_input_all, side_residual)
 
@@ -1259,7 +1334,9 @@ class NNUE(pl.LightningModule):
         self.side_input_type = normalize_side_input(side_input_type)
         self.side_input_dim = int(side_input_dim)
         self.side_input_fusion = normalize_side_input_fusion(side_input_fusion)
-        self.side_input_schema_version = SIDE_INPUT_SCHEMA_VERSION
+        self.side_input_schema_version = side_input_schema_version(
+            self.side_input_type)
+        self.side_input_scale = side_input_fixed_scale(self.side_input_type)
         self.safe_escape_experiment = self.side_input_type != "none"
         self.pair_relation_side_input = bool(pair_relation_side_input)
         self.pair_relation_schema_version = int(pair_relation_schema_version)
@@ -1309,6 +1386,7 @@ class NNUE(pl.LightningModule):
             "side_input_dim": self.side_input_dim,
             "side_input_fusion": self.side_input_fusion,
             "side_input_schema_version": self.side_input_schema_version,
+            "side_input_scale": self.side_input_scale,
             "pair_relation_side_input": self.pair_relation_side_input,
             "pair_relation_schema_version": self.pair_relation_schema_version,
             "pair_relation_scale": self.pair_relation_scale,
@@ -1961,19 +2039,28 @@ class NNUE(pl.LightningModule):
                 if side_stats is not None:
                     ratio = side_stats["side_base_l2_ratio"]
                     cohort_lines = []
-                    for label in ("0", "1", ">=2"):
-                        cohort = side_stats["safe_count_cohorts"][label]
-                        if cohort["count"] == 0:
-                            cohort_lines.append(
-                                f"    safe_count {label:>3}: n=0 (N/A)")
-                        else:
-                            cohort_lines.append(
-                                f"    safe_count {label:>3}: "
-                                f"n={cohort['count']:5d}  "
-                                f"mean={cohort['mean'] * 100:.4f}%  "
-                                f"median={cohort['median'] * 100:.4f}%  "
-                                f"p90={cohort['p90'] * 100:.4f}%  "
-                                f"p99={cohort['p99'] * 100:.4f}%")
+                    if (side_stats["side_input_type"]
+                            == SideInputType.SAFE_ESCAPE.value):
+                        for label in ("0", "1", ">=2"):
+                            cohort = side_stats["safe_count_cohorts"][label]
+                            if cohort["count"] == 0:
+                                cohort_lines.append(
+                                    f"    safe_count {label:>3}: n=0 (N/A)")
+                            else:
+                                cohort_lines.append(
+                                    f"    safe_count {label:>3}: "
+                                    f"n={cohort['count']:5d}  "
+                                    f"mean={cohort['mean'] * 100:.4f}%  "
+                                    f"median={cohort['median'] * 100:.4f}%  "
+                                    f"p90={cohort['p90'] * 100:.4f}%  "
+                                    f"p99={cohort['p99'] * 100:.4f}%")
+                    else:
+                        inputs = ", ".join(
+                            f"{m:.4f}±{s:.4f}" for m, s in zip(
+                                side_stats["input_mean"],
+                                side_stats["input_std"]))
+                        cohort_lines.append(
+                            f"    normalized input mean±std: [{inputs}]")
                     print(
                         # This diagnostic is triggered by dbg_cnt every 500
                         # training forwards.  During the 500th forward,
@@ -1981,8 +2068,8 @@ class NNUE(pl.LightningModule):
                         # still 499, so label it with the matching diagnostic
                         # cadence rather than the pre-step global_step.
                         f"[Side Input Diagnostics](Step {self.dbg_cnt})\n"
-                        f"  Mask bit ON rate            : "
-                        f"{side_stats['mask_bit_on_rate'] * 100:7.3f}%\n"
+                        f"  Side input type             : "
+                        f"{side_stats['side_input_type']}\n"
                         f"  Side_Encode abs mean/std    : "
                         f"{side_stats['encoded_abs_mean']:.6e} / "
                         f"{side_stats['encoded_abs_std']:.6e} "
@@ -2007,7 +2094,7 @@ class NNUE(pl.LightningModule):
                         f"  Ratio/position p99          : "
                         f"{side_stats['side_base_ratio_p99']:.6e} "
                         f"({side_stats['side_base_ratio_p99'] * 100:.4f}%)\n"
-                        f"  Ratio by safe_count (side-to-move mask):\n"
+                        f"  Input/cohort diagnostics:\n"
                         + "\n".join(cohort_lines)
                     )
 
@@ -2359,22 +2446,21 @@ class NNUE(pl.LightningModule):
             if self.layer_stacks.side_input_enabled:
                 side_encode = self.layer_stacks.side_input_encode
                 side_residual = self.layer_stacks.side_input_l2_residual
-                parts.extend([
-                    (
+                if isinstance(side_encode, nn.Linear):
+                    parts.append((
                         "Side_Encode",
                         side_encode.weight.detach().cpu(),
                         side_encode.weight.grad.detach().cpu()
                         if side_encode.weight.grad is not None else None,
                         side_encode.bias.detach().cpu(),
-                    ),
-                    (
+                    ))
+                parts.append((
                         "Side_L2_Residual",
                         side_residual.weight.detach().cpu(),
                         side_residual.weight.grad.detach().cpu()
                         if side_residual.weight.grad is not None else None,
                         side_residual.bias.detach().cpu(),
-                    ),
-                ])
+                    ))
 
             phase_names = ["Open", "Mid1", "Mid2", "End "]
             for p in range(4):
@@ -5528,6 +5614,38 @@ class NNUE(pl.LightningModule):
                 f"{pair_stats.get('pair_fc1_ratio', float('nan')):.6e}"
             )
 
+        side_gradient_diagnostic_due = (
+            self.side_input_type in (
+                SideInputType.MOBILITY_TACTICAL_V1.value,
+                SideInputType.MOBILITY_TACTICAL_V2.value)
+            and (int(self.global_step) % 500 == 0
+                 or completed_step in (1, 10, 25, 50, 100))
+        )
+        if side_gradient_diagnostic_due:
+            projection = self.layer_stacks.side_input_l2_residual
+            projection_grad = projection.weight.grad
+            side_stats = self.layer_stacks.last_side_input_diagnostics or {}
+            input_summary = ", ".join(
+                f"{mean:.4f}+-{std:.4f}"
+                for mean, std in zip(
+                    side_stats.get("input_mean", ()),
+                    side_stats.get("input_std", ())))
+            print(
+                f"[Mobility/Tactical Side Gradients](Step {completed_step})\n"
+                f"  projection grad norm  : "
+                f"{(projection_grad.norm().item() if projection_grad is not None else 0.0):.6e}\n"
+                f"  projection weight norm: {projection.weight.norm().item():.6e}\n"
+                f"  side residual abs mean: "
+                f"{side_stats.get('residual_abs_mean', float('nan')):.6e}\n"
+                f"  side/base L2 ratio    : "
+                f"{side_stats.get('side_base_l2_ratio', float('nan')):.6e}\n"
+                f"  ratio p50/p90/p99     : "
+                f"{side_stats.get('side_base_ratio_median', float('nan')):.6e} / "
+                f"{side_stats.get('side_base_ratio_p90', float('nan')):.6e} / "
+                f"{side_stats.get('side_base_ratio_p99', float('nan')):.6e}\n"
+                f"  normalized input mean+-std: [{input_summary}]"
+            )
+
         if not self.enable_cuda_timing:
             return
 
@@ -6762,6 +6880,7 @@ class NNUE(pl.LightningModule):
             "side_input_fusion": architecture["side_input_fusion"],
             "side_input_schema_version": architecture[
                 "side_input_schema_version"],
+            "side_input_scale": architecture["side_input_scale"],
             "pair_relation_side_input": architecture[
                 "pair_relation_side_input"],
             "pair_relation_schema_version": architecture[
@@ -6789,6 +6908,7 @@ class NNUE(pl.LightningModule):
             "side_input_fusion": architecture["side_input_fusion"],
             "side_input_schema_version": architecture[
                 "side_input_schema_version"],
+            "side_input_scale": architecture["side_input_scale"],
             "pair_relation_side_input": architecture[
                 "pair_relation_side_input"],
             "pair_relation_schema_version": architecture[
@@ -6875,6 +6995,7 @@ class NNUE(pl.LightningModule):
                     "side_input_type",
                     "side_input_dim",
                     "side_input_fusion",
+                    "side_input_schema_version",
                     "pair_relation_side_input",
                 })
                 # ``load_from_checkpoint(strict=False)`` is also used by
@@ -6946,11 +7067,14 @@ class NNUE(pl.LightningModule):
         # no-missing/no-duplicate invariant before dispatching parameters to
         # the layout's child optimizers.
         if self.side_input_type != "none":
+            if isinstance(self.layer_stacks.side_input_encode, nn.Linear):
+                other_groups.extend([
+                    {'params': [self.layer_stacks.side_input_encode.weight],
+                     'lr': LR * 1.0, 'weight_decay': 0.0},
+                    {'params': [self.layer_stacks.side_input_encode.bias],
+                     'lr': LR * 1.0, 'weight_decay': 0.0},
+                ])
             other_groups.extend([
-                {'params': [self.layer_stacks.side_input_encode.weight],
-                 'lr': LR * 1.0, 'weight_decay': 0.0},
-                {'params': [self.layer_stacks.side_input_encode.bias],
-                 'lr': LR * 1.0, 'weight_decay': 0.0},
                 {'params': [self.layer_stacks.side_input_l2_residual.weight],
                  'lr': LR * 1.0, 'weight_decay': 0.0},
                 {'params': [self.layer_stacks.side_input_l2_residual.bias],

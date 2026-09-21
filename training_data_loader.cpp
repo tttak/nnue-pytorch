@@ -19,6 +19,7 @@
 #include "lib/rng.h"
 #define NNUE_SIDE_INPUT_KING_SQUARE(pos, color) (pos).king_square(color)
 #include "lib/nnue_side_input.h"
+#include "lib/nnue_mobility_tactical.h"
 #undef NNUE_SIDE_INPUT_KING_SQUARE
 
 #if defined (__x86_64__)
@@ -476,7 +477,8 @@ struct SparseBatch
 
     template <typename... Ts>
     SparseBatch(FeatureSet<Ts...>, const std::vector<TrainingDataEntry>& entries,
-                const bool generate_pair_relations = false)
+                const bool generate_pair_relations = false,
+                const bool generate_mobility_tactical = false)
     {
         num_inputs = FeatureSet<Ts...>::INPUTS;
         size = entries.size();
@@ -493,6 +495,8 @@ struct SparseBatch
         kif_group_id = new int[size];
         ply = new int[size];
         side_input_safe_escape = new std::uint16_t[size];
+        side_input_mobility_tactical = (
+            generate_mobility_tactical ? new float[size * 8] : nullptr);
 
         num_active_white_features = 0;
         num_active_black_features = 0;
@@ -511,7 +515,7 @@ struct SparseBatch
         {
             source_sfens.emplace_back(entries[i].pos->sfen());
             fill_entry(FeatureSet<Ts...>{}, i, entries[i],
-                       generate_pair_relations);
+                       generate_pair_relations, generate_mobility_tactical);
         }
     }
 
@@ -534,6 +538,7 @@ struct SparseBatch
     int* kif_group_id;
     int* ply;
     std::uint16_t* side_input_safe_escape;
+    float* side_input_mobility_tactical;
     std::vector<std::int32_t> pair_relation_indices;
     std::vector<std::int32_t> pair_relation_batch_indices;
     // Diagnostic provenance for Python/C++ parity tests. This member is not
@@ -555,13 +560,15 @@ struct SparseBatch
         delete[] kif_group_id;
         delete[] ply;
         delete[] side_input_safe_escape;
+        delete[] side_input_mobility_tactical;
     }
 
 private:
 
     template <typename... Ts>
     void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e,
-                    const bool generate_pair_relations)
+                    const bool generate_pair_relations,
+                    const bool generate_mobility_tactical)
     {
         is_white[i] = static_cast<float>(e.pos->side_to_move() == Color::BLACK);
         outcome[i] = (e.result + 1.0f) / 2.0f;
@@ -573,6 +580,12 @@ private:
         ply[i] = e.ply;
         side_input_safe_escape[i] =
             NnueSideInput::safe_escape_mask16(*e.pos);
+        if (generate_mobility_tactical) {
+            const auto normalized = NnueMobilityTactical::normalize(
+                NnueMobilityTactical::raw(*e.pos));
+            std::copy(normalized.begin(), normalized.end(),
+                      side_input_mobility_tactical + i * 8);
+        }
         if (generate_pair_relations)
             PairRelationSideInput::append(
                 *e.pos, i, pair_relation_indices,
@@ -648,7 +661,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false) :
+    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false, const bool generate_mobility_tactical = false) :
         BaseType(
             std::max(
                 1,
@@ -667,7 +680,8 @@ struct FeaturedBatchStream : Stream<StorageT>
         ),
         m_concurrency(concurrency),
         m_batch_size(batch_size),
-        m_generate_pair_relations(generate_pair_relations)
+        m_generate_pair_relations(generate_pair_relations),
+        m_generate_mobility_tactical(generate_mobility_tactical)
     {
         m_stop_flag.store(false);
 
@@ -690,7 +704,8 @@ struct FeaturedBatchStream : Stream<StorageT>
                 }
 
                 auto batch = new StorageT(
-                    FeatureSet{}, entries, m_generate_pair_relations);
+                    FeatureSet{}, entries, m_generate_pair_relations,
+                    m_generate_mobility_tactical);
 
                 {
                     std::unique_lock lock(m_batch_mutex);
@@ -765,6 +780,7 @@ private:
     int m_batch_size;
     int m_concurrency;
     bool m_generate_pair_relations;
+    bool m_generate_mobility_tactical;
     std::deque<StorageT*> m_batches;
     std::mutex m_batch_mutex;
     std::mutex m_stream_mutex;
@@ -1062,6 +1078,87 @@ extern "C" {
         return nullptr;
     }
 
+    // Experiment 84 formal branch. Separate factories preserve the default
+    // stream ABI and avoid mobility/tactical extraction when side input is OFF.
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_mobility_tactical(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [
+                random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && (e.isCapturingMove() || e.isInCheck()));
+            };
+        }
+        std::string_view feature_set(feature_set_c);
+        if (feature_set == "HalfKA_KSDG3")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, true);
+        if (feature_set == "HalfKA_KSDG3^")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, true);
+        if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+            return new FeaturedBatchStream<
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
+                    concurrency, filename1, filename2, filename3, train1_rate,
+                    train2_rate, skiprate, mirror, batch_size, cyclic,
+                    skipPredicate, nullptr, false, true);
+        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_mobility_tactical(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        std::string_view feature_set(feature_set_c);
+        if (feature_set == "HalfKA_KSDG3")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, true);
+        if (feature_set == "HalfKA_KSDG3^")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_KSDG3_Factorized>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, true);
+        if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
+            return new FeaturedBatchStream<
+                FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
+                    concurrency, filename1, filename2, filename3, train1_rate,
+                    train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                    ranking_target3_filename, false, true);
+        fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
     EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
     {
         delete stream;
@@ -1083,6 +1180,12 @@ extern "C" {
         const SparseBatch* batch)
     {
         return batch ? batch->side_input_safe_escape : nullptr;
+    }
+
+    EXPORT const float* CDECL get_sparse_batch_mobility_tactical(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->side_input_mobility_tactical : nullptr;
     }
 
     EXPORT std::size_t CDECL get_sparse_batch_pair_relation_count(

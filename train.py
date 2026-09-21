@@ -625,7 +625,7 @@ def main():
       help=("Experiment-only: freeze input.weight/input.bias/input.v and "
             "Router weight/bias, excluding them from the optimizer."))
   parser.add_argument(
-      "--side-input", choices=("none", "safe_escape"), default=None,
+      "--side-input", choices=("none", "safe_escape", "mobility_tactical_v1", "mobility_tactical_v2"), default=None,
       help=("Optional dense/context side input. Omitted means none for a new "
             "model and preserves the saved architecture when resuming."))
   parser.add_argument(

@@ -71,6 +71,17 @@ class SparseBatch(ctypes.Structure):
             side = torch.from_numpy(bits.astype(np.float32)).pin_memory().to(
                 device=device, non_blocking=True)
             result += (side,)
+        elif side_input in ("mobility_tactical_v1", "mobility_tactical_v2"):
+            if get_sparse_batch_mobility_tactical is None:
+                raise RuntimeError(
+                    "training_data_loader lacks mobility/tactical side-input ABI; "
+                    "rebuild training_data_loader.dll")
+            pointer = get_sparse_batch_mobility_tactical(ctypes.byref(self))
+            values = np.ctypeslib.as_array(
+                pointer, shape=(self.size, 8)).copy()
+            side = torch.from_numpy(values).pin_memory().to(
+                device=device, non_blocking=True)
+            result += (side,)
         if pair_relation_side_input:
             if (get_sparse_batch_pair_relation_count is None
                     or get_sparse_batch_pair_relation_indices is None
@@ -150,10 +161,12 @@ class TrainingDataProvider:
 
         if batch_size:
             if ranking_target3:
-                create = (
-                    create_sparse_batch_stream_with_ranking_target3_pair_relation
-                    if self.pair_relation_side_input else
-                    create_sparse_batch_stream_with_ranking_target3)
+                if self.pair_relation_side_input:
+                    create = create_sparse_batch_stream_with_ranking_target3_pair_relation
+                elif self.side_input in ("mobility_tactical_v1", "mobility_tactical_v2"):
+                    create = create_sparse_batch_stream_with_ranking_target3_mobility_tactical
+                else:
+                    create = create_sparse_batch_stream_with_ranking_target3
                 if create is None:
                     raise RuntimeError(
                         "training_data_loader lacks pair-relation v1 stream ABI; "
@@ -165,9 +178,12 @@ class TrainingDataProvider:
                     skiprate, mirror, batch_size, cyclic, filtered,
                     random_fen_skipping)
             else:
-                create = (create_sparse_batch_stream_pair_relation
-                          if self.pair_relation_side_input
-                          else self.create_stream)
+                if self.pair_relation_side_input:
+                    create = create_sparse_batch_stream_pair_relation
+                elif self.side_input in ("mobility_tactical_v1", "mobility_tactical_v2"):
+                    create = create_sparse_batch_stream_mobility_tactical
+                else:
+                    create = self.create_stream
                 if create is None:
                     raise RuntimeError(
                         "training_data_loader lacks pair-relation v1 stream ABI; "
@@ -221,6 +237,27 @@ try:
     get_sparse_batch_safe_escape.argtypes = [SparseBatchPtr]
 except AttributeError:
     get_sparse_batch_safe_escape = None
+
+try:
+    create_sparse_batch_stream_mobility_tactical = (
+        dll.create_sparse_batch_stream_mobility_tactical)
+    create_sparse_batch_stream_mobility_tactical.restype = ctypes.c_void_p
+    create_sparse_batch_stream_mobility_tactical.argtypes = (
+        create_sparse_batch_stream.argtypes)
+    create_sparse_batch_stream_with_ranking_target3_mobility_tactical = (
+        dll.create_sparse_batch_stream_with_ranking_target3_mobility_tactical)
+    create_sparse_batch_stream_with_ranking_target3_mobility_tactical.restype = (
+        ctypes.c_void_p)
+    create_sparse_batch_stream_with_ranking_target3_mobility_tactical.argtypes = (
+        create_sparse_batch_stream_with_ranking_target3.argtypes)
+    get_sparse_batch_mobility_tactical = (
+        dll.get_sparse_batch_mobility_tactical)
+    get_sparse_batch_mobility_tactical.restype = ctypes.POINTER(ctypes.c_float)
+    get_sparse_batch_mobility_tactical.argtypes = [SparseBatchPtr]
+except AttributeError:
+    create_sparse_batch_stream_mobility_tactical = None
+    create_sparse_batch_stream_with_ranking_target3_mobility_tactical = None
+    get_sparse_batch_mobility_tactical = None
 
 try:
     create_sparse_batch_stream_pair_relation = (
