@@ -547,25 +547,50 @@ class NNUEWriter():
     w2 = torch.clamp(1.0 - torch.abs(p3 - 2.0), min=0.0)
     w3 = torch.clamp(p3 - 2.0, min=0.0)
 
-    pw_bucket_logits = (
-        w0 * pw_raw[0]
-        + w1 * pw_raw[1]
-        + w2 * pw_raw[2]
-        + w3 * pw_raw[3]
+    # A deserialized nn.bin contains an independently quantized 12-bucket Q14
+    # inference table.  Four semantic phase logits cannot reproduce that table
+    # losslessly after log/softmax interpolation.  Preserve and reuse the exact
+    # table only while the semantic PairWeight tensor remains bit-identical to
+    # the snapshot taken by NNUEReader.  Checkpoint-origin models have no such
+    # snapshot, and any PairWeight edit invalidates it, so those paths retain
+    # the established regeneration behavior.
+    saved_bucket_q14 = getattr(model, '_serialized_pair_bucket_q14', None)
+    saved_pair_snapshot = getattr(
+        model, '_serialized_pair_weights_snapshot', None)
+    current_pair_cpu = pw_raw.detach().cpu()
+    reuse_saved_bucket = (
+        isinstance(saved_bucket_q14, torch.Tensor)
+        and saved_bucket_q14.dtype == torch.int16
+        and tuple(saved_bucket_q14.shape) == (12, 3, 640)
+        and isinstance(saved_pair_snapshot, torch.Tensor)
+        and tuple(saved_pair_snapshot.shape) == tuple(current_pair_cpu.shape)
+        and torch.equal(current_pair_cpu, saved_pair_snapshot)
     )
-    pw_bucket_softmax = torch.softmax(pw_bucket_logits, dim=2)
-    pw_bucket_quantized = pw_bucket_softmax.mul(W_SCALE).round().to(torch.int16)
 
-    # 各bucket・各channelのMul/Diff/Sum合計を16384に補正する。
-    for b in range(12):
-        diffs = 16384 - pw_bucket_quantized[b].sum(dim=1, dtype=torch.int32)
-        for i in range(640):
-            if diffs[i] != 0:
-                max_idx = torch.argmax(pw_bucket_quantized[b, i])
-                pw_bucket_quantized[b, i, max_idx] += diffs[i].item()
+    if reuse_saved_bucket:
+        pw_bucket_exported = saved_bucket_q14.detach().cpu().clone().contiguous()
+        print('PairWeight 12-bucket Q14: reusing lossless deserialized table')
+    else:
+        pw_bucket_logits = (
+            w0 * pw_raw[0]
+            + w1 * pw_raw[1]
+            + w2 * pw_raw[2]
+            + w3 * pw_raw[3]
+        )
+        pw_bucket_softmax = torch.softmax(pw_bucket_logits, dim=2)
+        pw_bucket_quantized = pw_bucket_softmax.mul(W_SCALE).round().to(torch.int16)
 
-    # [12, 640, 3] -> [12, 3, 640]
-    pw_bucket_exported = pw_bucket_quantized.permute(0, 2, 1).contiguous()
+        # 各bucket・各channelのMul/Diff/Sum合計を16384に補正する。
+        for b in range(12):
+            diffs = 16384 - pw_bucket_quantized[b].sum(dim=1, dtype=torch.int32)
+            for i in range(640):
+                if diffs[i] != 0:
+                    max_idx = torch.argmax(pw_bucket_quantized[b, i])
+                    pw_bucket_quantized[b, i, max_idx] += diffs[i].item()
+
+        # [12, 640, 3] -> [12, 3, 640]
+        pw_bucket_exported = pw_bucket_quantized.permute(0, 2, 1).contiguous()
+        print('PairWeight 12-bucket Q14: regenerated from semantic parameters')
 
     print(f"FT Pair Weight (12-Bucket x 3-terms) bytes: {pw_bucket_exported.nbytes}")
     print(f"Shape: {pw_bucket_exported.shape} (Bucket, Type[M/D/S], 640)")
@@ -1062,9 +1087,10 @@ class NNUEReader():
     pw_exported = self.tensor(np.int16, [4, 3, 640]).divide(W_SCALE)
     print(f"read_feature_transformer pair_weights END")
 
-    # C++推論用の12 bucketデータ。PyTorchモデルの復元には使用しないが、
-    # 後続のrouter/network weightを正しい位置から読むために読み飛ばす。
-    self.tensor(np.int16, [12, 3, 640])
+    # C++推論用の12 bucket Q14データ。semanticな4 phase parameterだけ
+    # では元の丸め済みtableを完全再現できないため、losslessに保持する。
+    inference_pair_q14 = self.tensor(
+        np.int16, [12, 3, 640]).round().to(torch.int16)
     print(f"read_feature_transformer inference_pair_weights END")
     
     # 2. モデルの Parameter 形状 [4, 640, 3] に戻す
@@ -1086,6 +1112,16 @@ class NNUEReader():
     # モデル側の Parameter に 4段階の Logits を代入
     # self.model.pair_weights.shape は [4, 640, 3]
     self.model.pair_weights.data = pair_w_logits
+
+    # These are deliberately non-state-dict attributes.  They describe the
+    # byte-level provenance of an nn.bin deserialize, not trainable model
+    # state.  NNUEWriter reuses the saved table only if pair_weights is still
+    # exactly equal to this snapshot; checkpoint-origin or edited models are
+    # regenerated from semantic parameters.
+    self.model._serialized_pair_bucket_q14 = (
+        inference_pair_q14.detach().cpu().clone().contiguous())
+    self.model._serialized_pair_weights_snapshot = (
+        self.model.pair_weights.detach().cpu().clone())
 
 
   def read_fc_layer(self, layer, is_output=False):

@@ -307,7 +307,13 @@ void Position::set(std::string sfen , StateInfo* si , Thread* th)
 	st->materialValue = Eval::material(*this);
 #endif
 
+#if !defined(EVAL_LEARN)
+	// The learner DLL never consumes a freshly computed NNUE value here.  Its
+	// direct-SFEN diagnostic ABI may also run without loaded evaluation weights,
+	// so touching the production evaluator would dereference uninitialized
+	// network storage. Packed training records initialize their own eval state.
 	Eval::compute_eval(*this);
+#endif
 
 	// --- 入玉の駒点の設定
 

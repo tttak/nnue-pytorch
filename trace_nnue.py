@@ -783,14 +783,37 @@ def make_integer_reference(entries, nnue):
         phase_bias.to(torch.int64)
         + torch.matmul(phase_weight.to(torch.int64), phase_input)
     )
-    phase_preact = phase_preact_all[:6]
-    phase_logit = phase_preact.to(torch.float32) / 8128.0 * 3.0 + 1.0
-    phase_sigmoid = sigmoid_float32(phase_logit)
-    phase_value = 0.1 + 0.9 * phase_sigmoid
+    # The trace schema remains six semantic channels for compatibility, while
+    # compact Phase5 physically stores rows (MainSqr, MainRaw, Diff, Abs,
+    # Cross), i.e. legacy semantic rows (0, 1, 2, 3, 5).  Expand the physical
+    # result before comparing with the C++ trace; semantic row 4 is absent and
+    # is never consumed by compact128.
+    phase_rows = tuple(getattr(nnue, "phase_semantic_rows", ()))
+    if phase_preact_all.numel() == 5:
+        phase_rows = (0, 1, 2, 3, 5)
+    elif not phase_rows:
+        phase_rows = tuple(range(min(6, phase_preact_all.numel())))
+    phase_preact = torch.zeros(6, dtype=phase_preact_all.dtype)
+    phase_preact[list(phase_rows)] = phase_preact_all[:len(phase_rows)]
+    phase_logit = torch.zeros(6, dtype=torch.float32)
+    phase_sigmoid = torch.zeros(6, dtype=torch.float32)
+    phase_value = torch.zeros(6, dtype=torch.float32)
+    physical_logit = (
+        phase_preact_all[:len(phase_rows)].to(torch.float32) / 8128.0 * 3.0
+        + 1.0
+    )
+    physical_sigmoid = sigmoid_float32(physical_logit)
+    physical_value = 0.1 + 0.9 * physical_sigmoid
+    phase_logit[list(phase_rows)] = physical_logit
+    phase_sigmoid[list(phase_rows)] = physical_sigmoid
+    phase_value[list(phase_rows)] = physical_value
     phase_multipliers = torch.tensor(
         [1.3, 1.5, 1.0, 0.7, 0.88, 1.5], dtype=torch.float32
     )
-    channel_scales = (0.5 + 0.5 * phase_value) * phase_multipliers
+    channel_scales = torch.zeros(6, dtype=torch.float32)
+    channel_scales[list(phase_rows)] = (
+        (0.5 + 0.5 * physical_value) * phase_multipliers[list(phase_rows)]
+    )
 
     main_raw = torch.clamp(
         torch.floor_divide(main_fc_after_gate[:31], 64), 0, 127
@@ -817,8 +840,9 @@ def make_integer_reference(entries, nnue):
         (cross_product_diff, cross_product_abs), dim=0
     )
 
-    cross_start = fm_bucket * FM_DIM
-    cross_end = cross_start + FM_DIM
+    cross_width = int(nnue.layer_stacks.cross_proj.out_features // 12)
+    cross_start = fm_bucket * cross_width
+    cross_end = cross_start + cross_width
     cross_bias, cross_weight = quantize_hidden_fc_parameters_like_serialize(
         nnue,
         nnue.layer_stacks.cross_proj.bias.data[cross_start:cross_end],
@@ -832,29 +856,48 @@ def make_integer_reference(entries, nnue):
         torch.floor_divide(cross_preact, 64), 0, 127
     )
 
-    def scale_channel(values, scale):
+    # Production compact128 uses the C32 LUT and integer Q23 channel scales,
+    # not the diagnostic float channel_scales above.
+    raw = phase_preact_all[:len(phase_rows)].to(torch.int64)
+    rounded_raw = torch.clamp(raw, -65536, 65536)
+    lut_index = torch.div(
+        rounded_raw + 65536 + 16, 32, rounding_mode="trunc")
+    lut_raw = (-65536 + lut_index * 32).to(torch.float32)
+    lut_logit = lut_raw / 8128.0 * 3.0 + 1.0
+    sigmoid_q15 = torch.floor(torch.sigmoid(lut_logit) * 32768.0 + 0.5).to(
+        torch.int64)
+    base_q15 = 18022 + torch.div(
+        sigmoid_q15 * 14746 + (1 << 14), 1 << 15,
+        rounding_mode="trunc")
+    factor_q15 = torch.tensor(
+        [42598, 49152, 32768, 22938, 49152], dtype=torch.int64)
+    physical_scales_q23 = torch.div(
+        base_q15 * factor_q15 + 64, 128, rounding_mode="trunc")
+    channel_scales_q23 = torch.zeros(6, dtype=torch.int64)
+    channel_scales_q23[list(phase_rows)] = physical_scales_q23
+
+    def scale_channel_q23(values, semantic_index):
         return torch.clamp(
-            torch.trunc(values.to(torch.float32) * scale).to(torch.int64),
-            0,
-            127,
-        )
+            (values.to(torch.int64) * channel_scales_q23[semantic_index]) >> 23,
+            0, 127)
 
     fc1_parts = [
-        scale_channel(main_squared, channel_scales[0]),
-        scale_channel(main_raw, channel_scales[1]),
-        scale_channel(lca_output, channel_scales[2]),
-        scale_channel(abs_output, channel_scales[3]),
+        scale_channel_q23(main_squared, 0),
+        scale_channel_q23(main_raw, 1),
+        scale_channel_q23(lca_output, 2)[list(nnue.l2_fm_diff_indices)],
+        scale_channel_q23(abs_output, 3)[list(nnue.l2_fm_abs_raw_indices)],
     ]
     if not nnue.remove_abs_sqr_l2:
-        fc1_parts.append(scale_channel(abs_squared_output, channel_scales[4]))
+        fc1_parts.append(scale_channel_q23(abs_squared_output, 4))
     fc1_parts.extend((
-        scale_channel(cross_output, channel_scales[5]),
+        scale_channel_q23(cross_output, 5),
         torch.zeros(2, dtype=torch.int64),
     ))
     fc1_input = torch.cat(tuple(fc1_parts), dim=0)
 
-    fc1_start = fm_bucket * 96
-    fc1_end = fc1_start + 96
+    fc1_width = int(nnue.layer_stacks.l3_dimensions)
+    fc1_start = fm_bucket * fc1_width
+    fc1_end = fc1_start + fc1_width
     fc1_bias, fc1_weight = quantize_hidden_fc_parameters_like_serialize(
         nnue,
         nnue.layer_stacks.l2.bias.data[fc1_start:fc1_end],
@@ -896,6 +939,7 @@ def make_integer_reference(entries, nnue):
     reference["deep.phase.channel_scale_f32_bits"] = float32_bits(
         channel_scales
     )
+    reference["deep.phase.channel_scale_q23"] = channel_scales_q23
     reference["deep.main.raw"] = main_raw
     reference["deep.main.squared"] = main_squared
     reference["deep.cross.main_squared"] = cross_main_squared
@@ -905,8 +949,12 @@ def make_integer_reference(entries, nnue):
     reference["deep.cross.product_diff"] = cross_product_diff
     reference["deep.cross.product_abs"] = cross_product_abs
     reference["deep.cross.input"] = cross_input
-    reference["deep.cross.preact"] = cross_preact
-    reference["deep.cross.output"] = cross_output
+    # The trace format keeps the historical 32-wide Cross vectors.  Cross16
+    # stores the physical outputs in the prefix and zero-fills the remainder.
+    reference["deep.cross.preact"] = F.pad(
+        cross_preact, (0, FM_DIM - cross_preact.numel()))
+    reference["deep.cross.output"] = F.pad(
+        cross_output, (0, FM_DIM - cross_output.numel()))
     reference["deep.fc1.input"] = fc1_input
     reference["deep.fc1.preact"] = fc1_preact
     reference["deep.fc1.output"] = fc1_output
@@ -1143,6 +1191,7 @@ def compare_integer_reference(entries, reference):
             "deep.phase.sigmoid_f32_bits",
             "deep.phase.value_f32_bits",
             "deep.phase.channel_scale_f32_bits",
+            "deep.phase.channel_scale_q23",
             "deep.main.raw",
             "deep.main.squared",
             "deep.cross.main_squared",
@@ -1815,18 +1864,33 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
     phase_input = torch.cat(
         (phase_abs_input, diff_input, main_input[:128]), dim=0
     )
-    phase_preact = nnue.layer_stacks.phase_proj(
+    phase_preact_physical = nnue.layer_stacks.phase_proj(
         phase_input.unsqueeze(0)
-    ).squeeze(0)[:6]
-    phase_logit = phase_preact * 3.0 + 1.0
-    phase_sigmoid = torch.sigmoid(phase_logit)
-    phase_value = 0.1 + 0.9 * phase_sigmoid
+    ).squeeze(0)
+    phase_rows = ((0, 1, 2, 3, 5)
+                  if phase_preact_physical.numel() == 5
+                  else tuple(range(min(6, phase_preact_physical.numel()))))
+    phase_preact = torch.zeros(6, dtype=phase_preact_physical.dtype,
+                               device=phase_preact_physical.device)
+    phase_preact[list(phase_rows)] = phase_preact_physical[:len(phase_rows)]
+    phase_logit = torch.zeros_like(phase_preact)
+    phase_sigmoid = torch.zeros_like(phase_preact)
+    phase_value = torch.zeros_like(phase_preact)
+    physical_logit = phase_preact_physical[:len(phase_rows)] * 3.0 + 1.0
+    physical_sigmoid = torch.sigmoid(physical_logit)
+    physical_value = 0.1 + 0.9 * physical_sigmoid
+    phase_logit[list(phase_rows)] = physical_logit
+    phase_sigmoid[list(phase_rows)] = physical_sigmoid
+    phase_value[list(phase_rows)] = physical_value
     phase_multipliers = torch.tensor(
         [1.3, 1.5, 1.0, 0.7, 0.88, 1.5],
         dtype=phase_value.dtype,
         device=phase_value.device,
     )
-    channel_scales = (0.5 + 0.5 * phase_value) * phase_multipliers
+    channel_scales = torch.zeros_like(phase_value)
+    channel_scales[list(phase_rows)] = (
+        (0.5 + 0.5 * physical_value) * phase_multipliers[list(phase_rows)]
+    )
 
     cross_main_squared = main_squared[:16]
     cross_diff = diff_post_lca[:16]
@@ -1835,8 +1899,9 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
     cross_product_diff = cross_main_squared * cross_diff
     cross_product_abs = cross_main_raw * cross_abs
     cross_input = torch.cat((cross_product_diff, cross_product_abs), dim=0)
-    cross_start = bucket * FM_DIM
-    cross_end = cross_start + FM_DIM
+    cross_width = int(nnue.layer_stacks.cross_proj.out_features // 12)
+    cross_start = bucket * cross_width
+    cross_end = cross_start + cross_width
     cross_preact = F.linear(
         cross_input.unsqueeze(0),
         nnue.layer_stacks.cross_proj.weight[cross_start:cross_end],
@@ -1847,8 +1912,8 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
     fc1_parts = [
         main_squared * channel_scales[0],
         main_raw * channel_scales[1],
-        diff_post_lca * channel_scales[2],
-        abs_output * channel_scales[3],
+        (diff_post_lca * channel_scales[2])[list(nnue.l2_fm_diff_indices)],
+        (abs_output * channel_scales[3])[list(nnue.l2_fm_abs_raw_indices)],
     ]
     if not nnue.remove_abs_sqr_l2:
         fc1_parts.append(abs_squared * channel_scales[4])
@@ -1857,8 +1922,9 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
         torch.zeros(2, dtype=main_raw.dtype, device=main_raw.device),
     ))
     fc1_input = torch.cat(tuple(fc1_parts), dim=0).clamp(0.0, 1.0)
-    fc1_start = bucket * 96
-    fc1_end = fc1_start + 96
+    fc1_width = int(nnue.layer_stacks.l3_dimensions)
+    fc1_start = bucket * fc1_width
+    fc1_end = fc1_start + fc1_width
     fc1_preact = F.linear(
         fc1_input.unsqueeze(0),
         nnue.layer_stacks.l2.weight[
@@ -1924,13 +1990,13 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
         "Cross pre-activation: C++ / 8128 vs PyTorch",
         get_trace_integers(entries, "deep.cross.preact", FM_DIM),
         hidden_scale,
-        cross_preact,
+        F.pad(cross_preact, (0, FM_DIM - cross_preact.numel())),
     )
     report_comparison(
         "Cross output: C++ / 127 vs PyTorch",
         get_trace_integers(entries, "deep.cross.output", FM_DIM),
         CPP_FT_SCALE,
-        cross_output,
+        F.pad(cross_output, (0, FM_DIM - cross_output.numel())),
     )
     report_comparison(
         "FC1 input: C++ / 127 vs PyTorch",
@@ -1942,13 +2008,13 @@ def compare_native_deep(entries, nnue, raw_diff, raw_abs, lca_native):
     )
     report_comparison(
         "FC1 pre-activation: C++ / 8128 vs PyTorch",
-        get_trace_integers(entries, "deep.fc1.preact", 96),
+        get_trace_integers(entries, "deep.fc1.preact", fc1_width),
         hidden_scale,
         fc1_preact,
     )
     report_comparison(
         "FC1 activation: C++ / 127 vs PyTorch",
-        get_trace_integers(entries, "deep.fc1.output", 96),
+        get_trace_integers(entries, "deep.fc1.output", fc1_width),
         CPP_FT_SCALE,
         fc1_output,
     )
@@ -2112,11 +2178,9 @@ def main():
     us_perspective, them_perspective = validate_perspectives(entries)
 
     device = torch.device(args.device)
-    if device.type != "cuda":
-        raise ValueError("The current custom Feature Transformer requires CUDA")
-    if not torch.cuda.is_available():
+    if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
-    if device.index is not None:
+    if device.type == "cuda" and device.index is not None:
         torch.cuda.set_device(device)
 
     feature_set = features.get_feature_set_from_name(args.features)
@@ -2183,12 +2247,33 @@ def main():
     compare_integer_reference(entries, integer_reference)
 
     with torch.no_grad():
-        t_w, t_b, v_w, v_b = nnue.input(
-            inputs["white_indices"],
-            inputs["white_values"],
-            inputs["black_indices"],
-            inputs["black_values"],
-        )
+        if device.type == "cuda":
+            t_w, t_b, v_w, v_b = nnue.input(
+                inputs["white_indices"],
+                inputs["white_values"],
+                inputs["black_indices"],
+                inputs["black_values"],
+            )
+        else:
+            # Read-only trace diagnostics do not need the custom CUDA sparse
+            # op.  Summing the active rows is its exact float definition and
+            # avoids moving a second EMA-sized checkpoint copy to the GPU.
+            def direct_ft(indices, values):
+                valid = (indices[0] >= 0) & (values[0] != 0)
+                active_indices = indices[:, valid].to(torch.long)
+                active_values = values[:, valid]
+                rows = nnue.input.weight[active_indices[0]]
+                transformed = (
+                    nnue.input.bias
+                    + (rows * active_values[0].unsqueeze(-1)).sum(dim=0)
+                ).unsqueeze(0)
+                factors = nnue.input.v[active_indices[0]].unsqueeze(0)
+                return transformed, factors, active_indices
+
+            t_w, v_w, inputs["white_indices"] = direct_ft(
+                inputs["white_indices"], inputs["white_values"])
+            t_b, v_b, inputs["black_indices"] = direct_ft(
+                inputs["black_indices"], inputs["black_values"])
 
         fm_by_perspective = {
             "BLACK": process_fm(v_w, inputs["white_indices"]),

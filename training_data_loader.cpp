@@ -7,6 +7,7 @@
 #include <future>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <deque>
 #include <random>
 #include <vector>
@@ -322,9 +323,82 @@ struct HalfKA_HM1_NoDG_KSDG3_NoDG {
         const TrainingDataEntry& e, int* features, float* values, Color color) {
         auto result = HalfKA_KSDG3::fill_features_sparse(
             e, features, values, color);
+
+        // HalfKA_KSDG3 is the legacy Python training contract and excludes the
+        // perspective-side king (39 HalfKA rows).  The production C++
+        // HalfKA_hm1 extractor includes both kings (40 rows), so append that
+        // one missing row in the old layout before applying the hm1/no-DG
+        // remap.  Existing D checkpoints are neutral to this correction: the
+        // corresponding Main and V rows were never trained and are zero.
+        auto& pos = *e.pos;
+        Eval::BonaPiece* pieces = color == Color::BLACK
+            ? pos.eval_list()->piece_list_fb()
+            : pos.eval_list()->piece_list_fw();
+        const PieceNumber target =
+            static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
+        const auto sq_target_k = static_cast<Square>(
+            (pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
+        features[result.first] =
+            KSDG_INPUTS + OLD_BONA * static_cast<int>(sq_target_k)
+            + static_cast<int>(pieces[target]);
+        values[result.first] = 1.0f;
+        ++result.first;
+
         for (int i = 0; i < result.first; ++i)
             features[i] = map_index(features[i]);
         return {result.first, INPUTS};
+    }
+};
+
+// Experiment 85 canonical simple feature set.  This mirrors
+// Features::HalfKA_hm2<Friend> while making the merged-gold/no-DG layout
+// explicit and independent of the production complex extractor.
+struct HalfKA_HM2_NoDG {
+    static constexpr int BONA_PLANES = 1629;
+    static constexpr int INPUTS = 45 * BONA_PLANES;
+    static constexpr int MAX_ACTIVE_FEATURES = PIECE_NUMBER_NB;
+
+    static int mirror_square(int sq) {
+        return (8 - sq / 9) * 9 + sq % 9;
+    }
+
+    static int map_bona(int p, bool mirror) {
+        if (mirror && p >= 90) {
+            const int q = p - 90;
+            p = 90 + (q / 81) * 81 + mirror_square(q % 81);
+        }
+        // Merge promoted pawn/lance/knight/silver into the gold planes.
+        if (p >= 1548 && p < 2196)
+            p = 738 + (p - 1548) % 162;
+        // Remove the four distinguished-gold planes.
+        if (p >= 2196)
+            p -= 648;
+        // hm2 shares the friend/enemy king plane.
+        if (p >= BONA_PLANES)
+            p -= 81;
+        return p;
+    }
+
+    static std::pair<int, int> fill_features_sparse(
+        const TrainingDataEntry& e, int* features, float* values, Color color) {
+        const auto& pos = *e.pos;
+        Eval::BonaPiece* pieces = color == BLACK
+            ? pos.eval_list()->piece_list_fb()
+            : pos.eval_list()->piece_list_fw();
+        const PieceNumber target = static_cast<PieceNumber>(PIECE_NUMBER_KING + color);
+        int king = static_cast<int>((pieces[target] - Eval::BonaPiece::f_king) % SQ_NB);
+        const bool mirror = king >= static_cast<int>(SQ_61);
+        if (mirror)
+            king = mirror_square(king);
+
+        int count = 0;
+        for (PieceNumber i = PIECE_NUMBER_ZERO; i < PIECE_NUMBER_NB; ++i) {
+            const int p = map_bona(static_cast<int>(pieces[i]), mirror);
+            features[count] = king * BONA_PLANES + p;
+            values[count] = 1.0f;
+            ++count;
+        }
+        return {count, INPUTS};
     }
 };
 
@@ -574,7 +648,18 @@ private:
         outcome[i] = (e.result + 1.0f) / 2.0f;
         score[i] = e.score;
         ranking_target[i] = e.ranking_target;
-        layer_stack_indices[i] = e.pos->stack_index();
+        if constexpr ((std::is_same_v<Ts, HalfKA_HM2_NoDG> || ...)) {
+            constexpr int friend_band[9] = {0,0,0,3,3,3,6,6,6};
+            constexpr int enemy_band[9]  = {0,0,0,1,1,1,2,2,2};
+            const Color stm = e.pos->side_to_move();
+            const Square fk = e.pos->king_square(stm);
+            const Square ek = e.pos->king_square(~stm);
+            const int fr = stm == BLACK ? rank_of(fk) : rank_of(Inv(fk));
+            const int er = stm == BLACK ? rank_of(Inv(ek)) : rank_of(ek);
+            layer_stack_indices[i] = friend_band[fr] + enemy_band[er];
+        } else {
+            layer_stack_indices[i] = e.pos->stack_index();
+        }
         material[i] = e.material;
         kif_group_id[i] = e.kif_group_id;
         ply[i] = e.ply;
@@ -872,6 +957,8 @@ extern "C" {
             return new SparseBatch(
                 FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>{}, entries);
         }
+        else if (feature_set == "HalfKA_HM2_NoDG")
+            return new SparseBatch(FeatureSet<HalfKA_HM2_NoDG>{}, entries);
 
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
@@ -901,6 +988,8 @@ extern "C" {
         if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
             return new SparseBatch(
                 FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>{}, entries, true);
+        if (feature_set == "HalfKA_HM2_NoDG")
+            return new SparseBatch(FeatureSet<HalfKA_HM2_NoDG>{}, entries, true);
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
     }
@@ -951,6 +1040,10 @@ extern "C" {
                     train2_rate, skiprate, mirror, batch_size, cyclic,
                     skipPredicate);
         }
+        else if (feature_set == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, skipPredicate);
 
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
         return nullptr;
@@ -984,6 +1077,11 @@ extern "C" {
         if (feature_set == "HalfKA_HM1_NoDG_KSDG3_NoDG")
             return new FeaturedBatchStream<
                 FeatureSet<HalfKA_HM1_NoDG_KSDG3_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename);
+        if (feature_set == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
                 concurrency, filename1, filename2, filename3, train1_rate,
                 train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
                 ranking_target3_filename);

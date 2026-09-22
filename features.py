@@ -13,8 +13,12 @@ import halfkp
 import halfka
 import halfka_ksdg3
 import halfka_ksdg3_compressed
+import halfka_hm2_simple
 
-_feature_modules = [halfkp, halfka, halfka_ksdg3, halfka_ksdg3_compressed]
+_feature_modules = [
+    halfkp, halfka, halfka_ksdg3, halfka_ksdg3_compressed,
+    halfka_hm2_simple,
+]
 
 _feature_blocks_by_name = dict()
 

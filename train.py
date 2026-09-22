@@ -6,6 +6,7 @@ from datetime import datetime
 import hashlib
 import json
 import model as M
+from simple_halfka_hm2_model import SimpleHalfKAHM2NNUE
 from optimizer_presets import available_optimizer_presets
 from optimizer_layouts import (
     PARAMETER_SUBGROUPS,
@@ -240,7 +241,7 @@ class UncertaintyTrainingStatsCallback(pytorch_lightning.Callback):
 
 
 class PositionMilestoneCheckpointCallback(pytorch_lightning.Callback):
-  """Opt-in intra-epoch checkpoints at approximate sample-count milestones."""
+  """Opt-in weight-only checkpoints at approximate sample-count milestones."""
 
   def __init__(self, output_dir, milestones):
     super().__init__()
@@ -266,6 +267,8 @@ class PositionMilestoneCheckpointCallback(pytorch_lightning.Callback):
           "target_positions": target,
           "actual_positions": self.samples_seen,
           "global_step": int(trainer.global_step),
+          "checkpoint_kind": "model_weights_only",
+          "resume_option": "--resume-from-model",
           "checkpoint": str(path),
       })
       manifest = self.output_dir / "milestone_manifest.json"
@@ -273,7 +276,8 @@ class PositionMilestoneCheckpointCallback(pytorch_lightning.Callback):
           json.dumps({"milestones": self.saved}, ensure_ascii=False, indent=2) + "\n",
           encoding="utf-8")
       print(
-          f"Position milestone saved: target={target}, "
+          f"Position milestone saved (model weights only; resume with "
+          f"--resume-from-model): target={target}, "
           f"actual={self.samples_seen}, path={path}", flush=True)
 
 
@@ -596,6 +600,15 @@ def main():
       "--num-sanity-val-steps", default=2, type=int,
       help="Lightning validation sanity steps (default: 2).")
   parser.add_argument("--py-data", action="store_true", help="Use python data loader (default=False)")
+  parser.add_argument(
+      "--architecture", choices=("complex", "halfka_hm2_simple"),
+      default="complex",
+      help=("Python NNUE architecture. Default remains the production complex "
+            "network; halfka_hm2_simple selects Experiment 85."))
+  parser.add_argument(
+      "--simple-debug-log-interval", type=int, default=500,
+      help=("HalfKA_HM2 Simple stdout diagnostic interval in optimizer steps "
+            "(default: 500; <=0 disables feature/bucket/heavy diagnostics)."))
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--start-lambda", default=None, type=float, dest='start_lambda', help="lambda to use at first epoch.")
   parser.add_argument("--end-lambda", default=None, type=float, dest='end_lambda', help="lambda to use at last epoch.")
@@ -713,7 +726,9 @@ def main():
       help="Enable the existing sparse 500-step FT gradient/cosine diagnostic.")
   parser.add_argument(
       "--position-milestones", dest="position_milestones",
-      help="Comma-separated sample counts for opt-in intra-epoch checkpoints.")
+      help=("Comma-separated sample counts for opt-in intra-epoch "
+            "weight-only checkpoints. Resume them with --resume-from-model, "
+            "not --resume-training-state."))
   parser.add_argument(
       "--position-milestone-dir", dest="position_milestone_dir",
       help="Directory for --position-milestones checkpoints.")
@@ -802,6 +817,20 @@ def main():
         "--position-milestones and --position-milestone-dir must be used together")
 
   feature_set = features.get_feature_set_from_name(args.features)
+  simple_architecture = args.architecture == "halfka_hm2_simple"
+  ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
+  if simple_architecture:
+    if feature_set.name != "HalfKA_HM2_NoDG":
+      raise ValueError(
+          "--architecture halfka_hm2_simple requires "
+          "--features HalfKA_HM2_NoDG")
+    if (args.side_input not in (None, "none")
+        or args.pair_relation_side_input):
+      raise ValueError("Experiment 85 simple baseline does not accept side inputs")
+    if args.optimizer_layout or args.reinit_groups or args.freeze_ft_router:
+      raise ValueError(
+          "simple baseline uses its fixed optimizer preset; optimizer layouts, "
+          "reinit groups and --freeze-ft-router are complex-only")
   requested_side_input = args.side_input
   new_side_input = requested_side_input or "none"
   if args.py_data and new_side_input != "none":
@@ -817,7 +846,7 @@ def main():
   end_lambda = args.end_lambda or args.lambda_
   max_epoch = args.max_epochs or 800
   if args.resume_from_model is None:
-    nnue = M.NNUE(feature_set=feature_set,
+    nnue = ModelClass(feature_set=feature_set,
       start_lambda=start_lambda,
       max_epoch=max_epoch,
       end_lambda=end_lambda,
@@ -845,7 +874,9 @@ def main():
           args.pair_relation_schema_version
           if args.pair_relation_schema_version is not None
           else M.PAIR_RELATION_SCHEMA_VERSION))
-    print("Fresh NNUE architecture:", M.nnue_architecture_metadata(nnue))
+    print("Fresh NNUE architecture:",
+          (nnue.architecture_metadata() if simple_architecture
+           else M.nnue_architecture_metadata(nnue)))
   else:
 
     # 「.pt」の場合
@@ -860,7 +891,16 @@ def main():
       # current defaults.  This is essential for compact L2/Cross models and
       # also preserves the exact FM source-unit ordering.
       if hasattr(checkpoint, 'state_dict'):
-          architecture = M.nnue_architecture_metadata(checkpoint)
+          if simple_architecture:
+              if not isinstance(checkpoint, SimpleHalfKAHM2NNUE):
+                  raise TypeError(
+                      "--architecture halfka_hm2_simple requires a Simple "
+                      "HalfKA_HM2 .pt model")
+              architecture = checkpoint.architecture_metadata(
+                  getattr(checkpoint, "transplant_source", None),
+                  getattr(checkpoint, "transplant_mapping_version", None))
+          else:
+              architecture = M.nnue_architecture_metadata(checkpoint)
           checkpoint_dict = checkpoint.state_dict()
       elif isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
           architecture = (checkpoint.get('architecture')
@@ -875,20 +915,27 @@ def main():
           architecture = None
           checkpoint_dict = checkpoint
 
-      architecture_kwargs = M.nnue_architecture_kwargs(architecture)
-      if requested_side_input is not None:
+      if simple_architecture:
+          if (architecture is None
+              or architecture.get("architecture_type")
+                  != "halfka_hm2_simple"):
+              raise ValueError(".pt is not a HalfKA_HM2 simple architecture")
+          architecture_kwargs = {}
+      else:
+          architecture_kwargs = M.nnue_architecture_kwargs(architecture)
+      if not simple_architecture and requested_side_input is not None:
           architecture_kwargs.update({
               "side_input_type": requested_side_input,
               "side_input_dim": args.side_input_dim,
               "side_input_fusion": args.side_input_fusion,
           })
-      if args.pair_relation_side_input is not None:
+      if not simple_architecture and args.pair_relation_side_input is not None:
           architecture_kwargs["pair_relation_side_input"] = bool(
               args.pair_relation_side_input)
-      if args.pair_relation_schema_version is not None:
+      if not simple_architecture and args.pair_relation_schema_version is not None:
           architecture_kwargs["pair_relation_schema_version"] = int(
               args.pair_relation_schema_version)
-      nnue = M.NNUE(feature_set=feature_set,
+      nnue = ModelClass(feature_set=feature_set,
                     start_lambda=start_lambda,
                     max_epoch=max_epoch,
                     end_lambda=end_lambda,
@@ -912,7 +959,11 @@ def main():
       model_dict = nnue.state_dict()
       if architecture is not None:
           print("Resuming .pt architecture:",
-                M.nnue_architecture_metadata(nnue))
+                (nnue.architecture_metadata(
+                    getattr(nnue, "transplant_source", None),
+                    getattr(nnue, "transplant_mapping_version", None))
+                 if simple_architecture
+                 else M.nnue_architecture_metadata(nnue)))
 
       # checkpoint_dict を使って、形状が一致するものだけを抽出
       pretrained_dict = {
@@ -1014,23 +1065,24 @@ def main():
       if not args.resume_training_state or args.reinit_groups:
         resume_overrides["reinit_groups"] = args.reinit_groups
         resume_overrides["reinit_seed"] = args.reinit_seed
-      nnue = M.NNUE.load_from_checkpoint(
+      nnue = ModelClass.load_from_checkpoint(
           args.resume_from_model, feature_set=feature_set, strict=False,
           **resume_overrides)
-      if (args.resume_training_state and requested_side_input is not None
+      if (not simple_architecture
+          and args.resume_training_state and requested_side_input is not None
           and nnue.side_input_type != requested_side_input):
         raise ValueError(
             "--resume-training-state side-input mismatch: "
             f"checkpoint={nnue.side_input_type}, requested={requested_side_input}. "
             "Use --resume-from-model without --resume-training-state for "
             "weight-only architecture migration.")
-      if (args.resume_training_state
+      if (not simple_architecture and args.resume_training_state
           and args.pair_relation_side_input is not None
           and nnue.pair_relation_side_input
               != bool(args.pair_relation_side_input)):
         raise ValueError(
             "--resume-training-state pair-relation architecture mismatch")
-      if (args.resume_training_state
+      if (not simple_architecture and args.resume_training_state
           and args.pair_relation_schema_version is not None
           and nnue.pair_relation_schema_version
               != args.pair_relation_schema_version):
@@ -1041,7 +1093,7 @@ def main():
 
       """
       # 1. まず、新しい構造のモデルを普通に作る
-      nnue = M.NNUE(feature_set=feature_set)
+      nnue = ModelClass(feature_set=feature_set)
       
       # 2. チェックポイントを「ただの辞書」として読み込む
       checkpoint = torch.load(args.resume_from_model, map_location='cpu')
@@ -1081,20 +1133,26 @@ def main():
     nnue.gamma = args.gamma
     nnue.lr = args.lr
 
-  nnue.ft_optimizer_name = args.ft_optimizer
-  nnue.other_optimizer_name = args.other_optimizer
-  if not args.resume_training_state or args.optimizer_layout is not None:
-    nnue.optimizer_layout_name = args.optimizer_layout
-  if not args.resume_training_state or args.reinit_groups:
-    nnue.reinit_groups = tuple(args.reinit_groups)
-    nnue.reinit_seed = args.reinit_seed
-  if nnue.optimizer_layout_name is None:
-    nnue.set_freeze_ft_router(args.freeze_ft_router)
-  else:
-    nnue.apply_optimizer_layout_freeze()
-  if args.reinit_groups:
-    nnue.reinitialize_optimizer_subgroups(
-        args.reinit_groups, args.reinit_seed)
+  if simple_architecture:
+    # Logging cadence is runtime policy, not part of the network schema.
+    # Apply it uniformly to fresh, weight-only and training-state resumes.
+    nnue.simple_debug_log_interval = int(args.simple_debug_log_interval)
+
+  if not simple_architecture:
+    nnue.ft_optimizer_name = args.ft_optimizer
+    nnue.other_optimizer_name = args.other_optimizer
+    if not args.resume_training_state or args.optimizer_layout is not None:
+      nnue.optimizer_layout_name = args.optimizer_layout
+    if not args.resume_training_state or args.reinit_groups:
+      nnue.reinit_groups = tuple(args.reinit_groups)
+      nnue.reinit_seed = args.reinit_seed
+    if nnue.optimizer_layout_name is None:
+      nnue.set_freeze_ft_router(args.freeze_ft_router)
+    else:
+      nnue.apply_optimizer_layout_freeze()
+    if args.reinit_groups:
+      nnue.reinitialize_optimizer_subgroups(
+          args.reinit_groups, args.reinit_seed)
 
   nnue.ranking_disagreement_weight = args.ranking_disagreement_weight
   if (args.ranking_target3
@@ -1118,6 +1176,8 @@ def main():
         "raw DLSuisho15b remains the base target"
     )
 
+  if args.uncertainty_head and simple_architecture:
+    raise ValueError("uncertainty heads are complex-only")
   if args.uncertainty_head:
     nnue.configure_uncertainty_base_weighting(
         args.uncertainty_head,
@@ -1127,9 +1187,10 @@ def main():
         f"strength={args.uncertainty_base_weight_strength:.3f}, "
         f"path={Path(args.uncertainty_head).resolve()}"
     )
-  nnue.enable_ft_loss_contribution_measurement = (
-      args.enable_ft_loss_contribution_measurement)
-  nnue.capture_training_loss_components = bool(args.uncertainty_report)
+  if not simple_architecture:
+    nnue.enable_ft_loss_contribution_measurement = (
+        args.enable_ft_loss_contribution_measurement)
+    nnue.capture_training_loss_components = bool(args.uncertainty_report)
 
   print("Feature set: {}".format(feature_set.name))
   print("Num real features: {}".format(feature_set.num_real_features))
@@ -1207,7 +1268,7 @@ def main():
     train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, nnue.side_input_type, nnue.pair_relation_side_input)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False))
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()
