@@ -31,6 +31,7 @@ SIMPLE_SIDE_INPUT_TYPE = "ply_material_v1"
 SIMPLE_SIDE_INPUT_DIM = 4
 SIMPLE_DIRECT_SIDE_INPUT_TYPE = "ply_material_direct_v1"
 SIMPLE_DIRECT_SIDE_INPUT_DIM = 2
+SIMPLE_SHARED_PSQT_TYPE = "halfka_hm2_shared_psqt_v1"
 BUCKET_STAT_NAMES = (
     "count", "weight", "loss", "prob_mae", "cp_mae",
     "importance_weighted_loss",
@@ -102,6 +103,35 @@ class SimpleFeatureTransformer(nn.Module):
             return F.embedding_bag(
                 safe_indices, self.weight, offsets,
                 per_sample_weights=safe_values, mode="sum") + self.bias
+
+        return (accumulate(white_indices, white_values),
+                accumulate(black_indices, black_values))
+
+
+class SimpleSharedPsqt(nn.Module):
+    """One learned scalar per HalfKA_HM2 feature, shared by all buckets."""
+
+    def __init__(self, num_inputs: int = FT_INPUTS):
+        super().__init__()
+        # Zero rows make baseline -> PSQT migration exactly output-neutral.
+        self.weight = nn.Parameter(torch.zeros(num_inputs, 1))
+        # Keep the scale explicit and trainable.  Initializing it to one lets
+        # the zero rows receive gradient on the first optimizer step.
+        self.scale = nn.Parameter(torch.ones(()))
+
+    def forward(self, white_indices, white_values,
+                black_indices, black_values):
+        def accumulate(indices, values):
+            batch, active = indices.shape
+            valid = indices >= 0
+            safe_indices = indices.masked_fill(~valid, 0).reshape(-1).long()
+            safe_values = values.masked_fill(~valid, 0.0).reshape(-1)
+            offsets = torch.arange(
+                0, batch * active, active, dtype=torch.long,
+                device=indices.device)
+            return F.embedding_bag(
+                safe_indices, self.weight, offsets,
+                per_sample_weights=safe_values, mode="sum").view(-1)
 
         return (accumulate(white_indices, white_values),
                 accumulate(black_indices, black_values))
@@ -194,6 +224,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_debug_log_interval=500,
         use_side_input=False,
         use_direct_side_input=False,
+        use_shared_psqt=False,
         use_bucket_importance_base_loss=False,
         **unused,
     ):
@@ -209,11 +240,14 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.use_projected_side_input = bool(use_side_input)
         self.use_direct_side_input = bool(use_direct_side_input)
         self.use_side_input = bool(use_side_input or use_direct_side_input)
+        self.use_shared_psqt = bool(use_shared_psqt)
         self.simple_side_input_type = (
             (SIMPLE_DIRECT_SIDE_INPUT_TYPE if self.use_direct_side_input
              else SIMPLE_SIDE_INPUT_TYPE)
             if self.use_side_input else "none")
         self.input = SimpleFeatureTransformer()
+        self.shared_psqt = (
+            SimpleSharedPsqt() if self.use_shared_psqt else None)
         self.side_proj = (
             nn.Sequential(nn.Linear(2, SIMPLE_SIDE_INPUT_DIM), nn.ReLU())
             if self.use_projected_side_input else None)
@@ -251,6 +285,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self._simple_debug_layer_stats = None
         self._simple_clip_stats_pending = None
         self._simple_debug_display_step = None
+        self.simple_validation_cohort_report = False
+        self._simple_validation_cohorts = None
         self.nnue2score = NNUE_TO_SCORE
         self.weight_clipping = [
             {
@@ -309,6 +345,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "simple_side_input_normalization": (
                 "ply_clamp_200_0_2+material_clamp_4000_m2_2"
                 if use_side_input else "none"),
+            "use_shared_psqt": bool(self.use_shared_psqt),
+            "simple_psqt_type": (
+                SIMPLE_SHARED_PSQT_TYPE if self.use_shared_psqt else "none"),
+            "simple_psqt_scale": (
+                "learnable_scalar_init_1" if self.use_shared_psqt else "none"),
             "transplant_source": transplant_source,
             "transplant_mapping_version": mapping_version,
         }
@@ -354,6 +395,10 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         collect = bool(self.training and self._simple_debug_capture)
         out = transformed.new_empty((transformed.shape[0], 1))
         diagnostic_parts = {} if collect else None
+        psqt_deep = (transformed.new_empty(transformed.shape[0])
+                     if collect and self.use_shared_psqt else None)
+        psqt_shortcut = (transformed.new_empty(transformed.shape[0])
+                         if collect and self.use_shared_psqt else None)
         for bucket, stack in enumerate(self.layer_stacks):
             mask = buckets == bucket
             if mask.any():
@@ -363,12 +408,38 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                         None if side_h is None else side_h[mask],
                         collect_diagnostics=True)
                     out[mask] = bucket_out
+                    if self.use_shared_psqt:
+                        psqt_deep[mask] = bucket_diagnostics["deep"].view(-1)
+                        psqt_shortcut[mask] = (
+                            bucket_diagnostics["shortcut"].view(-1))
                     for name, value in bucket_diagnostics.items():
                         diagnostic_parts.setdefault(name, []).append(value)
                 else:
                     out[mask] = stack(
                         transformed[mask],
                         None if side_h is None else side_h[mask])
+        psqt_snapshot = None
+        if self.use_shared_psqt:
+            white_psqt, black_psqt = self.shared_psqt(
+                white_indices, white_values, black_indices, black_values)
+            # white_* is the fixed BLACK-perspective accumulator and black_*
+            # the fixed WHITE-perspective accumulator.  Apply the same
+            # side-to-move friend/enemy selection as the FT path above.
+            raw_psqt = (
+                us.view(-1) * (white_psqt - black_psqt)
+                + them.view(-1) * (black_psqt - white_psqt))
+            psqt_value = self.shared_psqt.scale * raw_psqt
+            existing_output = out.view(-1)
+            out = out + psqt_value.view(-1, 1)
+            if collect:
+                psqt_snapshot = {
+                    "raw": raw_psqt.detach(),
+                    "value": psqt_value.detach(),
+                    "existing_output": existing_output.detach(),
+                    "final_output": out.view(-1).detach(),
+                    "deep": psqt_deep.detach(),
+                    "shortcut": psqt_shortcut.detach(),
+                }
         if collect:
             activation_tensors = {
                 name: torch.cat(parts, dim=0)
@@ -378,6 +449,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 "activations": self._activation_snapshot(
                     transformed, activation_tensors, side_raw),
             }
+            if psqt_snapshot is not None:
+                self._simple_debug_snapshot["psqt"] = psqt_snapshot
         return out
 
     @staticmethod
@@ -533,6 +606,10 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         total = base_loss + 0.01 * pair_loss + 0.01 * listwise_loss
 
         if stage == "val":
+            if self.simple_validation_cohort_report:
+                self._accumulate_validation_cohort_stats(
+                    bucket.view(-1).long(), (qf - pf).abs(),
+                    (pred_cp - score).abs(), ply, material)
             # Keep a stable score-only validation objective even when a future
             # run uses a win-rate blend (start/end lambda != 1).  Reuse the
             # already computed forward result; only the lightweight ranking
@@ -730,6 +807,28 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             snapshot["pair_metrics"] = pair_metrics
             snapshot["pt_range"] = (
                 None if pt_range is None else pt_range.detach())
+            if self.use_shared_psqt and "psqt" in snapshot:
+                psqt = snapshot["psqt"]
+
+                def correlation(left, right):
+                    left = left.detach().float().view(-1)
+                    right = right.detach().float().view(-1)
+                    left = left - left.mean()
+                    right = right - right.mean()
+                    denominator = left.square().sum().sqrt() * \
+                        right.square().sum().sqrt()
+                    return ((left * right).sum()
+                            / denominator.clamp_min(1e-12))
+
+                teacher_output = score.detach().float() / self.nnue2score
+                residual = teacher_output - psqt["existing_output"].float()
+                contribution = psqt["value"].float()
+                psqt["corr_teacher_residual"] = correlation(
+                    contribution, residual)
+                psqt["corr_shortcut"] = correlation(
+                    contribution, psqt["shortcut"])
+                psqt["corr_deep"] = correlation(
+                    contribution, psqt["deep"])
         self._simple_debug_snapshot = snapshot
 
     def _print_training_bucket_stats(self, display_step):
@@ -977,6 +1076,39 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         print(
             f"  Absolute share  : Deep={output['deep_share']:.2%} "
             f"Shortcut={output['shortcut_share']:.2%}")
+
+        if self.use_shared_psqt:
+            psqt = snapshot["psqt"]
+            value = psqt["value"].detach().float()
+            raw = psqt["raw"].detach().float()
+            existing = psqt["existing_output"].detach().float()
+            final = psqt["final_output"].detach().float()
+            weight = self.shared_psqt.weight.detach().float().view(-1)
+            print(f"[PSQT Stats](Step {display_step}, current batch snapshot)")
+            print(
+                "  psqt output mean/std/min/max       : "
+                f"{value.mean().item():+.6e} / {value.std(unbiased=False).item():.6e} / "
+                f"{value.min().item():+.6e} / {value.max().item():+.6e}")
+            print(f"  psqt abs mean                     : {value.abs().mean().item():.6e}")
+            print(f"  existing output abs mean          : {existing.abs().mean().item():.6e}")
+            print(
+                "  psqt / final-output abs ratio      : "
+                f"{(value.abs().mean() / final.abs().mean().clamp_min(1e-12)).item():.6e}")
+            print(
+                "  psqt weight mean/std/min/max       : "
+                f"{weight.mean().item():+.6e} / {weight.std(unbiased=False).item():.6e} / "
+                f"{weight.min().item():+.6e} / {weight.max().item():+.6e}")
+            print(f"  psqt learnable scale              : {self.shared_psqt.scale.item():+.6e}")
+            print(
+                "  active raw contribution mean/std  : "
+                f"{raw.mean().item():+.6e} / {raw.std(unbiased=False).item():.6e}")
+            print(
+                "  corr(psqt, teacher residual)       : "
+                f"{host_scalar(psqt['corr_teacher_residual']):+.6f}")
+            print(
+                "  corr(psqt, shortcut / deep)        : "
+                f"{host_scalar(psqt['corr_shortcut']):+.6f} / "
+                f"{host_scalar(psqt['corr_deep']):+.6f}")
 
         if self.use_side_input:
             side = {
@@ -1256,6 +1388,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self._simple_debug_display_step = None
 
     def on_validation_epoch_start(self):
+        if self.simple_validation_cohort_report:
+            self._simple_validation_cohorts = None
         optimizer = self.optimizers()
         param_groups = optimizer.param_groups
         if not param_groups:
@@ -1268,6 +1402,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
               if self.use_projected_side_input else
               "9 bucket layer stacks + direct side"
               if self.use_direct_side_input else "9 bucket layer stacks"))
+        if self.use_shared_psqt:
+            group_names = (
+                group_names[0], group_names[1] + " + shared PSQT")
         for index, group in enumerate(param_groups):
             name = group_names[index] if index < len(group_names) else "unknown"
             parameters = sum(parameter.numel() for parameter in group["params"])
@@ -1280,11 +1417,77 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             experiment.add_scalar(
                 "current_lr", current_lr, global_step=self.global_step)
 
+    @staticmethod
+    def _cohort_add(table, indices, prob_error, cp_error):
+        rows = torch.stack((
+            torch.ones_like(prob_error), prob_error, cp_error), dim=1)
+        table.index_add_(0, indices, rows.float())
+
+    def _accumulate_validation_cohort_stats(
+            self, bucket, prob_error, cp_error, ply, material):
+        if self._simple_validation_cohorts is None:
+            device = bucket.device
+            self._simple_validation_cohorts = {
+                "bucket": torch.zeros((9, 3), device=device),
+                "ply": torch.zeros((6, 3), device=device),
+                "material": torch.zeros((5, 3), device=device),
+            }
+        stats = self._simple_validation_cohorts
+        ply_index = torch.where(
+            ply <= 20, 0, torch.where(
+                ply <= 40, 1, torch.where(
+                    ply <= 60, 2, torch.where(
+                        ply <= 80, 3, torch.where(ply <= 100, 4, 5))))).long()
+        absolute_material = material.abs()
+        material_index = torch.where(
+            absolute_material < 300, 0, torch.where(
+                absolute_material < 1000, 1, torch.where(
+                    absolute_material < 2000, 2, torch.where(
+                        absolute_material < 4000, 3, 4)))).long()
+        self._cohort_add(stats["bucket"], bucket, prob_error, cp_error)
+        self._cohort_add(stats["ply"], ply_index, prob_error, cp_error)
+        self._cohort_add(
+            stats["material"], material_index, prob_error, cp_error)
+
+    def on_validation_epoch_end(self):
+        if not self.simple_validation_cohort_report \
+                or self._simple_validation_cohorts is None:
+            return
+        labels = {
+            "bucket": [f"B{index:02d}" for index in range(9)],
+            "ply": ["1-20", "21-40", "41-60", "61-80", "81-100", "101+"],
+            "material": ["0-299", "300-999", "1000-1999", "2000-3999", "4000+"],
+        }
+        print(f"[Simple Validation Cohorts](Step {int(self.global_step)})")
+        for group in ("bucket", "ply", "material"):
+            table = self._simple_validation_cohorts[group].detach().cpu().double()
+            print(f"  {group}:")
+            for index, label in enumerate(labels[group]):
+                count = int(table[index, 0].item())
+                if count:
+                    print(
+                        f"    {label}: n={count} "
+                        f"prob_mae={table[index, 1].item() / count:.9f} "
+                        f"cp_mae={table[index, 2].item() / count:.6f}")
+        bucket = self._simple_validation_cohorts["bucket"].detach().cpu().double()
+        non_count = int(bucket[:8, 0].sum().item())
+        b08_count = int(bucket[8, 0].item())
+        print(
+            f"  non-B08: n={non_count} "
+            f"prob_mae={bucket[:8, 1].sum().item() / max(non_count, 1):.9f} "
+            f"cp_mae={bucket[:8, 2].sum().item() / max(non_count, 1):.6f}")
+        print(
+            f"  B08: n={b08_count} "
+            f"prob_mae={bucket[8, 1].item() / max(b08_count, 1):.9f} "
+            f"cp_mae={bucket[8, 2].item() / max(b08_count, 1):.6f}")
+
     def configure_optimizers(self):
         # A fresh optimizer is intentional for transplanted checkpoints.
         downstream = list(self.layer_stacks.parameters())
         if self.side_proj is not None:
             downstream.extend(self.side_proj.parameters())
+        if self.shared_psqt is not None:
+            downstream.extend(self.shared_psqt.parameters())
         optimizer = torch.optim.AdamW(
             [
                 {"params": list(self.input.parameters()), "lr": self.lr},
@@ -1310,6 +1513,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError("HalfKA_hm2 simple schema mismatch")
         saved_side_input = bool(metadata.get("use_side_input", False))
         saved_side_type = metadata.get("simple_side_input_type", "none")
+        saved_shared_psqt = bool(metadata.get("use_shared_psqt", False))
         if saved_side_input and saved_side_type != self.simple_side_input_type:
             raise ValueError(
                 "Simple side-input type mismatch: "
@@ -1338,5 +1542,18 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             if self.use_projected_side_input:
                 for key in ("side_proj.0.weight", "side_proj.0.bias"):
                     state[key] = current[key].detach().clone()
+        if saved_shared_psqt and not self.use_shared_psqt:
+            raise ValueError(
+                "shared-PSQT checkpoint cannot be loaded into the baseline "
+                "Simple architecture")
+        if not saved_shared_psqt and self.use_shared_psqt:
+            # Weight-only baseline -> PSQT migration.  Preserve the exact
+            # baseline at step zero while introducing the new trainable path.
+            state = checkpoint.get("state_dict", {})
+            current = self.state_dict()
+            state["shared_psqt.weight"] = (
+                current["shared_psqt.weight"].detach().clone())
+            state["shared_psqt.scale"] = (
+                current["shared_psqt.scale"].detach().clone())
         self.transplant_source = metadata.get("transplant_source")
         self.transplant_mapping_version = metadata.get("transplant_mapping_version")

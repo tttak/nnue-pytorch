@@ -628,6 +628,10 @@ def main():
       help=("HalfKA_HM2 Simple stdout diagnostic interval in optimizer steps "
             "(default: 500; <=0 disables feature/bucket/heavy diagnostics)."))
   parser.add_argument(
+      "--simple-validation-cohort-report", action="store_true",
+      help=("Print natural-validation bucket/ply/|material| probability and "
+            "cp MAE aggregates for HalfKA_HM2 Simple. Diagnostic only."))
+  parser.add_argument(
       "--use-side-input", action="store_true",
       help=("Experiment-only HalfKA_HM2 Simple side input: normalized ply "
             "and material -> Linear(2,4) -> ReLU -> FC1 concat. Default OFF."))
@@ -636,6 +640,11 @@ def main():
       help=("Experiment-only HalfKA_HM2 Simple direct side input: normalized "
             "ply/material are concatenated directly to the 30d FC1 input. "
             "Default OFF."))
+  parser.add_argument(
+      "--use-shared-psqt", action="store_true",
+      help=("Experiment-only HalfKA_HM2 Simple learned PSQT bypass: one "
+            "zero-initialized scalar per feature, shared across buckets, "
+            "added to the final output. Default OFF."))
   parser.add_argument(
       "--simple-base-bucket-importance", action="store_true",
       help=("Experiment-only HalfKA_HM2 Simple training rule: apply fixed "
@@ -863,6 +872,8 @@ def main():
   simple_architecture = args.architecture == "halfka_hm2_simple"
   simple_any_side_input = bool(
       args.use_side_input or args.use_direct_side_input)
+  simple_any_experimental_path = bool(
+      simple_any_side_input or args.use_shared_psqt)
   if args.use_side_input and args.use_direct_side_input:
     raise ValueError(
         "--use-side-input and --use-direct-side-input are mutually exclusive")
@@ -870,6 +881,9 @@ def main():
     raise ValueError(
         "--simple-base-bucket-importance requires "
         "--architecture halfka_hm2_simple")
+  if args.use_shared_psqt and not simple_architecture:
+    raise ValueError(
+        "--use-shared-psqt requires --architecture halfka_hm2_simple")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
   if simple_architecture:
     if feature_set.name != "HalfKA_HM2_NoDG":
@@ -900,7 +914,7 @@ def main():
   start_lambda = args.start_lambda or args.lambda_
   end_lambda = args.end_lambda or args.lambda_
   max_epoch = args.max_epochs or 800
-  if simple_architecture and simple_any_side_input:
+  if simple_architecture and simple_any_experimental_path:
     # Model construction happens before the common pl.seed_everything() call
     # below. Seed here as well so the newly introduced side projection has a
     # reproducible initialization in baseline-vs-side weight-only A/B runs.
@@ -937,6 +951,8 @@ def main():
       use_side_input=(args.use_side_input if simple_architecture else False),
       use_direct_side_input=(
           args.use_direct_side_input if simple_architecture else False),
+      use_shared_psqt=(
+          args.use_shared_psqt if simple_architecture else False),
       use_bucket_importance_base_loss=(
           args.simple_base_bucket_importance
           if simple_architecture else False))
@@ -998,6 +1014,9 @@ def main():
                       == "ply_material_direct_v1"),
               "use_bucket_importance_base_loss": bool(
                   args.simple_base_bucket_importance),
+              "use_shared_psqt": bool(
+                  args.use_shared_psqt
+                  or architecture.get("use_shared_psqt", False)),
           }
       else:
           architecture_kwargs = M.nnue_architecture_kwargs(architecture)
@@ -1120,6 +1139,7 @@ def main():
       if simple_architecture:
         resume_overrides["use_bucket_importance_base_loss"] = bool(
             args.simple_base_bucket_importance)
+        resume_overrides["use_shared_psqt"] = bool(args.use_shared_psqt)
       if simple_architecture and simple_any_side_input:
         if args.resume_training_state:
           source_checkpoint = torch.load(
@@ -1136,6 +1156,18 @@ def main():
         resume_overrides["use_side_input"] = bool(args.use_side_input)
         resume_overrides["use_direct_side_input"] = bool(
             args.use_direct_side_input)
+      if simple_architecture and args.use_shared_psqt:
+        if args.resume_training_state:
+          source_checkpoint = torch.load(
+              args.resume_from_model, map_location="cpu", weights_only=False)
+          source_metadata = (
+              source_checkpoint.get("architecture")
+              or source_checkpoint.get("nnue_architecture") or {})
+          if not source_metadata.get("use_shared_psqt", False):
+            raise ValueError(
+                "cannot attach shared PSQT with --resume-training-state; "
+                "use --resume-from-model for weight-only migration")
+          del source_checkpoint
       if not args.resume_training_state and requested_side_input is not None:
         resume_overrides.update({
             "side_input_type": requested_side_input,
@@ -1173,6 +1205,9 @@ def main():
       if (simple_architecture and simple_any_side_input
           and not nnue.use_side_input):
         raise ValueError("failed to construct requested Simple side-input model")
+      if (simple_architecture and args.use_shared_psqt
+          and not nnue.use_shared_psqt):
+        raise ValueError("failed to construct requested Simple shared-PSQT model")
       if (not simple_architecture
           and args.resume_training_state and requested_side_input is not None
           and nnue.side_input_type != requested_side_input):
@@ -1242,6 +1277,8 @@ def main():
     # Logging cadence is runtime policy, not part of the network schema.
     # Apply it uniformly to fresh, weight-only and training-state resumes.
     nnue.simple_debug_log_interval = int(args.simple_debug_log_interval)
+    nnue.simple_validation_cohort_report = bool(
+        args.simple_validation_cohort_report)
 
   if not simple_architecture:
     nnue.ft_optimizer_name = args.ft_optimizer
