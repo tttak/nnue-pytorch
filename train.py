@@ -636,6 +636,12 @@ def main():
       help=("Experiment-only HalfKA_HM2 Simple direct side input: normalized "
             "ply/material are concatenated directly to the 30d FC1 input. "
             "Default OFF."))
+  parser.add_argument(
+      "--simple-base-bucket-importance", action="store_true",
+      help=("Experiment-only HalfKA_HM2 Simple training rule: apply fixed "
+            "selected-bucket frequency^-0.25 importance weights (clipped at "
+            "4, normalized to natural E[w]=1) to base regression only. "
+            "Validation, pairwise and listwise losses remain unweighted."))
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--start-lambda", default=None, type=float, dest='start_lambda', help="lambda to use at first epoch.")
   parser.add_argument("--end-lambda", default=None, type=float, dest='end_lambda', help="lambda to use at last epoch.")
@@ -860,6 +866,10 @@ def main():
   if args.use_side_input and args.use_direct_side_input:
     raise ValueError(
         "--use-side-input and --use-direct-side-input are mutually exclusive")
+  if args.simple_base_bucket_importance and not simple_architecture:
+    raise ValueError(
+        "--simple-base-bucket-importance requires "
+        "--architecture halfka_hm2_simple")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
   if simple_architecture:
     if feature_set.name != "HalfKA_HM2_NoDG":
@@ -926,7 +936,10 @@ def main():
           else M.PAIR_RELATION_SCHEMA_VERSION),
       use_side_input=(args.use_side_input if simple_architecture else False),
       use_direct_side_input=(
-          args.use_direct_side_input if simple_architecture else False))
+          args.use_direct_side_input if simple_architecture else False),
+      use_bucket_importance_base_loss=(
+          args.simple_base_bucket_importance
+          if simple_architecture else False))
     print("Fresh NNUE architecture:",
           (nnue.architecture_metadata() if simple_architecture
            else M.nnue_architecture_metadata(nnue)))
@@ -983,6 +996,8 @@ def main():
                   args.use_direct_side_input
                   or architecture.get("simple_side_input_type")
                       == "ply_material_direct_v1"),
+              "use_bucket_importance_base_loss": bool(
+                  args.simple_base_bucket_importance),
           }
       else:
           architecture_kwargs = M.nnue_architecture_kwargs(architecture)
@@ -1102,6 +1117,9 @@ def main():
           "freeze_ft_router": args.freeze_ft_router,
           "enforce_optimizer_checkpoint_match": bool(args.resume_training_state),
       })
+      if simple_architecture:
+        resume_overrides["use_bucket_importance_base_loss"] = bool(
+            args.simple_base_bucket_importance)
       if simple_architecture and simple_any_side_input:
         if args.resume_training_state:
           source_checkpoint = torch.load(

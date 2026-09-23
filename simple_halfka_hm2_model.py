@@ -33,10 +33,30 @@ SIMPLE_DIRECT_SIDE_INPUT_TYPE = "ply_material_direct_v1"
 SIMPLE_DIRECT_SIDE_INPUT_DIM = 2
 BUCKET_STAT_NAMES = (
     "count", "weight", "loss", "prob_mae", "cp_mae",
+    "importance_weighted_loss",
     "pt_sum", "pt_sq", "pf_sum", "pf_sq", "qf_sum", "qf_sq",
     "error_sum", "error_abs", "error_sq",
     "ply_sum", "ply_sq", "material_sum", "material_sq",
     "score_sum", "score_sq", "pred_sum", "pred_sq")
+
+# Experiment 92: fixed natural-training-distribution frequencies.  These are
+# aggregated from 2,120 disjoint 500-step windows in the v27 production log
+# (13,527,794,634 base-regression samples), never from the current mini-batch.
+SIMPLE_BUCKET_TRAIN_COUNTS = (
+    111_119_684, 48_838_898, 81_167_259, 50_293_752, 91_517_365,
+    481_820_651, 96_587_244, 577_071_342, 11_989_378_439)
+SIMPLE_BUCKET_TRAIN_FREQUENCIES = tuple(
+    count / sum(SIMPLE_BUCKET_TRAIN_COUNTS)
+    for count in SIMPLE_BUCKET_TRAIN_COUNTS)
+SIMPLE_BUCKET_IMPORTANCE_RAW = tuple(
+    min(frequency ** -0.25, 4.0)
+    for frequency in SIMPLE_BUCKET_TRAIN_FREQUENCIES)
+_SIMPLE_BUCKET_IMPORTANCE_MEAN = sum(
+    frequency * weight for frequency, weight in zip(
+        SIMPLE_BUCKET_TRAIN_FREQUENCIES, SIMPLE_BUCKET_IMPORTANCE_RAW))
+SIMPLE_BUCKET_IMPORTANCE_NORMALIZED = tuple(
+    weight / _SIMPLE_BUCKET_IMPORTANCE_MEAN
+    for weight in SIMPLE_BUCKET_IMPORTANCE_RAW)
 
 
 def normalize_simple_side_input(ply, material_stm, dtype=None):
@@ -174,6 +194,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_debug_log_interval=500,
         use_side_input=False,
         use_direct_side_input=False,
+        use_bucket_importance_base_loss=False,
         **unused,
     ):
         super().__init__()
@@ -217,6 +238,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.epoch_size = int(epoch_size)
         self.batch_size = int(batch_size)
         self.simple_debug_log_interval = int(simple_debug_log_interval)
+        self.use_bucket_importance_base_loss = bool(
+            use_bucket_importance_base_loss)
+        self.register_buffer(
+            "_bucket_importance_weights",
+            torch.tensor(SIMPLE_BUCKET_IMPORTANCE_NORMALIZED),
+            persistent=False)
         self._simple_debug_capture = False
         self._simple_debug_snapshot = None
         self._simple_debug_touched_rows = None
@@ -475,7 +502,16 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         err = (target - qf).abs().pow(2.5)
         weights = 1.0 + 0.5 * torch.exp(-(pf - 0.5).abs() / 0.15)
         err = err * (1.0 + self.adjust_loss * (qf > target))
-        base_loss = (err[mask] * weights[mask]).sum() / weights[mask].sum().clamp_min(1e-9)
+        base_loss_numerator = err[mask] * weights[mask]
+        if stage == "train" and self.use_bucket_importance_base_loss:
+            # Keep the old denominator.  Since E_natural[importance] == 1,
+            # this preserves the expected global gradient scale while changing
+            # only the selected-bucket allocation of base-regression gradient.
+            bucket_importance = self._bucket_importance_weights.index_select(
+                0, bucket.view(-1).long()[mask])
+            base_loss_numerator = base_loss_numerator * bucket_importance
+        base_loss = (base_loss_numerator.sum()
+                     / weights[mask].sum().clamp_min(1e-9))
 
         ranking_indices = torch.nonzero(group == 3, as_tuple=False).flatten()
         sorted_data = self._prepare_sorted_data(
@@ -536,6 +572,10 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                     bucket.view(-1).long()[mask],
                     weights[mask],
                     lambda1_err[mask] * weights[mask],
+                    (lambda1_err[mask] * weights[mask]
+                     * (self._bucket_importance_weights.index_select(
+                         0, bucket.view(-1).long()[mask])
+                        if self.use_bucket_importance_base_loss else 1.0)),
                     target[mask], pf[mask], qf[mask],
                     (pf - qf).abs()[mask],
                     (pred_cp - score).abs()[mask],
@@ -627,7 +667,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             device=device, dtype=torch.float32)
 
     def _accumulate_training_bucket_stats(
-            self, bucket, weight, loss, pt, pf, qf, prob_mae, cp_mae,
+            self, bucket, weight, loss, importance_weighted_loss,
+            pt, pf, qf, prob_mae, cp_mae,
             ply, material, score, prediction):
         stats = getattr(self, "_simple_train_bucket_stats", None)
         if stats is None or stats.device != bucket.device:
@@ -641,6 +682,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         # 500 * 16,384 samples) and materially reduces diagnostic overhead.
         rows = torch.stack((
             torch.ones_like(prob_mae), weight, loss, prob_mae, cp_mae,
+            importance_weighted_loss,
             pt, pt.square(), pf, pf.square(), qf, qf.square(),
             error, error.abs(), error.square(),
             ply, ply.square(), material, material.square(),
@@ -754,6 +796,24 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             print(
                 f"  ALL    | {total_count:10d} | {total_loss:12.8f} | "
                 f"{total_prob:8.6f} | {total_cp:9.3f}")
+        if self.use_bucket_importance_base_loss:
+            weighted_numerator = host["importance_weighted_loss"]
+            total_weighted = weighted_numerator.sum().item()
+            print(
+                f"[Simple Bucket Base Importance](Step {display_step}, "
+                f"fixed-frequency, exponent=-0.25, clip=4.0, E[w]=1)")
+            print("  Bucket | sample freq | raw weight | norm weight | weighted loss contribution")
+            print("  " + "-" * 83)
+            for index in range(LAYER_STACKS):
+                contribution = (
+                    weighted_numerator[index].item() / total_weighted
+                    if total_weighted else 0.0)
+                print(
+                    f"  B{index:02d}    | "
+                    f"{SIMPLE_BUCKET_TRAIN_FREQUENCIES[index]:11.7%} | "
+                    f"{SIMPLE_BUCKET_IMPORTANCE_RAW[index]:10.6f} | "
+                    f"{SIMPLE_BUCKET_IMPORTANCE_NORMALIZED[index]:11.6f} | "
+                    f"{contribution:26.6%}")
         stats.zero_()
         self._simple_train_bucket_steps = 0
 
