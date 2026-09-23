@@ -66,7 +66,7 @@ namespace training_data {
         static constexpr auto openmode = std::ios::in | std::ios::binary;
         static inline const std::string extension = "bin";
 
-        BinSfenInputStream(std::string filename1, std::string filename2, std::string filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, std::string ranking_target3_filename = {}) :
+        BinSfenInputStream(std::string filename1, std::string filename2, std::string filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, std::string ranking_target3_filename = {}, const std::uint64_t seed = 5489ULL) :
             m_stream1(filename1, openmode),
             m_stream2(filename2, openmode),
             m_stream3(filename3, openmode),
@@ -83,6 +83,8 @@ namespace training_data {
             m_eof2(!m_stream2),
             m_eof3(!m_stream3),
             m_cyclic(cyclic),
+            m_rand(seed),
+            m_mirror_rand(seed ^ 0x9e3779b97f4a7c15ULL),
             m_skipPredicate(std::move(skipPredicate))
         {
             if (!m_ranking_target3_filename.empty() && !m_ranking_target3_stream)
@@ -195,22 +197,34 @@ namespace training_data {
             std::iota(order3.begin(), order3.end(), std::size_t{0});
             std::shuffle(order3.begin(), order3.end(), m_rand);
 
-            PRNG prng;
-            float mirror = m_mirror;
+            // Mirror decisions must not depend on worker scheduling or on
+            // model-construction RNG consumption. Generate them serially from
+            // a dedicated, explicitly seeded stream before parallel decode.
+            const auto mirror_limit = static_cast<std::uint64_t>(
+                std::clamp(m_mirror, 0.0f, 1.0f) * 1000000.0f);
+            std::vector<std::uint8_t> mirror1(n1), mirror2(n2), mirror3(n3);
+            const auto fill_mirror = [this, mirror_limit](auto& values) {
+                for (auto& value : values)
+                    value = static_cast<std::uint8_t>(
+                        (m_mirror_rand() % 1000000ULL) < mirror_limit);
+            };
+            fill_mirror(mirror1);
+            fill_mirror(mirror2);
+            fill_mirror(mirror3);
 
-            concurrency::parallel_for(size_t(0), n1, [&work_vec, &packedSfenValues1, &prng, &mirror](size_t i)
+            concurrency::parallel_for(size_t(0), n1, [&work_vec, &packedSfenValues1, &mirror1](size_t i)
             {
-                const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
+                const bool mir = mirror1[i] != 0;
                 work_vec[i] = packedSfenValueToTrainingDataEntry(packedSfenValues1[i], mir, 1);
             });
-            concurrency::parallel_for(size_t(0), n2, [&work_vec, &packedSfenValues2, &n1, &prng, &mirror](size_t i)
+            concurrency::parallel_for(size_t(0), n2, [&work_vec, &packedSfenValues2, &n1, &mirror2](size_t i)
             {
-                const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
+                const bool mir = mirror2[i] != 0;
                 work_vec[n1+i] = packedSfenValueToTrainingDataEntry(packedSfenValues2[i], mir, 2);
             });
-            concurrency::parallel_for(size_t(0), n3, [&work_vec, &packedSfenValues3, &rankingTargets3, &order3, &n1, &n2, &prng, &mirror, this](size_t i)
+            concurrency::parallel_for(size_t(0), n3, [&work_vec, &packedSfenValues3, &rankingTargets3, &order3, &n1, &n2, &mirror3, this](size_t i)
             {
-                const bool mir = prng.rand(1000000) < mirror * 1000000.0f;
+                const bool mir = mirror3[i] != 0;
                 const auto source_index = order3[i];
                 work_vec[n1+n2+i] = packedSfenValueToTrainingDataEntry(
                     packedSfenValues3[source_index], mir, 3);
@@ -261,22 +275,24 @@ namespace training_data {
         bool m_eof3;
         bool m_cyclic;
         std::mt19937_64 m_rand;
+        std::mt19937_64 m_mirror_rand;
         std::function<bool(const TrainingDataEntry&)> m_skipPredicate;
+
     };
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, const std::string& ranking_target3_filename = {})
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file(const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, const std::string& ranking_target3_filename = {}, const std::uint64_t seed = 5489ULL)
     {
         if (has_extension(filename1, BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate), ranking_target3_filename);
+            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate), ranking_target3_filename, seed);
 
         return nullptr;
     }
 
-    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, const std::string& ranking_target3_filename = {})
+    inline std::unique_ptr<BasicSfenInputStream> open_sfen_input_file_parallel(int concurrency, const std::string& filename1, const std::string& filename2, const std::string& filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr, const std::string& ranking_target3_filename = {}, const std::uint64_t seed = 5489ULL)
     {
         // TODO (low priority): optimize and parallelize .bin reading.
         if (has_extension(filename1, BinSfenInputStream::extension))
-            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate), ranking_target3_filename);
+            return std::make_unique<BinSfenInputStream>(filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, std::move(skipPredicate), ranking_target3_filename, seed);
 
         return nullptr;
     }

@@ -8105,6 +8105,10 @@ namespace binpack
         bool skip;
         std::int16_t material;
         std::int16_t kif_group_id;
+        // Diagnostic provenance. These fields do not affect training targets
+        // or feature extraction; they let reproducibility tests verify the
+        // exact source/mirroring stream produced by the native loader.
+        bool mirror_applied = false;
 
         [[nodiscard]] bool isValid() const
         {
@@ -8140,6 +8144,7 @@ namespace binpack
 
         ret.material = Eval::material(*ret.pos) * (ret.pos->side_to_move() == BLACK ? 1 : -1);
         ret.kif_group_id = kif_group_id;
+        ret.mirror_applied = mirror;
 
         {
             static std::uint64_t cntAll = 0;

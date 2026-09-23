@@ -2,6 +2,7 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <iterator>
 #include <future>
@@ -38,6 +39,10 @@
 
 using namespace binpack;
 //using namespace chess;
+
+namespace {
+std::atomic<std::uint64_t> g_training_data_seed{5489ULL};
+}
 
 namespace PairRelationSideInput {
 
@@ -588,6 +593,8 @@ struct SparseBatch
         for (int i = 0; i < entries.size(); ++i)
         {
             source_sfens.emplace_back(entries[i].pos->sfen());
+            mirror_applied.emplace_back(
+                static_cast<std::uint8_t>(entries[i].mirror_applied));
             fill_entry(FeatureSet<Ts...>{}, i, entries[i],
                        generate_pair_relations, generate_mobility_tactical);
         }
@@ -618,6 +625,7 @@ struct SparseBatch
     // Diagnostic provenance for Python/C++ parity tests. This member is not
     // part of the stable ctypes prefix and is exposed only through an accessor.
     std::vector<std::string> source_sfens;
+    std::vector<std::uint8_t> mirror_applied;
 
     ~SparseBatch()
     {
@@ -704,7 +712,7 @@ struct Stream : AnyStream
     using StorageType = StorageT;
 
     Stream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr) :
-        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, skipPredicate, ranking_target3_filename ? ranking_target3_filename : ""))
+        m_stream(training_data::open_sfen_input_file_parallel(concurrency, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, cyclic, skipPredicate, ranking_target3_filename ? ranking_target3_filename : "", g_training_data_seed.load(std::memory_order_relaxed)))
     {
     }
 
@@ -899,6 +907,18 @@ static void EnsureInitialize()
 }
 
 extern "C" {
+
+    EXPORT void CDECL set_training_data_seed(const std::uint64_t seed)
+    {
+        // Set before creating the streams. Stream instances copy this value
+        // into independent shuffle and mirror RNGs.
+        g_training_data_seed.store(seed, std::memory_order_relaxed);
+    }
+
+    EXPORT std::uint64_t CDECL get_training_data_seed()
+    {
+        return g_training_data_seed.load(std::memory_order_relaxed);
+    }
 
     // Diagnostic/reference ABI for Pair Relation Side Input v1.  This path
     // intentionally does not build NNUE sparse FT features, so compact
@@ -1311,6 +1331,13 @@ extern "C" {
     {
         return batch && index < batch->source_sfens.size()
             ? batch->source_sfens[index].c_str() : nullptr;
+    }
+
+    EXPORT const std::uint8_t* CDECL get_sparse_batch_mirror_applied(
+        const SparseBatch* batch)
+    {
+        return batch && !batch->mirror_applied.empty()
+            ? batch->mirror_applied.data() : nullptr;
     }
 
 }

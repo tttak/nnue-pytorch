@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import torch
 from torch import set_num_threads as t_set_num_threads
 from pytorch_lightning import loggers as pl_loggers
@@ -121,6 +122,23 @@ class TeacherSampleStatsCallback(pytorch_lightning.Callback):
 
   def on_exception(self, trainer, pl_module, exception):
     self.save(trainer)
+
+
+class BatchThrottleCallback(pytorch_lightning.Callback):
+  """Experiment-only duty-cycle throttle; does not alter model/data state."""
+
+  def __init__(self, milliseconds):
+    super().__init__()
+    self.seconds = max(float(milliseconds), 0.0) / 1000.0
+
+  def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+    if self.seconds:
+      time.sleep(self.seconds)
+
+  def on_validation_batch_end(
+      self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+    if self.seconds:
+      time.sleep(self.seconds)
 
 
 class UncertaintyTrainingStatsCallback(pytorch_lightning.Callback):
@@ -609,6 +627,15 @@ def main():
       "--simple-debug-log-interval", type=int, default=500,
       help=("HalfKA_HM2 Simple stdout diagnostic interval in optimizer steps "
             "(default: 500; <=0 disables feature/bucket/heavy diagnostics)."))
+  parser.add_argument(
+      "--use-side-input", action="store_true",
+      help=("Experiment-only HalfKA_HM2 Simple side input: normalized ply "
+            "and material -> Linear(2,4) -> ReLU -> FC1 concat. Default OFF."))
+  parser.add_argument(
+      "--use-direct-side-input", action="store_true",
+      help=("Experiment-only HalfKA_HM2 Simple direct side input: normalized "
+            "ply/material are concatenated directly to the 30d FC1 input. "
+            "Default OFF."))
   parser.add_argument("--lambda", default=1.0, type=float, dest='lambda_', help="lambda=1.0 = train on evaluations, lambda=0.0 = train on game results, interpolates between (default=1.0).")
   parser.add_argument("--start-lambda", default=None, type=float, dest='start_lambda', help="lambda to use at first epoch.")
   parser.add_argument("--end-lambda", default=None, type=float, dest='end_lambda', help="lambda to use at last epoch.")
@@ -660,6 +687,11 @@ def main():
   parser.add_argument("--batch-size", default=-1, type=int, dest='batch_size', help="Number of positions per batch / per iteration. Default on GPU = 8192 on CPU = 128.")
   parser.add_argument("--threads", default=-1, type=int, dest='threads', help="Number of torch threads to use. Default automatic (cores) .")
   parser.add_argument("--seed", default=42, type=int, dest='seed', help="torch seed to use.")
+  parser.add_argument(
+      "--training-data-seed", type=int, default=None,
+      help=("Seed for the native training-data shuffle/mirror streams. "
+            "Use the same explicit value for reproducible A/B runs; it is "
+            "independent from model initialization RNG."))
   parser.add_argument("--smart-fen-skipping", action='store_true', dest='smart_fen_skipping', help="If enabled positions that are bad training targets will be skipped during loading. Default: False")
   parser.add_argument("--random-fen-skipping", default=0, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
@@ -682,6 +714,11 @@ def main():
   parser.add_argument(
       "--teacher-sample-report", dest="teacher_sample_report",
       help="Write opt-in per-stream and per-loss sample counts as JSON/CSV.")
+  parser.add_argument(
+      "--batch-throttle-ms", type=float, default=0.0,
+      help=("Experiment-only sleep after each train/validation batch. It "
+            "limits GPU duty cycle without changing data, loss, optimizer, "
+            "or scheduler semantics; default 0 disables it."))
   parser.add_argument(
       "--ranking-target3", dest="ranking_target3",
       help=("Optional float32 score-equivalent sidecar aligned one-to-one "
@@ -818,6 +855,11 @@ def main():
 
   feature_set = features.get_feature_set_from_name(args.features)
   simple_architecture = args.architecture == "halfka_hm2_simple"
+  simple_any_side_input = bool(
+      args.use_side_input or args.use_direct_side_input)
+  if args.use_side_input and args.use_direct_side_input:
+    raise ValueError(
+        "--use-side-input and --use-direct-side-input are mutually exclusive")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
   if simple_architecture:
     if feature_set.name != "HalfKA_HM2_NoDG":
@@ -831,6 +873,9 @@ def main():
       raise ValueError(
           "simple baseline uses its fixed optimizer preset; optimizer layouts, "
           "reinit groups and --freeze-ft-router are complex-only")
+  elif simple_any_side_input:
+    raise ValueError(
+        "Simple side-input flags require --architecture halfka_hm2_simple")
   requested_side_input = args.side_input
   new_side_input = requested_side_input or "none"
   if args.py_data and new_side_input != "none":
@@ -845,6 +890,11 @@ def main():
   start_lambda = args.start_lambda or args.lambda_
   end_lambda = args.end_lambda or args.lambda_
   max_epoch = args.max_epochs or 800
+  if simple_architecture and simple_any_side_input:
+    # Model construction happens before the common pl.seed_everything() call
+    # below. Seed here as well so the newly introduced side projection has a
+    # reproducible initialization in baseline-vs-side weight-only A/B runs.
+    torch.manual_seed(args.seed)
   if args.resume_from_model is None:
     nnue = ModelClass(feature_set=feature_set,
       start_lambda=start_lambda,
@@ -873,7 +923,10 @@ def main():
       pair_relation_schema_version=(
           args.pair_relation_schema_version
           if args.pair_relation_schema_version is not None
-          else M.PAIR_RELATION_SCHEMA_VERSION))
+          else M.PAIR_RELATION_SCHEMA_VERSION),
+      use_side_input=(args.use_side_input if simple_architecture else False),
+      use_direct_side_input=(
+          args.use_direct_side_input if simple_architecture else False))
     print("Fresh NNUE architecture:",
           (nnue.architecture_metadata() if simple_architecture
            else M.nnue_architecture_metadata(nnue)))
@@ -920,7 +973,17 @@ def main():
               or architecture.get("architecture_type")
                   != "halfka_hm2_simple"):
               raise ValueError(".pt is not a HalfKA_HM2 simple architecture")
-          architecture_kwargs = {}
+          architecture_kwargs = {
+              "use_side_input": bool(
+                  args.use_side_input
+                  or (architecture.get("use_side_input", False)
+                      and architecture.get("simple_side_input_type")
+                          != "ply_material_direct_v1")),
+              "use_direct_side_input": bool(
+                  args.use_direct_side_input
+                  or architecture.get("simple_side_input_type")
+                      == "ply_material_direct_v1"),
+          }
       else:
           architecture_kwargs = M.nnue_architecture_kwargs(architecture)
       if not simple_architecture and requested_side_input is not None:
@@ -982,7 +1045,12 @@ def main():
               if checkpoint_dict[k].shape == model_dict[k].shape:
                   model_dict[k].copy_(checkpoint_dict[k])
 
-              elif k in ["input.weight", "input.v", "layer_stacks.phase_proj.weight", "layer_stacks.phase_proj.bias"]:
+              elif (k in ["input.weight", "input.v", "layer_stacks.phase_proj.weight", "layer_stacks.phase_proj.bias"]
+                    or (simple_architecture and simple_any_side_input
+                        and k.startswith("layer_stacks.")
+                        and k.endswith(".fc1.weight")
+                        and tuple(checkpoint_dict[k].shape) == (32, 30)
+                        and tuple(model_dict[k].shape) in ((32, 32), (32, 34)))):
                   print(f"形状が異なりますが、重なっている部分だけコピーします: {k}")
 
                   old_shape = checkpoint_dict[k].shape
@@ -1034,6 +1102,22 @@ def main():
           "freeze_ft_router": args.freeze_ft_router,
           "enforce_optimizer_checkpoint_match": bool(args.resume_training_state),
       })
+      if simple_architecture and simple_any_side_input:
+        if args.resume_training_state:
+          source_checkpoint = torch.load(
+              args.resume_from_model, map_location="cpu", weights_only=False)
+          source_metadata = (
+              source_checkpoint.get("architecture")
+              or source_checkpoint.get("nnue_architecture") or {})
+          if not source_metadata.get("use_side_input", False):
+            raise ValueError(
+                "cannot attach Simple side input with --resume-training-state; "
+                "use --resume-from-model for weight-only migration so the "
+                "optimizer and scheduler start fresh")
+          del source_checkpoint
+        resume_overrides["use_side_input"] = bool(args.use_side_input)
+        resume_overrides["use_direct_side_input"] = bool(
+            args.use_direct_side_input)
       if not args.resume_training_state and requested_side_input is not None:
         resume_overrides.update({
             "side_input_type": requested_side_input,
@@ -1068,6 +1152,9 @@ def main():
       nnue = ModelClass.load_from_checkpoint(
           args.resume_from_model, feature_set=feature_set, strict=False,
           **resume_overrides)
+      if (simple_architecture and simple_any_side_input
+          and not nnue.use_side_input):
+        raise ValueError("failed to construct requested Simple side-input model")
       if (not simple_architecture
           and args.resume_training_state and requested_side_input is not None
           and nnue.side_input_type != requested_side_input):
@@ -1201,6 +1288,10 @@ def main():
 
   pl.seed_everything(args.seed)
   print("Seed {}".format(args.seed))
+  if args.training_data_seed is not None:
+    nnue_dataset.set_training_data_seed(args.training_data_seed)
+    print("Training data seed {} (native shuffle/mirror RNG)".format(
+        args.training_data_seed))
 
   if args.gpus < 0:
     raise ValueError(f"--gpus must be 0 or greater (got {args.gpus})")
@@ -1230,6 +1321,10 @@ def main():
       log_dir=tb_logger.log_dir,
       interrupt_controller=interrupt_controller)
   callbacks = [checkpoint_callback]
+  if args.batch_throttle_ms > 0:
+    callbacks.insert(0, BatchThrottleCallback(args.batch_throttle_ms))
+    print(f"Batch throttle: {args.batch_throttle_ms:g} ms after each batch",
+          flush=True)
   if args.teacher_sample_report:
     teacher_sample_callback = TeacherSampleStatsCallback(
         args.teacher_sample_report,

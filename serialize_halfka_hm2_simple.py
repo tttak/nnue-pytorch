@@ -69,6 +69,10 @@ def _write_fc(buf, layer):
 def serialize_model(model, output, ft_compression="none"):
     if not isinstance(model, SimpleHalfKAHM2NNUE):
         raise TypeError("simple serializer accepts only SimpleHalfKAHM2NNUE")
+    if getattr(model, "use_side_input", False):
+        raise ValueError(
+            "ply/material Simple side-input is Python-training-only; its C++ "
+            "serializer/schema has intentionally not been implemented")
     buf = bytearray()
     _u32(buf, VERSION)
     _u32(buf, OUTER_HASH)

@@ -17,6 +17,31 @@ if not local_dllpath:
 dllpath = os.path.abspath(local_dllpath[0])
 dll = ctypes.cdll.LoadLibrary(dllpath)
 
+try:
+    _set_training_data_seed = dll.set_training_data_seed
+    _set_training_data_seed.restype = None
+    _set_training_data_seed.argtypes = [ctypes.c_uint64]
+    _get_training_data_seed = dll.get_training_data_seed
+    _get_training_data_seed.restype = ctypes.c_uint64
+    _get_training_data_seed.argtypes = []
+except AttributeError:
+    _set_training_data_seed = None
+    _get_training_data_seed = None
+
+
+def set_training_data_seed(seed):
+    """Seed native shuffle/mirror RNGs before constructing data streams."""
+    if _set_training_data_seed is None:
+        raise RuntimeError(
+            "training_data_loader lacks deterministic data-seed ABI; "
+            "rebuild training_data_loader.dll")
+    _set_training_data_seed(int(seed) & ((1 << 64) - 1))
+
+
+def get_training_data_seed():
+    return None if _get_training_data_seed is None else int(
+        _get_training_data_seed())
+
 class SparseBatch(ctypes.Structure):
     _fields_ = [
         ('num_inputs', ctypes.c_int),
@@ -295,6 +320,19 @@ except AttributeError:
     get_sparse_batch_pair_relation_indices = None
     get_sparse_batch_pair_relation_batch_indices = None
     get_sparse_batch_source_sfen = None
+
+try:
+    # Generic provenance ABI; unlike Pair Relation diagnostics this is useful
+    # for every sparse-batch architecture.
+    get_sparse_batch_source_sfen = dll.get_sparse_batch_source_sfen
+    get_sparse_batch_source_sfen.restype = ctypes.c_char_p
+    get_sparse_batch_source_sfen.argtypes = [SparseBatchPtr, ctypes.c_size_t]
+    get_sparse_batch_mirror_applied = dll.get_sparse_batch_mirror_applied
+    get_sparse_batch_mirror_applied.restype = ctypes.POINTER(ctypes.c_uint8)
+    get_sparse_batch_mirror_applied.argtypes = [SparseBatchPtr]
+except AttributeError:
+    get_sparse_batch_source_sfen = None
+    get_sparse_batch_mirror_applied = None
 
 get_sparse_batch_from_fens = dll.get_sparse_batch_from_fens
 get_sparse_batch_from_fens.restype = SparseBatchPtr

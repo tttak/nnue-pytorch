@@ -27,12 +27,33 @@ NNUE_TO_SCORE = 127.0 * 64.0 / 16.0
 HIDDEN_WEIGHT_SCALE = 64.0
 MAX_HIDDEN_WEIGHT = 127.0 / HIDDEN_WEIGHT_SCALE
 FT_SERIALIZER_SCALE = 127.0
+SIMPLE_SIDE_INPUT_TYPE = "ply_material_v1"
+SIMPLE_SIDE_INPUT_DIM = 4
+SIMPLE_DIRECT_SIDE_INPUT_TYPE = "ply_material_direct_v1"
+SIMPLE_DIRECT_SIDE_INPUT_DIM = 2
 BUCKET_STAT_NAMES = (
     "count", "weight", "loss", "prob_mae", "cp_mae",
     "pt_sum", "pt_sq", "pf_sum", "pf_sq", "qf_sum", "qf_sq",
     "error_sum", "error_abs", "error_sq",
     "ply_sum", "ply_sq", "material_sum", "material_sq",
     "score_sum", "score_sq", "pred_sum", "pred_sq")
+
+
+def normalize_simple_side_input(ply, material_stm, dtype=None):
+    """Normalize the two Simple side inputs without changing perspective.
+
+    ``training_data_loader.cpp`` already emits ``material`` as
+    ``Eval::material(pos) * (side_to_move == BLACK ? 1 : -1)``.  It is thus
+    side-to-move-relative (friend minus enemy), exactly like the transformed
+    NNUE input. Applying another color/sign conversion here would be wrong.
+    """
+    if dtype is None:
+        dtype = torch.float32
+    ply_norm = torch.clamp(
+        ply.view(-1).to(dtype=dtype) / 200.0, 0.0, 2.0)
+    material_norm = torch.clamp(
+        material_stm.view(-1).to(dtype=dtype) / 4000.0, -2.0, 2.0)
+    return torch.stack((ply_norm, material_norm), dim=1)
 
 
 class SimpleFeatureTransformer(nn.Module):
@@ -69,34 +90,65 @@ class SimpleFeatureTransformer(nn.Module):
 class SimpleStack(nn.Module):
     """1536 -> 16; (sqr15, relu15) -> 32 -> 1 + shortcut."""
 
-    def __init__(self):
+    def __init__(self, side_input_dim: int = 0):
         super().__init__()
+        self.side_input_dim = int(side_input_dim)
         self.fc0 = nn.Linear(FT_WIDTH, 16)
-        self.fc1 = nn.Linear(30, 32)
+        self.fc1 = nn.Linear(30 + self.side_input_dim, 32)
         self.fc2 = nn.Linear(32, 1)
+        if self.side_input_dim:
+            # Preserve the old network exactly at architecture-migration time.
+            # The original 30 columns keep their normal initialization/load;
+            # only the newly attached side columns start with no contribution.
+            with torch.no_grad():
+                self.fc1.weight[:, 30:].zero_()
 
-    def forward(self, x, collect_diagnostics=False):
+    def forward(self, x, side_input=None, collect_diagnostics=False):
         h0 = self.fc0(x)
         hidden_pre = h0[:, :15]
         # Canonical SFNN squares the raw affine output before clipping.
         hidden2 = torch.clamp(
             hidden_pre.square() * (127.0 / 128.0), 0.0, 1.0)
         hidden = torch.clamp(hidden_pre, 0.0, 1.0)
-        h1 = torch.clamp(
-            self.fc1(torch.cat((hidden2, hidden), dim=1)), 0.0, 1.0)
+        main_h = torch.cat((hidden2, hidden), dim=1)
+        if self.side_input_dim:
+            if side_input is None:
+                raise ValueError("enabled simple side input requires side features")
+            fc1_input = torch.cat((main_h, side_input), dim=1)
+        else:
+            fc1_input = main_h
+        fc1_pre = self.fc1(fc1_input)
+        h1 = torch.clamp(fc1_pre, 0.0, 1.0)
         deep = self.fc2(h1)
         shortcut = h0[:, 15:16]
         output = deep + shortcut
         if collect_diagnostics:
-            return output, {
+            diagnostics = {
                 "fc0_pre": h0[:, :15],
                 "clipped": hidden,
                 "squared": hidden2,
+                "fc1_pre": fc1_pre,
                 "fc1_activation": h1,
                 "deep": deep,
                 "shortcut": shortcut,
                 "final": output,
             }
+            if self.side_input_dim:
+                diagnostics.update({
+                    "side_projection": side_input,
+                    "main_fc1_contribution": F.linear(
+                        main_h, self.fc1.weight[:, :30], None),
+                    "side_fc1_contribution": F.linear(
+                        side_input, self.fc1.weight[:, 30:], None),
+                })
+                if self.side_input_dim == SIMPLE_DIRECT_SIDE_INPUT_DIM:
+                    diagnostics.update({
+                        "ply_fc1_contribution": (
+                            side_input[:, 0:1] * self.fc1.weight[None, :, 30]),
+                        "material_fc1_contribution": (
+                            side_input[:, 1:2] * self.fc1.weight[None, :, 31]),
+                    })
+            return output, diagnostics
         return output
 
 
@@ -120,6 +172,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         epoch_size=50_000_000,
         batch_size=16_384,
         simple_debug_log_interval=500,
+        use_side_input=False,
+        use_direct_side_input=False,
         **unused,
     ):
         super().__init__()
@@ -128,8 +182,27 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 f"simple architecture requires {FEATURE_NAME}/{FT_INPUTS}, got "
                 f"{feature_set.name}/{feature_set.num_features}")
         self.feature_set = feature_set
+        if use_side_input and use_direct_side_input:
+            raise ValueError(
+                "projected and direct Simple side inputs are mutually exclusive")
+        self.use_projected_side_input = bool(use_side_input)
+        self.use_direct_side_input = bool(use_direct_side_input)
+        self.use_side_input = bool(use_side_input or use_direct_side_input)
+        self.simple_side_input_type = (
+            (SIMPLE_DIRECT_SIDE_INPUT_TYPE if self.use_direct_side_input
+             else SIMPLE_SIDE_INPUT_TYPE)
+            if self.use_side_input else "none")
         self.input = SimpleFeatureTransformer()
-        self.layer_stacks = nn.ModuleList(SimpleStack() for _ in range(LAYER_STACKS))
+        self.side_proj = (
+            nn.Sequential(nn.Linear(2, SIMPLE_SIDE_INPUT_DIM), nn.ReLU())
+            if self.use_projected_side_input else None)
+        side_dim = (
+            SIMPLE_DIRECT_SIDE_INPUT_DIM if self.use_direct_side_input
+            else SIMPLE_SIDE_INPUT_DIM if self.use_projected_side_input
+            else 0)
+        self.layer_stacks = nn.ModuleList(
+            SimpleStack(side_dim)
+            for _ in range(LAYER_STACKS))
         self.start_lambda = float(start_lambda)
         self.end_lambda = float(end_lambda)
         self.max_epoch = int(max_epoch)
@@ -181,8 +254,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.ranking_disagreement_weight = 1.0
         self.save_hyperparameters(ignore=("feature_set", "unused"))
 
-    @staticmethod
-    def architecture_metadata(transplant_source=None, mapping_version=None):
+    def architecture_metadata(self, transplant_source=None, mapping_version=None):
+        use_side_input = bool(getattr(self, "use_side_input", False))
         return {
             "architecture_type": ARCHITECTURE_TYPE,
             "feature": FEATURE_NAME,
@@ -192,6 +265,23 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "distinguish_golds": False,
             "long_effect_required": False,
             "simple_schema_version": SIMPLE_SCHEMA_VERSION,
+            "use_side_input": use_side_input,
+            "simple_side_input_type": (
+                getattr(self, "simple_side_input_type", "none")
+                if use_side_input else "none"),
+            "simple_side_input_projection_dim": (
+                (SIMPLE_DIRECT_SIDE_INPUT_DIM
+                 if getattr(self, "use_direct_side_input", False)
+                 else SIMPLE_SIDE_INPUT_DIM)
+                if use_side_input else 0),
+            "simple_side_input_fusion": (
+                ("fc1_direct_concat"
+                 if getattr(self, "use_direct_side_input", False)
+                 else "fc1_concat")
+                if use_side_input else "none"),
+            "simple_side_input_normalization": (
+                "ply_clamp_200_0_2+material_clamp_4000_m2_2"
+                if use_side_input else "none"),
             "transplant_source": transplant_source,
             "transplant_mapping_version": mapping_version,
         }
@@ -202,7 +292,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.feature_set = feature_set
 
     def forward(self, us, them, white_indices, white_values, black_indices,
-                black_values, layer_stack_indices, **unused):
+                black_values, layer_stack_indices, ply=None, material=None,
+                **unused):
         tw, tb = self.input(
             white_indices, white_values, black_indices, black_values)
         us = us.view(-1, 1)
@@ -220,6 +311,16 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         ew, eb = ewm(tw), ewm(tb)
         transformed = us * torch.cat((ew, eb), dim=1) \
             + them * torch.cat((eb, ew), dim=1)
+        side_raw = None
+        side_h = None
+        if self.use_side_input:
+            if ply is None or material is None:
+                raise ValueError(
+                    "ply/material are required when simple side input is enabled")
+            side_raw = normalize_simple_side_input(
+                ply, material, dtype=transformed.dtype)
+            side_h = (side_raw if self.use_direct_side_input
+                      else self.side_proj(side_raw))
         buckets = layer_stack_indices.view(-1).long()
         if torch.any((buckets < 0) | (buckets >= LAYER_STACKS)):
             raise RuntimeError("HalfKA_hm2 simple bucket must be in [0,8]")
@@ -231,12 +332,16 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             if mask.any():
                 if collect:
                     bucket_out, bucket_diagnostics = stack(
-                        transformed[mask], collect_diagnostics=True)
+                        transformed[mask],
+                        None if side_h is None else side_h[mask],
+                        collect_diagnostics=True)
                     out[mask] = bucket_out
                     for name, value in bucket_diagnostics.items():
                         diagnostic_parts.setdefault(name, []).append(value)
                 else:
-                    out[mask] = stack(transformed[mask])
+                    out[mask] = stack(
+                        transformed[mask],
+                        None if side_h is None else side_h[mask])
         if collect:
             activation_tensors = {
                 name: torch.cat(parts, dim=0)
@@ -244,7 +349,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             }
             self._simple_debug_snapshot = {
                 "activations": self._activation_snapshot(
-                    transformed, activation_tensors),
+                    transformed, activation_tensors, side_raw),
             }
         return out
 
@@ -263,7 +368,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             result["high_pct"] = (high_value >= 1.0).float().mean() * 100.0
         return result
 
-    def _activation_snapshot(self, transformed, tensors):
+    def _activation_snapshot(self, transformed, tensors, side_raw=None):
         deep = tensors["deep"].detach().float()
         shortcut = tensors["shortcut"].detach().float()
         final = tensors["final"].detach().float()
@@ -275,7 +380,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         shortcut_share = torch.where(
             valid, shortcut.abs() / denominator.clamp_min(1e-12),
             torch.zeros_like(denominator))
-        return {
+        result = {
             "ft": self._tensor_summary(transformed),
             "fc0_pre": self._tensor_summary(tensors["fc0_pre"]),
             "clipped": self._tensor_summary(
@@ -297,6 +402,40 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 "shortcut_share": shortcut_share.mean(),
             },
         }
+        if self.use_side_input:
+            side_contribution = tensors["side_fc1_contribution"].detach().float()
+            main_contribution = tensors["main_fc1_contribution"].detach().float()
+            total_pre = tensors["fc1_pre"].detach().float()
+            result["side_input"] = {
+                "ply_norm": self._tensor_summary(side_raw[:, 0]),
+                "material_norm": self._tensor_summary(side_raw[:, 1]),
+                "side_projection": self._tensor_summary(
+                    tensors["side_projection"]),
+                "side_contribution_abs_mean": side_contribution.abs().mean(),
+                "main_contribution_abs_mean": main_contribution.abs().mean(),
+                "total_pre_abs_mean": total_pre.abs().mean(),
+                "side_to_total_ratio": (
+                    side_contribution.abs().mean()
+                    / total_pre.abs().mean().clamp_min(1e-12)),
+            }
+            if self.use_direct_side_input:
+                ply_contribution = tensors["ply_fc1_contribution"].detach().float()
+                material_contribution = (
+                    tensors["material_fc1_contribution"].detach().float())
+                ply_weights = torch.cat([
+                    stack.fc1.weight[:, 30].detach().float().reshape(-1)
+                    for stack in self.layer_stacks])
+                material_weights = torch.cat([
+                    stack.fc1.weight[:, 31].detach().float().reshape(-1)
+                    for stack in self.layer_stacks])
+                result["side_input"].update({
+                    "ply_contribution_abs_mean": ply_contribution.abs().mean(),
+                    "material_contribution_abs_mean": (
+                        material_contribution.abs().mean()),
+                    "ply_weight_norm": ply_weights.norm(),
+                    "material_weight_norm": material_weights.norm(),
+                })
+        return result
 
     def _lambda(self):
         progress = min(max(self.current_epoch / max(self.max_epoch, 1), 0.0), 1.0)
@@ -311,7 +450,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
     def _step(self, batch, stage):
         (us, them, wi, wv, bi, bv, outcome, score, bucket, material,
          group, ply, *optional) = batch
-        pred_cp = self(us, them, wi, wv, bi, bv, bucket).view(-1) * self.nnue2score
+        pred_cp = self(
+            us, them, wi, wv, bi, bv, bucket,
+            ply=ply, material=material).view(-1) * self.nnue2score
         score = score.view(-1)
         outcome = outcome.view(-1)
         group = group.view(-1)
@@ -659,7 +800,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             }
             for label, attribute in (
                     ("FC0_1536x16", "fc0"),
-                    ("FC1_30x32", "fc1"),
+                    ((f"FC1_{30 + self.layer_stacks[0].side_input_dim}x32"
+                      if self.use_side_input else "FC1_30x32"),
+                     "fc1"),
                     ("Output_32x1", "fc2")):
                 layers = [getattr(stack, attribute)
                           for stack in self.layer_stacks]
@@ -677,6 +820,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                     weights, biases,
                     torch.cat(weight_grads) if weight_grads else None,
                     torch.cat(bias_grads) if bias_grads else None)
+            if self.use_projected_side_input:
+                side_linear = self.side_proj[0]
+                layer_stats["SideProj_2x4"] = self._layer_stat_row(
+                    side_linear.weight, side_linear.bias,
+                    side_linear.weight.grad, side_linear.bias.grad)
             self._simple_debug_layer_stats = layer_stats
             snapshot = self._simple_debug_snapshot
             snapshot["ft_pre_step"] = {
@@ -769,6 +917,47 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         print(
             f"  Absolute share  : Deep={output['deep_share']:.2%} "
             f"Shortcut={output['shortcut_share']:.2%}")
+
+        if self.use_side_input:
+            side = {
+                key: ({sub_key: host_scalar(sub_value)
+                       for sub_key, sub_value in value.items()}
+                      if isinstance(value, dict) else host_scalar(value))
+                for key, value in snapshot["activations"]["side_input"].items()
+            }
+            heading = ("Direct Side Input Stats" if self.use_direct_side_input
+                       else "Side Input Stats")
+            print(f"[{heading}](Step {display_step}, current batch snapshot)")
+            print(self._format_summary("ply_norm", side["ply_norm"]))
+            print(self._format_summary(
+                "material_norm", side["material_norm"]))
+            if self.use_projected_side_input:
+                print(self._format_summary(
+                    "side_proj", side["side_projection"]))
+            else:
+                print(
+                    "  ply FC1 contribution mean abs  : "
+                    f"{side['ply_contribution_abs_mean']:.6e}")
+                print(
+                    "  material FC1 contribution mean abs: "
+                    f"{side['material_contribution_abs_mean']:.6e}")
+                print(
+                    "  ply/material FC1 weight norm   : "
+                    f"{side['ply_weight_norm']:.6e} / "
+                    f"{side['material_weight_norm']:.6e}")
+            print(
+                "  side FC1 contribution mean abs : "
+                f"{side['side_contribution_abs_mean']:.6e}")
+            print(
+                "  main FC1 contribution mean abs : "
+                f"{side['main_contribution_abs_mean']:.6e}")
+            print(
+                "  total FC1 pre-act mean abs      : "
+                f"{side['total_pre_abs_mean']:.6e}")
+            print(
+                "  side / total FC1 pre-act ratio  : "
+                f"{side['side_to_total_ratio']:.6e} "
+                f"({side['side_to_total_ratio']:.4%})")
 
         print(f"[Simple FT Stats] step={display_step}")
         if "ft_pre_step" in snapshot and all(
@@ -948,8 +1137,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             f"median={ply.median().item():.1f} min={ply.min().item():.1f} "
             f"max={ply.max().item():.1f} | "
             f"ply=0 ratio={(ply == 0).float().mean().item():.3%}")
-        print("  Ply range | Count |  qf_m  |  pf_m  |  pt_m  | |qf-.5| | |pf-.5| | |pt-.5| | Mat mean | |Mat| mean")
-        print("  " + "-" * 108)
+        print("  Ply range | Count | prob MAE |  cp MAE |  qf_m  |  pf_m  | Mat mean | |Mat| mean")
+        print("  " + "-" * 91)
         ply_bins = (
             (0, 1, "0"), (1, 21, "1-20"), (21, 41, "21-40"),
             (41, 61, "41-60"), (61, 81, "61-80"),
@@ -961,13 +1150,33 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             if not count:
                 continue
             print(
-                f"  {label:>9} | {count:5d} | {qf[selected].mean().item():.4f} | "
-                f"{pf[selected].mean().item():.4f} | {pt[selected].mean().item():.4f} | "
-                f"{(qf[selected] - .5).abs().mean().item():.4f} | "
-                f"{(pf[selected] - .5).abs().mean().item():.4f} | "
-                f"{(pt[selected] - .5).abs().mean().item():.4f} | "
+                f"  {label:>9} | {count:5d} | "
+                f"{(qf[selected] - pf[selected]).abs().mean().item():9.6f} | "
+                f"{(host['pred'][selected] - host['score'][selected]).abs().mean().item():8.1f} | "
+                f"{qf[selected].mean().item():.4f} | "
+                f"{pf[selected].mean().item():.4f} | "
                 f"{material[selected].mean().item():+8.1f} | "
                 f"{material[selected].abs().mean().item():8.1f}")
+
+        print(f"[Simple Error by |material|](Step {display_step}, current batch snapshot)")
+        print("  |material| range | Count | prob MAE |  cp MAE | ply mean")
+        print("  " + "-" * 63)
+        abs_material = material.abs()
+        material_bins = (
+            (0, 300, "0-299"), (300, 1000, "300-999"),
+            (1000, 2000, "1000-1999"),
+            (2000, 4000, "2000-3999"),
+            (4000, float("inf"), "4000+"))
+        for low, high, label in material_bins:
+            selected = (abs_material >= low) & (abs_material < high)
+            count = int(selected.sum().item())
+            if not count:
+                continue
+            print(
+                f"  {label:>16} | {count:5d} | "
+                f"{(qf[selected] - pf[selected]).abs().mean().item():9.6f} | "
+                f"{(host['pred'][selected] - host['score'][selected]).abs().mean().item():8.1f} | "
+                f"{ply[selected].mean().item():8.1f}")
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         if not self._simple_debug_capture:
@@ -993,7 +1202,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             return
         current_lr = float(param_groups[0]["lr"])
         print("[Simple optimizer learning rates]")
-        group_names = ("HalfKA_HM2 FT", "9 bucket layer stacks")
+        group_names = (
+            "HalfKA_HM2 FT",
+             ("9 bucket layer stacks + side projection"
+              if self.use_projected_side_input else
+              "9 bucket layer stacks + direct side"
+              if self.use_direct_side_input else "9 bucket layer stacks"))
         for index, group in enumerate(param_groups):
             name = group_names[index] if index < len(group_names) else "unknown"
             parameters = sum(parameter.numel() for parameter in group["params"])
@@ -1008,10 +1222,13 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
 
     def configure_optimizers(self):
         # A fresh optimizer is intentional for transplanted checkpoints.
+        downstream = list(self.layer_stacks.parameters())
+        if self.side_proj is not None:
+            downstream.extend(self.side_proj.parameters())
         optimizer = torch.optim.AdamW(
             [
                 {"params": list(self.input.parameters()), "lr": self.lr},
-                {"params": list(self.layer_stacks.parameters()), "lr": self.lr},
+                {"params": downstream, "lr": self.lr},
             ],
             betas=(0.9, 0.995), eps=1e-7, weight_decay=1e-6)
         scheduler = torch.optim.lr_scheduler.ExponentialLR(
@@ -1031,5 +1248,35 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError("checkpoint is not a HalfKA_hm2 simple checkpoint")
         if int(metadata.get("simple_schema_version", -1)) != SIMPLE_SCHEMA_VERSION:
             raise ValueError("HalfKA_hm2 simple schema mismatch")
+        saved_side_input = bool(metadata.get("use_side_input", False))
+        saved_side_type = metadata.get("simple_side_input_type", "none")
+        if saved_side_input and saved_side_type != self.simple_side_input_type:
+            raise ValueError(
+                "Simple side-input type mismatch: "
+                f"checkpoint={saved_side_type}, model={self.simple_side_input_type}")
+        if saved_side_input and not self.use_side_input:
+            raise ValueError(
+                "side-input checkpoint cannot be loaded into the baseline "
+                "Simple architecture")
+        if not saved_side_input and self.use_side_input:
+            # Weight-only baseline -> side migration. Lightning calls this hook
+            # before load_state_dict(), so expand the nine FC1 tensors here.
+            # The trainer rejects this path for full optimizer-state resume.
+            state = checkpoint.get("state_dict", {})
+            current = self.state_dict()
+            for index in range(LAYER_STACKS):
+                key = f"layer_stacks.{index}.fc1.weight"
+                old = state.get(key)
+                if old is None or tuple(old.shape) != (32, 30):
+                    raise ValueError(
+                        f"cannot migrate baseline FC1 tensor {key}: "
+                        f"shape={None if old is None else tuple(old.shape)}")
+                expanded = current[key].detach().clone()
+                expanded[:, :30].copy_(old)
+                expanded[:, 30:].zero_()
+                state[key] = expanded
+            if self.use_projected_side_input:
+                for key in ("side_proj.0.weight", "side_proj.0.bias"):
+                    state[key] = current[key].detach().clone()
         self.transplant_source = metadata.get("transplant_source")
         self.transplant_mapping_version = metadata.get("transplant_mapping_version")
