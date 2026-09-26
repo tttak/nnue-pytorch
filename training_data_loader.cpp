@@ -44,6 +44,81 @@ namespace {
 std::atomic<std::uint64_t> g_training_data_seed{5489ULL};
 }
 
+namespace SimplePp3Wide {
+
+constexpr int kStates = 4;
+constexpr int kSameFilePairs = 9 * 36;
+constexpr int kSquarePairs = kSameFilePairs + 8 * 81;
+constexpr int kDimensions = kSquarePairs * kStates * kStates;
+
+struct LocalPiece {
+    int square;
+    int state;
+};
+
+inline int mirror_square(const int sq) {
+    return (8 - sq / 9) * 9 + sq % 9;
+}
+
+inline int compact_square_pair(int a, int b) {
+    if (b < a)
+        std::swap(a, b);
+    if (a == b)
+        return -1;
+    const int fa = a / 9, ra = a % 9;
+    const int fb = b / 9, rb = b % 9;
+    if (fa == fb)
+        return fa * 36 + rb * (rb - 1) / 2 + ra;
+    if (fb == fa + 1)
+        return kSameFilePairs + fa * 81 + ra * 9 + rb;
+    return -1;
+}
+
+inline void append(const Position& pos, const Color perspective,
+                   const int batch_index,
+                   std::vector<std::int32_t>& indices,
+                   std::vector<std::int32_t>& batch_indices) {
+    int king = static_cast<int>(pos.king_square(perspective));
+    if (perspective == WHITE)
+        king = 80 - king;
+    const bool mirror = king >= static_cast<int>(SQ_61);
+
+    std::vector<LocalPiece> pieces;
+    pieces.reserve(22);
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const Color owner = static_cast<Color>(c);
+        for (const PieceType pt : {PAWN, LANCE}) {
+            Bitboard bb = pos.pieces(owner, pt);
+            while (bb) {
+                int sq = static_cast<int>(bb.pop());
+                if (perspective == WHITE)
+                    sq = 80 - sq;
+                if (mirror)
+                    sq = mirror_square(sq);
+                const int relative_owner = c ^ static_cast<int>(perspective);
+                const int piece_class = pt == LANCE ? 1 : 0;
+                pieces.push_back({sq, relative_owner * 2 + piece_class});
+            }
+        }
+    }
+    std::sort(pieces.begin(), pieces.end(), [](const LocalPiece& lhs,
+                                                const LocalPiece& rhs) {
+        return lhs.square < rhs.square;
+    });
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        for (std::size_t j = i + 1; j < pieces.size(); ++j) {
+            const int pair = compact_square_pair(
+                pieces[i].square, pieces[j].square);
+            if (pair < 0)
+                continue;
+            indices.push_back(pair * 16 + pieces[i].state * 4
+                              + pieces[j].state);
+            batch_indices.push_back(batch_index);
+        }
+}
+
+} // namespace SimplePp3Wide
+
 namespace PairRelationSideInput {
 
 constexpr int kPieceTypeCount = 14;
@@ -557,7 +632,8 @@ struct SparseBatch
     template <typename... Ts>
     SparseBatch(FeatureSet<Ts...>, const std::vector<TrainingDataEntry>& entries,
                 const bool generate_pair_relations = false,
-                const bool generate_mobility_tactical = false)
+                const bool generate_mobility_tactical = false,
+                const bool generate_simple_pp3wide = false)
     {
         num_inputs = FeatureSet<Ts...>::INPUTS;
         size = entries.size();
@@ -596,7 +672,8 @@ struct SparseBatch
             mirror_applied.emplace_back(
                 static_cast<std::uint8_t>(entries[i].mirror_applied));
             fill_entry(FeatureSet<Ts...>{}, i, entries[i],
-                       generate_pair_relations, generate_mobility_tactical);
+                       generate_pair_relations, generate_mobility_tactical,
+                       generate_simple_pp3wide);
         }
     }
 
@@ -622,6 +699,10 @@ struct SparseBatch
     float* side_input_mobility_tactical;
     std::vector<std::int32_t> pair_relation_indices;
     std::vector<std::int32_t> pair_relation_batch_indices;
+    std::vector<std::int32_t> pp3wide_white_indices;
+    std::vector<std::int32_t> pp3wide_white_batch_indices;
+    std::vector<std::int32_t> pp3wide_black_indices;
+    std::vector<std::int32_t> pp3wide_black_batch_indices;
     // Diagnostic provenance for Python/C++ parity tests. This member is not
     // part of the stable ctypes prefix and is exposed only through an accessor.
     std::vector<std::string> source_sfens;
@@ -650,7 +731,8 @@ private:
     template <typename... Ts>
     void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e,
                     const bool generate_pair_relations,
-                    const bool generate_mobility_tactical)
+                    const bool generate_mobility_tactical,
+                    const bool generate_simple_pp3wide)
     {
         is_white[i] = static_cast<float>(e.pos->side_to_move() == Color::BLACK);
         outcome[i] = (e.result + 1.0f) / 2.0f;
@@ -683,6 +765,14 @@ private:
             PairRelationSideInput::append(
                 *e.pos, i, pair_relation_indices,
                 pair_relation_batch_indices);
+        if (generate_simple_pp3wide) {
+            SimplePp3Wide::append(
+                *e.pos, BLACK, i, pp3wide_white_indices,
+                pp3wide_white_batch_indices);
+            SimplePp3Wide::append(
+                *e.pos, WHITE, i, pp3wide_black_indices,
+                pp3wide_black_batch_indices);
+        }
         fill_features(FeatureSet<Ts...>{}, i, e);
     }
 
@@ -754,7 +844,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false, const bool generate_mobility_tactical = false) :
+    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false, const bool generate_mobility_tactical = false, const bool generate_simple_pp3wide = false) :
         BaseType(
             std::max(
                 1,
@@ -774,7 +864,8 @@ struct FeaturedBatchStream : Stream<StorageT>
         m_concurrency(concurrency),
         m_batch_size(batch_size),
         m_generate_pair_relations(generate_pair_relations),
-        m_generate_mobility_tactical(generate_mobility_tactical)
+        m_generate_mobility_tactical(generate_mobility_tactical),
+        m_generate_simple_pp3wide(generate_simple_pp3wide)
     {
         m_stop_flag.store(false);
 
@@ -798,7 +889,8 @@ struct FeaturedBatchStream : Stream<StorageT>
 
                 auto batch = new StorageT(
                     FeatureSet{}, entries, m_generate_pair_relations,
-                    m_generate_mobility_tactical);
+                    m_generate_mobility_tactical,
+                    m_generate_simple_pp3wide);
 
                 {
                     std::unique_lock lock(m_batch_mutex);
@@ -874,6 +966,7 @@ private:
     int m_concurrency;
     bool m_generate_pair_relations;
     bool m_generate_mobility_tactical;
+    bool m_generate_simple_pp3wide;
     std::deque<StorageT*> m_batches;
     std::mutex m_batch_mutex;
     std::mutex m_stream_mutex;
@@ -1011,6 +1104,28 @@ extern "C" {
         if (feature_set == "HalfKA_HM2_NoDG")
             return new SparseBatch(FeatureSet<HalfKA_HM2_NoDG>{}, entries, true);
         fprintf(stderr, "Unknown feature_set %s\n", feature_set_c);
+        return nullptr;
+    }
+
+    EXPORT SparseBatch* get_sparse_batch_from_fens_pp3wide(
+        const char* feature_set_c, int num_fens, const char* const* fens,
+        int* scores, int* plies, int* results)
+    {
+        EnsureInitialize();
+        std::vector<TrainingDataEntry> entries;
+        entries.reserve(num_fens);
+        for (int i = 0; i < num_fens; ++i) {
+            auto& e = entries.emplace_back();
+            e.pos->set(fens[i], &e.stateInfo, Threads.main());
+            e.move = MOVE_NONE;
+            e.score = scores[i];
+            e.ply = plies[i];
+            e.result = results[i];
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM2_NoDG>{}, entries, false, false, true);
+        fprintf(stderr, "PP3Wide requires HalfKA_HM2_NoDG\n");
         return nullptr;
     }
 
@@ -1277,6 +1392,62 @@ extern "C" {
         return nullptr;
     }
 
+    // Experiment 120.  Keep the historical SparseBatch prefix and ordinary
+    // stream entry points untouched; PP rows are exposed by accessor vectors.
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_pp3wide(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [
+                random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && (e.isCapturingMove() || e.isInCheck()));
+            };
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, false, true);
+        fprintf(stderr, "PP3Wide requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_pp3wide(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, false, true);
+        fprintf(stderr, "PP3Wide requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
     EXPORT void CDECL destroy_sparse_batch_stream(Stream<SparseBatch>* stream)
     {
         delete stream;
@@ -1324,6 +1495,46 @@ extern "C" {
     {
         return batch && !batch->pair_relation_batch_indices.empty()
             ? batch->pair_relation_batch_indices.data() : nullptr;
+    }
+
+    EXPORT std::size_t CDECL get_sparse_batch_pp3wide_white_count(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->pp3wide_white_indices.size() : 0;
+    }
+
+    EXPORT const std::int32_t* CDECL get_sparse_batch_pp3wide_white_indices(
+        const SparseBatch* batch)
+    {
+        return batch && !batch->pp3wide_white_indices.empty()
+            ? batch->pp3wide_white_indices.data() : nullptr;
+    }
+
+    EXPORT const std::int32_t* CDECL
+    get_sparse_batch_pp3wide_white_batch_indices(const SparseBatch* batch)
+    {
+        return batch && !batch->pp3wide_white_batch_indices.empty()
+            ? batch->pp3wide_white_batch_indices.data() : nullptr;
+    }
+
+    EXPORT std::size_t CDECL get_sparse_batch_pp3wide_black_count(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->pp3wide_black_indices.size() : 0;
+    }
+
+    EXPORT const std::int32_t* CDECL get_sparse_batch_pp3wide_black_indices(
+        const SparseBatch* batch)
+    {
+        return batch && !batch->pp3wide_black_indices.empty()
+            ? batch->pp3wide_black_indices.data() : nullptr;
+    }
+
+    EXPORT const std::int32_t* CDECL
+    get_sparse_batch_pp3wide_black_batch_indices(const SparseBatch* batch)
+    {
+        return batch && !batch->pp3wide_black_batch_indices.empty()
+            ? batch->pp3wide_black_batch_indices.data() : nullptr;
     }
 
     EXPORT const char* CDECL get_sparse_batch_source_sfen(

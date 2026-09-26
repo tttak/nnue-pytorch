@@ -16,6 +16,10 @@ from torch import nn
 import torch.nn.functional as F
 
 import model as complex_model
+from simple_pp3wide import (
+    PP3WIDE_FEATURES, PP3WIDE_INIT_MODES, PP3WIDE_MAPPING_VERSION,
+    PP3WIDE_QUANT_SCALE, PP3WIDE_SCHEMA_VERSION, PP3WIDE_TYPE,
+)
 
 SIMPLE_SCHEMA_VERSION = 2
 ARCHITECTURE_TYPE = "halfka_hm2_simple"
@@ -61,6 +65,7 @@ SIMPLE_DIRECT_SIDE_INPUT_DIM = 2
 SIMPLE_SHARED_PSQT_TYPE = "halfka_hm2_shared_psqt_v1"
 SIMPLE_QAT_MODES = ("off", "weights", "weight_activation", "full")
 SIMPLE_QAT_RECOMMENDED_MODE = "full"
+SIMPLE_LOCAL_PAIR_FEATURES = ("off", PP3WIDE_TYPE)
 BUCKET_STAT_NAMES = (
     "count", "weight", "loss", "prob_mae", "cp_mae",
     "importance_weighted_loss",
@@ -341,6 +346,63 @@ class SimpleFeatureTransformer(nn.Module):
                 accumulate(black_indices, black_values))
 
 
+class SimplePp3Wide(nn.Module):
+    """Experiment 120 board-only unpromoted pawn/lance local-pair FT."""
+
+    def __init__(self, width=FT_WIDTH, initialization="zero",
+                 nonzero_rate=0.05, seed=120):
+        super().__init__()
+        if initialization not in PP3WIDE_INIT_MODES:
+            raise ValueError(
+                f"PP3Wide init must be one of {PP3WIDE_INIT_MODES}")
+        if not 0.0 <= float(nonzero_rate) <= 1.0:
+            raise ValueError("PP3Wide nonzero rate must be in [0,1]")
+        self.initialization = initialization
+        self.nonzero_rate = float(nonzero_rate)
+        self.seed = int(seed)
+        self.weight = nn.Parameter(torch.zeros(PP3WIDE_FEATURES, width))
+        if initialization == "quantized_random":
+            # Construct directly on the exported int8 grid.  A local CPU RNG
+            # keeps model initialization from perturbing the data-stream RNG.
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.seed)
+            with torch.no_grad():
+                active = torch.rand(
+                    self.weight.shape, generator=generator) < self.nonzero_rate
+                signs = torch.randint(
+                    0, 2, self.weight.shape, generator=generator,
+                    dtype=torch.int8).float().mul_(2).sub_(1)
+                self.weight.copy_(
+                    active.float() * signs / PP3WIDE_QUANT_SCALE)
+        self._qat_eval_cache = None
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._qat_eval_cache = None
+        return super().train(mode)
+
+    def forward(self, indices, batch_indices, batch_size, qat_mode="off"):
+        if qat_mode == "off":
+            weight = self.weight
+        elif not self.training and self._qat_eval_cache is not None:
+            weight = self._qat_eval_cache
+        else:
+            # int8 storage, scale 127.  C++ sign-extends q8 and doubles it
+            # before merging with the q127*2 main accumulator.
+            weight = _fake_quantize(
+                self.weight, PP3WIDE_QUANT_SCALE, -127.0, 127.0)
+            if not self.training:
+                self._qat_eval_cache = weight.detach()
+        if indices.numel() == 0:
+            return weight.new_zeros((batch_size, weight.shape[1]))
+        counts = torch.bincount(batch_indices, minlength=batch_size)
+        offsets = torch.cat((
+            counts.new_zeros(1), counts.cumsum(dim=0))).long()
+        return F.embedding_bag(
+            indices.long(), weight, offsets, mode="sum",
+            include_last_offset=True)
+
+
 class SimpleSharedPsqt(nn.Module):
     """One learned scalar per HalfKA_HM2 feature, shared by all buckets."""
 
@@ -487,6 +549,10 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         use_bucket_importance_base_loss=False,
         simple_qat_mode="off",
         simple_ft_virtual_factorization="off",
+        simple_local_pair_feature="off",
+        simple_pp3wide_init="zero",
+        simple_pp3wide_nonzero_rate=0.05,
+        simple_pp3wide_seed=120,
         **unused,
     ):
         super().__init__()
@@ -515,6 +581,20 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 f"{FT_VIRTUAL_FACTORIZATION_MODES}")
         self.input = SimpleFeatureTransformer(
             virtual_factorization=self.simple_ft_virtual_factorization)
+        self.simple_local_pair_feature = str(simple_local_pair_feature)
+        if self.simple_local_pair_feature not in SIMPLE_LOCAL_PAIR_FEATURES:
+            raise ValueError(
+                "simple_local_pair_feature must be one of "
+                f"{SIMPLE_LOCAL_PAIR_FEATURES}")
+        self.pp3wide = (
+            SimplePp3Wide(
+                initialization=simple_pp3wide_init,
+                nonzero_rate=simple_pp3wide_nonzero_rate,
+                seed=simple_pp3wide_seed)
+            if self.simple_local_pair_feature == PP3WIDE_TYPE else None)
+        self.simple_pp3wide_init = str(simple_pp3wide_init)
+        self.simple_pp3wide_nonzero_rate = float(simple_pp3wide_nonzero_rate)
+        self.simple_pp3wide_seed = int(simple_pp3wide_seed)
         self.shared_psqt = (
             SimpleSharedPsqt() if self.use_shared_psqt else None)
         self.side_proj = (
@@ -609,6 +689,20 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "simple_ft_virtual_mapping_version": (
                 FT_VIRTUAL_MAPPING_VERSION
                 if self.simple_ft_virtual_factorization == "shared" else None),
+            "simple_local_pair_feature": self.simple_local_pair_feature,
+            "simple_pp3wide_schema_version": (
+                PP3WIDE_SCHEMA_VERSION if self.pp3wide is not None else None),
+            "simple_pp3wide_mapping_version": (
+                PP3WIDE_MAPPING_VERSION if self.pp3wide is not None else None),
+            "simple_pp3wide_dimensions": (
+                PP3WIDE_FEATURES if self.pp3wide is not None else 0),
+            "simple_pp3wide_export_dtype": (
+                "int8_q127" if self.pp3wide is not None else "none"),
+            "simple_pp3wide_init": (
+                self.simple_pp3wide_init if self.pp3wide is not None else None),
+            "simple_pp3wide_nonzero_rate": (
+                self.simple_pp3wide_nonzero_rate
+                if self.pp3wide is not None else 0.0),
             "use_side_input": use_side_input,
             "simple_side_input_type": (
                 getattr(self, "simple_side_input_type", "none")
@@ -642,10 +736,30 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
 
     def forward(self, us, them, white_indices, white_values, black_indices,
                 black_values, layer_stack_indices, ply=None, material=None,
+                pp3wide_white_indices=None,
+                pp3wide_white_batch_indices=None,
+                pp3wide_black_indices=None,
+                pp3wide_black_batch_indices=None,
                 **unused):
         tw, tb = self.input(
             white_indices, white_values, black_indices, black_values,
             qat_mode=self.simple_qat_mode)
+        pp_white = pp_black = None
+        if self.pp3wide is not None:
+            required = (
+                pp3wide_white_indices, pp3wide_white_batch_indices,
+                pp3wide_black_indices, pp3wide_black_batch_indices)
+            if any(value is None for value in required):
+                raise ValueError("PP3Wide enabled model requires sparse PP rows")
+            batch_size = white_indices.shape[0]
+            pp_white = self.pp3wide(
+                pp3wide_white_indices, pp3wide_white_batch_indices,
+                batch_size, self.simple_qat_mode)
+            pp_black = self.pp3wide(
+                pp3wide_black_indices, pp3wide_black_batch_indices,
+                batch_size, self.simple_qat_mode)
+            tw = tw + pp_white
+            tb = tb + pp_black
         us = us.view(-1, 1)
         them = them.view(-1, 1)
         # The loader exposes BLACK in white_* and WHITE in black_*; us/them
@@ -731,6 +845,24 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             }
             if psqt_snapshot is not None:
                 self._simple_debug_snapshot["psqt"] = psqt_snapshot
+            if self.pp3wide is not None:
+                merged_rms = torch.cat((tw, tb)).float().square().mean().sqrt()
+                pp_cat = torch.cat((pp_white, pp_black)).float()
+                self._simple_debug_snapshot["pp3wide"] = {
+                    "accumulator_rms": pp_cat.square().mean().sqrt(),
+                    "mean_abs": pp_cat.abs().mean(),
+                    "merged_ratio": (
+                        pp_cat.square().mean().sqrt()
+                        / merged_rms.clamp_min(1e-12)),
+                    "active_mean": (
+                        (pp3wide_white_indices.numel()
+                         + pp3wide_black_indices.numel())
+                        / max(2 * white_indices.shape[0], 1)),
+                    "nonzero_weight_ratio": (
+                        (torch.round(self.pp3wide.weight.detach()
+                                     * PP3WIDE_QUANT_SCALE) != 0)
+                        .float().mean()),
+                }
         return out
 
     @staticmethod
@@ -830,9 +962,21 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
     def _step(self, batch, stage):
         (us, them, wi, wv, bi, bv, outcome, score, bucket, material,
          group, ply, *optional) = batch
+        pp_kwargs = {}
+        if self.pp3wide is not None:
+            if len(optional) < 4:
+                raise ValueError("PP3Wide batch is missing four sparse tensors")
+            pp = optional[-4:]
+            optional = optional[:-4]
+            pp_kwargs = {
+                "pp3wide_white_indices": pp[0],
+                "pp3wide_white_batch_indices": pp[1],
+                "pp3wide_black_indices": pp[2],
+                "pp3wide_black_batch_indices": pp[3],
+            }
         pred_cp = self(
             us, them, wi, wv, bi, bv, bucket,
-            ply=ply, material=material).view(-1) * self.nnue2score
+            ply=ply, material=material, **pp_kwargs).view(-1) * self.nnue2score
         score = score.view(-1)
         outcome = outcome.view(-1)
         group = group.view(-1)
@@ -1390,6 +1534,23 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 f"{host_scalar(psqt['corr_shortcut']):+.6f} / "
                 f"{host_scalar(psqt['corr_deep']):+.6f}")
 
+        if self.pp3wide is not None and "pp3wide" in snapshot:
+            pp = snapshot["pp3wide"]
+            print(f"[PP3Wide Stats](Step {display_step}, current batch snapshot)")
+            print(
+                "  accumulator RMS / mean abs : "
+                f"{host_scalar(pp['accumulator_rms']):.6e} / "
+                f"{host_scalar(pp['mean_abs']):.6e}")
+            print(
+                "  PP / merged FT RMS ratio   : "
+                f"{host_scalar(pp['merged_ratio']):.6e}")
+            print(
+                "  active features/perspective: "
+                f"{float(pp['active_mean']):.3f}")
+            print(
+                "  quantized nonzero weights   : "
+                f"{host_scalar(pp['nonzero_weight_ratio']):.4%}")
+
         if self.use_side_input:
             side = {
                 key: ({sub_key: host_scalar(sub_value)
@@ -1768,9 +1929,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             downstream.extend(self.side_proj.parameters())
         if self.shared_psqt is not None:
             downstream.extend(self.shared_psqt.parameters())
+        ft_parameters = list(self.input.parameters())
+        if self.pp3wide is not None:
+            ft_parameters.extend(self.pp3wide.parameters())
         optimizer = torch.optim.AdamW(
             [
-                {"params": list(self.input.parameters()), "lr": self.lr},
+                {"params": ft_parameters, "lr": self.lr},
                 {"params": downstream, "lr": self.lr},
             ],
             betas=(0.9, 0.995), eps=1e-7, weight_decay=1e-6)
@@ -1798,6 +1962,27 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "simple_ft_virtual_factorization", "off")
         saved_mapping_version = metadata.get(
             "simple_ft_virtual_mapping_version")
+        saved_local_pair = metadata.get("simple_local_pair_feature", "off")
+        if saved_local_pair not in SIMPLE_LOCAL_PAIR_FEATURES:
+            raise ValueError(
+                f"unknown checkpoint local pair feature: {saved_local_pair!r}")
+        if saved_local_pair != "off" and self.pp3wide is None:
+            raise ValueError(
+                "PP3Wide checkpoint cannot load into PP-OFF architecture")
+        if saved_local_pair != "off":
+            if metadata.get("simple_pp3wide_mapping_version") \
+                    != PP3WIDE_MAPPING_VERSION:
+                raise ValueError("Simple PP3Wide mapping version mismatch")
+            if int(metadata.get("simple_pp3wide_schema_version", -1)) \
+                    != PP3WIDE_SCHEMA_VERSION:
+                raise ValueError("Simple PP3Wide schema version mismatch")
+        if saved_local_pair == "off" and self.pp3wide is not None:
+            state = checkpoint.setdefault("state_dict", {})
+            state["pp3wide.weight"] = self.pp3wide.weight.detach().clone()
+            print(
+                "Weight-only Simple PP3Wide migration: off -> "
+                f"{self.simple_local_pair_feature}; init="
+                f"{self.simple_pp3wide_init}")
         if (saved_factorization == "shared"
                 and saved_mapping_version != FT_VIRTUAL_MAPPING_VERSION):
             raise ValueError(
