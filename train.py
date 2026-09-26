@@ -7,6 +7,8 @@ import hashlib
 import json
 import model as M
 from simple_halfka_hm2_model import (
+    FT_VIRTUAL_FACTORIZATION_MODES,
+    FT_VIRTUAL_MAPPING_VERSION,
     SIMPLE_QAT_MODES,
     SIMPLE_QAT_RECOMMENDED_MODE,
     SimpleHalfKAHM2NNUE,
@@ -645,6 +647,13 @@ def main():
       help=("Alias for --simple-qat-mode full; valid only for "
             "--architecture halfka_hm2_simple."))
   parser.add_argument(
+      "--simple-ft-virtual-factorization",
+      choices=FT_VIRTUAL_FACTORIZATION_MODES,
+      default="off",
+      help=("HalfKA_HM2 Simple training-time FT parameterization. 'shared' "
+            "adds a king-position-independent virtual table; export "
+            "coalesces it into the unchanged C++ FT. Default: off."))
+  parser.add_argument(
       "--simple-validation-cohort-report", action="store_true",
       help=("Print natural-validation bucket/ply/|material| probability and "
             "cp MAE aggregates for HalfKA_HM2 Simple. Diagnostic only."))
@@ -897,7 +906,8 @@ def main():
   simple_any_side_input = bool(
       args.use_side_input or args.use_direct_side_input)
   simple_any_experimental_path = bool(
-      simple_any_side_input or args.use_shared_psqt)
+      simple_any_side_input or args.use_shared_psqt
+      or args.simple_ft_virtual_factorization != "off")
   if args.use_side_input and args.use_direct_side_input:
     raise ValueError(
         "--use-side-input and --use-direct-side-input are mutually exclusive")
@@ -911,6 +921,11 @@ def main():
   if simple_qat_mode != "off" and not simple_architecture:
     raise ValueError(
         "--simple-qat/--simple-qat-mode requires "
+        "--architecture halfka_hm2_simple")
+  if (args.simple_ft_virtual_factorization != "off"
+      and not simple_architecture):
+    raise ValueError(
+        "--simple-ft-virtual-factorization requires "
         "--architecture halfka_hm2_simple")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
   if simple_architecture:
@@ -986,7 +1001,16 @@ def main():
       use_bucket_importance_base_loss=(
           args.simple_base_bucket_importance
           if simple_architecture else False),
-      simple_qat_mode=(simple_qat_mode if simple_architecture else "off"))
+      simple_qat_mode=(simple_qat_mode if simple_architecture else "off"),
+      simple_ft_virtual_factorization=(
+          args.simple_ft_virtual_factorization
+          if simple_architecture else "off"))
+    if simple_architecture:
+      # Kept outside the complex constructor surface: this is training-only
+      # and never changes the inference architecture/hash.
+      if (nnue.simple_ft_virtual_factorization
+          != args.simple_ft_virtual_factorization):
+        raise AssertionError("Simple FT factorization construction mismatch")
     print("Fresh NNUE architecture:",
           (nnue.architecture_metadata() if simple_architecture
            else M.nnue_architecture_metadata(nnue)))
@@ -1049,6 +1073,8 @@ def main():
               "use_shared_psqt": bool(
                   args.use_shared_psqt
                   or architecture.get("use_shared_psqt", False)),
+              "simple_ft_virtual_factorization": (
+                  args.simple_ft_virtual_factorization),
           }
       else:
           architecture_kwargs = M.nnue_architecture_kwargs(architecture)
@@ -1085,6 +1111,35 @@ def main():
                     reinit_groups=args.reinit_groups,
                     reinit_seed=args.reinit_seed,
                     **architecture_kwargs)
+      source_factorization = (
+          architecture.get("simple_ft_virtual_factorization", "off")
+          if simple_architecture and architecture is not None else "off")
+      if (simple_architecture and source_factorization == "shared"
+          and architecture.get("simple_ft_virtual_mapping_version")
+              != FT_VIRTUAL_MAPPING_VERSION):
+          raise ValueError(
+              "Simple FT virtual mapping mismatch: checkpoint="
+              f"{architecture.get('simple_ft_virtual_mapping_version')!r}, "
+              f"expected={FT_VIRTUAL_MAPPING_VERSION!r}")
+      target_factorization = (
+          args.simple_ft_virtual_factorization
+          if simple_architecture else "off")
+      source_effective_ft = None
+      if simple_architecture and source_factorization != target_factorization:
+          source_effective_ft = checkpoint_dict["input.weight"].detach().clone()
+          if source_factorization == "shared":
+              virtual = checkpoint_dict.get("input.virtual_weight")
+              if virtual is None:
+                  raise ValueError(
+                      "factorized .pt is missing input.virtual_weight")
+              source_effective_ft.add_(virtual.repeat(45, 1))
+          checkpoint_dict = dict(checkpoint_dict)
+          checkpoint_dict.pop("input.virtual_weight", None)
+          checkpoint_dict["input.weight"] = source_effective_ft
+          print(
+              "Simple FT parameterization conversion: "
+              f"{source_factorization} -> {target_factorization}; "
+              "optimizer/scheduler start fresh")
       model_dict = nnue.state_dict()
       if architecture is not None:
           print("Resuming .pt architecture:",
@@ -1140,6 +1195,9 @@ def main():
       # 現在のモデルの state_dict を更新してロード
       model_dict.update(pretrained_dict)
       nnue.load_state_dict(model_dict, strict=False)
+      if (simple_architecture and source_effective_ft is not None
+          and target_factorization == "shared"):
+          nnue.input.mean_decompose_(source_effective_ft)
 
     # 「.ckpt」の場合
     else:
@@ -1173,6 +1231,25 @@ def main():
             args.simple_base_bucket_importance)
         resume_overrides["use_shared_psqt"] = bool(args.use_shared_psqt)
         resume_overrides["simple_qat_mode"] = simple_qat_mode
+        resume_overrides["simple_ft_virtual_factorization"] = (
+            args.simple_ft_virtual_factorization)
+        if args.resume_training_state:
+          source_checkpoint = torch.load(
+              args.resume_from_model, map_location="cpu", weights_only=False)
+          source_metadata = (
+              source_checkpoint.get("architecture")
+              or source_checkpoint.get("nnue_architecture") or {})
+          saved_factorization = source_metadata.get(
+              "simple_ft_virtual_factorization", "off")
+          if saved_factorization != args.simple_ft_virtual_factorization:
+            raise ValueError(
+                "cannot change Simple FT virtual factorization while "
+                "restoring optimizer state: checkpoint="
+                f"{saved_factorization}, requested="
+                f"{args.simple_ft_virtual_factorization}. Use "
+                "--resume-from-model without --resume-training-state for "
+                "weight-only conversion and a fresh optimizer.")
+          del source_checkpoint
       if simple_architecture and simple_any_side_input:
         if args.resume_training_state:
           source_checkpoint = torch.load(

@@ -22,6 +22,10 @@ ARCHITECTURE_TYPE = "halfka_hm2_simple"
 FEATURE_NAME = "HalfKA_HM2_NoDG"
 FT_INPUTS = 73_305
 FT_WIDTH = 1_536
+HALFKA_HM2_KING_BUCKETS = 45
+HALFKA_HM2_PLANES = 1_629
+FT_VIRTUAL_FACTORIZATION_MODES = ("off", "shared")
+FT_VIRTUAL_MAPPING_VERSION = "halfka_hm2_makeindex_mod1629_v1"
 LAYER_STACKS = 9
 # Simple v2 fixed-point contract.  These values mirror the production C++
 # inference implementation and serialize_halfka_hm2_simple.py; QAT must not
@@ -174,14 +178,117 @@ def _simple_qat_activation(pre_activation, squared=False):
 
 
 class SimpleFeatureTransformer(nn.Module):
-    def __init__(self, num_inputs: int = FT_INPUTS, width: int = FT_WIDTH):
+    def __init__(self, num_inputs: int = FT_INPUTS, width: int = FT_WIDTH,
+                 virtual_factorization: str = "off"):
         super().__init__()
+        if virtual_factorization not in FT_VIRTUAL_FACTORIZATION_MODES:
+            raise ValueError(
+                "virtual_factorization must be one of "
+                f"{FT_VIRTUAL_FACTORIZATION_MODES}, got "
+                f"{virtual_factorization!r}")
+        if num_inputs == FT_INPUTS and (
+                FT_INPUTS != HALFKA_HM2_KING_BUCKETS * HALFKA_HM2_PLANES):
+            raise AssertionError("HalfKA_HM2 factorization layout changed")
+        self.virtual_factorization = virtual_factorization
         sigma = math.sqrt(1.0 / num_inputs)
         self.weight = nn.Parameter(torch.empty(num_inputs, width))
         self.bias = nn.Parameter(torch.empty(width))
+        if virtual_factorization == "shared":
+            self.virtual_weight = nn.Parameter(
+                torch.zeros(HALFKA_HM2_PLANES, width))
+            self.register_buffer(
+                "virtual_index",
+                torch.arange(num_inputs, dtype=torch.long).remainder(
+                    HALFKA_HM2_PLANES),
+                persistent=False)
+        else:
+            self.register_parameter("virtual_weight", None)
+            self.register_buffer("virtual_index", None, persistent=False)
         nn.init.uniform_(self.weight, -sigma, sigma)
         nn.init.uniform_(self.bias, -sigma, sigma)
         self._qat_eval_cache = None
+
+    def effective_weight(self):
+        """Return the deployment FT table without mutating training weights."""
+        if self.virtual_weight is None:
+            return self.weight
+        return self.weight + self.virtual_weight.index_select(
+            0, self.virtual_index)
+
+    @torch.no_grad()
+    def mean_decompose_(self, source_weight):
+        """Function-preserving unfactorized -> shared migration.
+
+        Every virtual group contains the 45 serialized king-bucket rows.  The
+        decomposition deliberately includes rows that may be unreachable in a
+        legal position: they are part of the existing inference table and this
+        makes migration deterministic and reversible without corpus-dependent
+        metadata.
+        """
+        if self.virtual_weight is None:
+            raise RuntimeError("mean_decompose_ requires shared factorization")
+        if tuple(source_weight.shape) != tuple(self.weight.shape):
+            raise ValueError(
+                f"FT shape mismatch: {tuple(source_weight.shape)} vs "
+                f"{tuple(self.weight.shape)}")
+        source = source_weight.to(device=self.weight.device,
+                                  dtype=self.weight.dtype)
+        grouped = source.view(
+            HALFKA_HM2_KING_BUCKETS, HALFKA_HM2_PLANES, -1)
+        virtual = grouped.mean(dim=0)
+        specific = source - virtual.index_select(0, self.virtual_index)
+        # Correct the last-bit cancellation where possible.  This keeps the
+        # coalesced float table bit-identical for normal trained weights and,
+        # more importantly, always preserves the production q127 table.
+        for _ in range(2):
+            reconstructed = specific + virtual.index_select(
+                0, self.virtual_index)
+            specific = specific + (source - reconstructed)
+        # Addition/subtraction can still miss the source by one ULP.  Nudge
+        # only those residual elements by one representable float toward the
+        # value whose subsequent S+V addition rounds exactly to the source.
+        expanded_virtual = virtual.index_select(0, self.virtual_index)
+        for _ in range(4):
+            reconstructed = specific + expanded_virtual
+            mismatch = reconstructed != source
+            if not mismatch.any():
+                break
+            direction = torch.where(
+                reconstructed < source,
+                torch.full_like(specific, float("inf")),
+                torch.full_like(specific, float("-inf")))
+            nudged = torch.nextafter(specific, direction)
+            specific = torch.where(mismatch, nudged, specific)
+        # The deployment contract is the q127 table.  Values exactly at a
+        # rounding boundary can change bin after the one-ULP reconstruction
+        # error above; nudge those rare elements toward the source bin.
+        desired_q = torch.round(source * FT_QUANT_SCALE)
+        for _ in range(4):
+            reconstructed = specific + expanded_virtual
+            actual_q = torch.round(reconstructed * FT_QUANT_SCALE)
+            mismatch = actual_q != desired_q
+            if not mismatch.any():
+                break
+            direction = torch.where(
+                actual_q < desired_q,
+                torch.full_like(specific, float("inf")),
+                torch.full_like(specific, float("-inf")))
+            specific = torch.where(
+                mismatch, torch.nextafter(specific, direction), specific)
+        self.virtual_weight.copy_(virtual)
+        self.weight.copy_(specific)
+        self._qat_eval_cache = None
+        return self
+
+    @torch.no_grad()
+    def load_coalesced_(self, source_weight):
+        """Load a deployment table into either parameterization."""
+        if self.virtual_weight is None:
+            self.weight.copy_(source_weight)
+        else:
+            self.mean_decompose_(source_weight)
+        self._qat_eval_cache = None
+        return self
 
     def train(self, mode: bool = True):
         # A validation cache is valid only until parameters may change again.
@@ -200,14 +307,17 @@ class SimpleFeatureTransformer(nn.Module):
         # sparse weighted row sum using a native PyTorch kernel, without a
         # multi-gigabyte [batch, active, width] intermediate.
         if qat_mode == "off":
-            weight, bias = self.weight, self.bias
+            weight, bias = self.effective_weight(), self.bias
         elif not self.training and self._qat_eval_cache is not None:
             weight, bias = self._qat_eval_cache
         else:
             # nn.bin stores both FT tensors as int16 at scale 127. C++ doubles
             # them after loading; the exact EWM path below accounts for that.
+            # QAT is applied after coalescing.  Quantizing S and V separately
+            # would not match the single q127 FT table stored in nn.bin.
             weight = _fake_quantize(
-                self.weight, FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX)
+                self.effective_weight(), FT_QUANT_SCALE,
+                FT_QUANT_MIN, FT_QUANT_MAX)
             bias = _fake_quantize(
                 self.bias, FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX)
             if not self.training:
@@ -376,6 +486,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         use_shared_psqt=False,
         use_bucket_importance_base_loss=False,
         simple_qat_mode="off",
+        simple_ft_virtual_factorization="off",
         **unused,
     ):
         super().__init__()
@@ -395,7 +506,15 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             (SIMPLE_DIRECT_SIDE_INPUT_TYPE if self.use_direct_side_input
              else SIMPLE_SIDE_INPUT_TYPE)
             if self.use_side_input else "none")
-        self.input = SimpleFeatureTransformer()
+        self.simple_ft_virtual_factorization = str(
+            simple_ft_virtual_factorization)
+        if self.simple_ft_virtual_factorization not in \
+                FT_VIRTUAL_FACTORIZATION_MODES:
+            raise ValueError(
+                "simple_ft_virtual_factorization must be one of "
+                f"{FT_VIRTUAL_FACTORIZATION_MODES}")
+        self.input = SimpleFeatureTransformer(
+            virtual_factorization=self.simple_ft_virtual_factorization)
         self.shared_psqt = (
             SimpleSharedPsqt() if self.use_shared_psqt else None)
         self.side_proj = (
@@ -483,6 +602,13 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "distinguish_golds": False,
             "long_effect_required": False,
             "simple_schema_version": SIMPLE_SCHEMA_VERSION,
+            # Training-only parameterization.  It does not participate in the
+            # C++ architecture/hash/schema because export coalesces the table.
+            "simple_ft_virtual_factorization": (
+                self.simple_ft_virtual_factorization),
+            "simple_ft_virtual_mapping_version": (
+                FT_VIRTUAL_MAPPING_VERSION
+                if self.simple_ft_virtual_factorization == "shared" else None),
             "use_side_input": use_side_input,
             "simple_side_input_type": (
                 getattr(self, "simple_side_input_type", "none")
@@ -1668,6 +1794,86 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         saved_side_input = bool(metadata.get("use_side_input", False))
         saved_side_type = metadata.get("simple_side_input_type", "none")
         saved_shared_psqt = bool(metadata.get("use_shared_psqt", False))
+        saved_factorization = metadata.get(
+            "simple_ft_virtual_factorization", "off")
+        saved_mapping_version = metadata.get(
+            "simple_ft_virtual_mapping_version")
+        if (saved_factorization == "shared"
+                and saved_mapping_version != FT_VIRTUAL_MAPPING_VERSION):
+            raise ValueError(
+                "Simple FT virtual mapping mismatch: checkpoint="
+                f"{saved_mapping_version!r}, expected="
+                f"{FT_VIRTUAL_MAPPING_VERSION!r}")
+        current_factorization = self.simple_ft_virtual_factorization
+        if saved_factorization not in FT_VIRTUAL_FACTORIZATION_MODES:
+            raise ValueError(
+                "unknown checkpoint Simple FT factorization: "
+                f"{saved_factorization!r}")
+        if saved_factorization != current_factorization:
+            state = checkpoint.get("state_dict", {})
+            source_weight = state.get("input.weight")
+            if source_weight is None:
+                raise ValueError("checkpoint is missing input.weight")
+            if saved_factorization == "shared":
+                source_virtual = state.get("input.virtual_weight")
+                if source_virtual is None:
+                    raise ValueError(
+                        "factorized checkpoint is missing input.virtual_weight")
+                effective = source_weight + source_virtual.repeat(
+                    HALFKA_HM2_KING_BUCKETS, 1)
+            else:
+                effective = source_weight
+            if current_factorization == "shared":
+                # Do the same function-preserving mean decomposition as the
+                # .pt migration path, but write tensors into Lightning's
+                # pending state_dict before load_state_dict runs.
+                virtual = effective.view(
+                    HALFKA_HM2_KING_BUCKETS,
+                    HALFKA_HM2_PLANES, -1).mean(dim=0)
+                specific = effective - virtual.repeat(
+                    HALFKA_HM2_KING_BUCKETS, 1)
+                for _ in range(2):
+                    reconstructed = specific + virtual.repeat(
+                        HALFKA_HM2_KING_BUCKETS, 1)
+                    specific.add_(effective - reconstructed)
+                expanded_virtual = virtual.repeat(
+                    HALFKA_HM2_KING_BUCKETS, 1)
+                for _ in range(4):
+                    reconstructed = specific + expanded_virtual
+                    mismatch = reconstructed != effective
+                    if not mismatch.any():
+                        break
+                    direction = torch.where(
+                        reconstructed < effective,
+                        torch.full_like(specific, float("inf")),
+                        torch.full_like(specific, float("-inf")))
+                    specific = torch.where(
+                        mismatch, torch.nextafter(specific, direction),
+                        specific)
+                desired_q = torch.round(effective * FT_QUANT_SCALE)
+                for _ in range(4):
+                    reconstructed = specific + expanded_virtual
+                    actual_q = torch.round(
+                        reconstructed * FT_QUANT_SCALE)
+                    mismatch = actual_q != desired_q
+                    if not mismatch.any():
+                        break
+                    direction = torch.where(
+                        actual_q < desired_q,
+                        torch.full_like(specific, float("inf")),
+                        torch.full_like(specific, float("-inf")))
+                    specific = torch.where(
+                        mismatch, torch.nextafter(specific, direction),
+                        specific)
+                state["input.weight"] = specific
+                state["input.virtual_weight"] = virtual
+            else:
+                state["input.weight"] = effective
+                state.pop("input.virtual_weight", None)
+            print(
+                "Simple FT checkpoint parameterization conversion: "
+                f"{saved_factorization} -> {current_factorization}; "
+                "weight-only resume requires a fresh optimizer")
         if saved_side_input and saved_side_type != self.simple_side_input_type:
             raise ValueError(
                 "Simple side-input type mismatch: "

@@ -83,8 +83,12 @@ def serialize_model(model, output, ft_compression="none"):
     _write_tensor(
         buf, model.input.bias.mul(Q_ONE).round().to(torch.int16),
         ft_compression)
+    # Virtual factorization is a training-only parameterization.  Export a
+    # fresh coalesced tensor without modifying either specific or virtual
+    # parameters; repeated serialization must therefore be byte-identical.
+    effective_ft_weight = model.input.effective_weight()
     _write_tensor(
-        buf, model.input.weight.mul(Q_ONE).round().to(torch.int16),
+        buf, effective_ft_weight.mul(Q_ONE).round().to(torch.int16),
         ft_compression)
     for stack in model.layer_stacks:
         _u32(buf, NETWORK_HASH)
