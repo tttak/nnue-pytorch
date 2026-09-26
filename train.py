@@ -6,7 +6,11 @@ from datetime import datetime
 import hashlib
 import json
 import model as M
-from simple_halfka_hm2_model import SimpleHalfKAHM2NNUE
+from simple_halfka_hm2_model import (
+    SIMPLE_QAT_MODES,
+    SIMPLE_QAT_RECOMMENDED_MODE,
+    SimpleHalfKAHM2NNUE,
+)
 from optimizer_presets import available_optimizer_presets
 from optimizer_layouts import (
     PARAMETER_SUBGROUPS,
@@ -628,6 +632,19 @@ def main():
       help=("HalfKA_HM2 Simple stdout diagnostic interval in optimizer steps "
             "(default: 500; <=0 disables feature/bucket/heavy diagnostics)."))
   parser.add_argument(
+      "--simple-qat-mode",
+      choices=SIMPLE_QAT_MODES,
+      default="off",
+      help=("Simple training-time QAT mode: off=float training; "
+            "weights=fake-quantized FT/dense weights and biases; "
+            "weight_activation=weights plus C++ hidden activations; "
+            "full=the production-recommended mode, additionally matching "
+            "shortcut/output integer addition. Default: off."))
+  parser.add_argument(
+      "--simple-qat", action="store_true",
+      help=("Alias for --simple-qat-mode full; valid only for "
+            "--architecture halfka_hm2_simple."))
+  parser.add_argument(
       "--simple-validation-cohort-report", action="store_true",
       help=("Print natural-validation bucket/ply/|material| probability and "
             "cp MAE aggregates for HalfKA_HM2 Simple. Diagnostic only."))
@@ -870,6 +887,13 @@ def main():
 
   feature_set = features.get_feature_set_from_name(args.features)
   simple_architecture = args.architecture == "halfka_hm2_simple"
+  if (args.simple_qat
+      and args.simple_qat_mode not in ("off", SIMPLE_QAT_RECOMMENDED_MODE)):
+    raise ValueError(
+        "--simple-qat is exactly an alias for --simple-qat-mode full and "
+        "cannot be combined with another QAT mode")
+  simple_qat_mode = (
+      SIMPLE_QAT_RECOMMENDED_MODE if args.simple_qat else args.simple_qat_mode)
   simple_any_side_input = bool(
       args.use_side_input or args.use_direct_side_input)
   simple_any_experimental_path = bool(
@@ -884,7 +908,13 @@ def main():
   if args.use_shared_psqt and not simple_architecture:
     raise ValueError(
         "--use-shared-psqt requires --architecture halfka_hm2_simple")
+  if simple_qat_mode != "off" and not simple_architecture:
+    raise ValueError(
+        "--simple-qat/--simple-qat-mode requires "
+        "--architecture halfka_hm2_simple")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
+  if simple_architecture:
+    print(f"Simple QAT training mode: {simple_qat_mode}")
   if simple_architecture:
     if feature_set.name != "HalfKA_HM2_NoDG":
       raise ValueError(
@@ -955,7 +985,8 @@ def main():
           args.use_shared_psqt if simple_architecture else False),
       use_bucket_importance_base_loss=(
           args.simple_base_bucket_importance
-          if simple_architecture else False))
+          if simple_architecture else False),
+      simple_qat_mode=(simple_qat_mode if simple_architecture else "off"))
     print("Fresh NNUE architecture:",
           (nnue.architecture_metadata() if simple_architecture
            else M.nnue_architecture_metadata(nnue)))
@@ -1014,6 +1045,7 @@ def main():
                       == "ply_material_direct_v1"),
               "use_bucket_importance_base_loss": bool(
                   args.simple_base_bucket_importance),
+              "simple_qat_mode": simple_qat_mode,
               "use_shared_psqt": bool(
                   args.use_shared_psqt
                   or architecture.get("use_shared_psqt", False)),
@@ -1140,6 +1172,7 @@ def main():
         resume_overrides["use_bucket_importance_base_loss"] = bool(
             args.simple_base_bucket_importance)
         resume_overrides["use_shared_psqt"] = bool(args.use_shared_psqt)
+        resume_overrides["simple_qat_mode"] = simple_qat_mode
       if simple_architecture and simple_any_side_input:
         if args.resume_training_state:
           source_checkpoint = torch.load(

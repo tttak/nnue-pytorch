@@ -23,15 +23,40 @@ FEATURE_NAME = "HalfKA_HM2_NoDG"
 FT_INPUTS = 73_305
 FT_WIDTH = 1_536
 LAYER_STACKS = 9
-NNUE_TO_SCORE = 127.0 * 64.0 / 16.0
-HIDDEN_WEIGHT_SCALE = 64.0
-MAX_HIDDEN_WEIGHT = 127.0 / HIDDEN_WEIGHT_SCALE
-FT_SERIALIZER_SCALE = 127.0
+# Simple v2 fixed-point contract.  These values mirror the production C++
+# inference implementation and serialize_halfka_hm2_simple.py; QAT must not
+# silently inherit constants from Stockfish or from the Complex network.
+FT_QUANT_SCALE = 127.0
+FT_QUANT_MIN = -32768.0
+FT_QUANT_MAX = 32767.0
+FT_LOAD_MULTIPLIER = 2.0
+DENSE_WEIGHT_SCALE = 64.0
+DENSE_WEIGHT_MIN = -127.0
+DENSE_WEIGHT_MAX = 127.0
+DENSE_BIAS_SCALE = DENSE_WEIGHT_SCALE * FT_QUANT_SCALE  # 8128
+ACCUMULATOR_PACK_MIN = 0.0
+ACCUMULATOR_PACK_MAX = 254.0
+ACTIVATION_QUANT_MIN = 0.0
+ACTIVATION_QUANT_MAX = 127.0
+UINT8_MAX = 255.0
+INT16_MIN = -32768.0
+INT16_MAX = 32767.0
+DENSE_ACTIVATION_SHIFT = 6
+SQUARED_ACTIVATION_SHIFT = 19
+EWM_SHIFT = 9
+NNUE_TO_SCORE = FT_QUANT_SCALE * DENSE_WEIGHT_SCALE / 16.0
+MAX_HIDDEN_WEIGHT = DENSE_WEIGHT_MAX / DENSE_WEIGHT_SCALE
+
+# Compatibility aliases used by existing diagnostics and external scripts.
+HIDDEN_WEIGHT_SCALE = DENSE_WEIGHT_SCALE
+FT_SERIALIZER_SCALE = FT_QUANT_SCALE
 SIMPLE_SIDE_INPUT_TYPE = "ply_material_v1"
 SIMPLE_SIDE_INPUT_DIM = 4
 SIMPLE_DIRECT_SIDE_INPUT_TYPE = "ply_material_direct_v1"
 SIMPLE_DIRECT_SIDE_INPUT_DIM = 2
 SIMPLE_SHARED_PSQT_TYPE = "halfka_hm2_shared_psqt_v1"
+SIMPLE_QAT_MODES = ("off", "weights", "weight_activation", "full")
+SIMPLE_QAT_RECOMMENDED_MODE = "full"
 BUCKET_STAT_NAMES = (
     "count", "weight", "loss", "prob_mae", "cp_mae",
     "importance_weighted_loss",
@@ -77,6 +102,77 @@ def normalize_simple_side_input(ply, material_stm, dtype=None):
     return torch.stack((ply_norm, material_norm), dim=1)
 
 
+def _ste(soft, hard):
+    """Use ``hard`` in forward while preserving the gradient of ``soft``."""
+    return soft + (hard - soft).detach()
+
+
+def _fake_quantize(parameter, scale, low, high):
+    """Fake-quantize onto a C++ storage grid with identity STE backward."""
+    quantized = torch.clamp(torch.round(parameter * scale), low, high) / scale
+    return _ste(parameter, quantized)
+
+
+def _fake_raw_grid(value):
+    """Use the common dense raw unit (1/8128) in forward, STE in backward."""
+    return _ste(value, torch.round(value * DENSE_BIAS_SCALE)
+                / DENSE_BIAS_SCALE)
+
+
+def _fake_dense_parameters(layer):
+    # Exactly serialize_halfka_hm2_simple._write_fc(): symmetric int8
+    # weights at scale 64 and int32 biases at scale 64*127.
+    weight = _fake_quantize(
+        layer.weight, DENSE_WEIGHT_SCALE,
+        DENSE_WEIGHT_MIN, DENSE_WEIGHT_MAX)
+    bias = _fake_raw_grid(layer.bias)
+    return weight, bias
+
+
+def _simple_qat_ewm(value, qat_mode):
+    """Element-wise multiplication for one fixed-perspective FT accumulator.
+
+    Float modes preserve the historical Simple training expression.  The
+    activation/full modes reproduce the production C++ ``scale_weights(true)``
+    path: q127 lanes are doubled, uint8-packed, multiplied and shifted by 9.
+    """
+    a, b = value[:, :FT_WIDTH // 2], value[:, FT_WIDTH // 2:]
+    soft = (torch.clamp(a, 0.0, 2.0)
+            * torch.clamp(b, 0.0, 2.0)
+            * (FT_QUANT_SCALE / 128.0))
+    if qat_mode not in ("weight_activation", "full"):
+        return soft
+    q0 = torch.clamp(
+        torch.round(a * FT_QUANT_SCALE) * FT_LOAD_MULTIPLIER,
+        ACCUMULATOR_PACK_MIN, ACCUMULATOR_PACK_MAX)
+    q1 = torch.clamp(
+        torch.round(b * FT_QUANT_SCALE) * FT_LOAD_MULTIPLIER,
+        ACCUMULATOR_PACK_MIN, ACCUMULATOR_PACK_MAX)
+    hard = torch.clamp(
+        torch.floor(q0 * q1 / float(1 << EWM_SHIFT)),
+        ACTIVATION_QUANT_MIN, UINT8_MAX) / FT_QUANT_SCALE
+    return _ste(soft, hard)
+
+
+def _simple_qat_activation(pre_activation, squared=False):
+    """Apply the Simple v2 uint8 activation contract with STE backward."""
+    raw = torch.clamp(
+        torch.round(pre_activation * DENSE_BIAS_SCALE),
+        INT16_MIN, INT16_MAX)
+    if squared:
+        hard_u8 = torch.clamp(
+            torch.floor(raw.square() / float(1 << SQUARED_ACTIVATION_SHIFT)),
+            ACTIVATION_QUANT_MIN, ACTIVATION_QUANT_MAX)
+        soft = torch.clamp(
+            pre_activation.square() * (FT_QUANT_SCALE / 128.0), 0.0, 1.0)
+    else:
+        hard_u8 = torch.clamp(
+            torch.floor(raw / float(1 << DENSE_ACTIVATION_SHIFT)),
+            ACTIVATION_QUANT_MIN, ACTIVATION_QUANT_MAX)
+        soft = torch.clamp(pre_activation, 0.0, 1.0)
+    return _ste(soft, hard_u8 / FT_QUANT_SCALE)
+
+
 class SimpleFeatureTransformer(nn.Module):
     def __init__(self, num_inputs: int = FT_INPUTS, width: int = FT_WIDTH):
         super().__init__()
@@ -85,13 +181,40 @@ class SimpleFeatureTransformer(nn.Module):
         self.bias = nn.Parameter(torch.empty(width))
         nn.init.uniform_(self.weight, -sigma, sigma)
         nn.init.uniform_(self.bias, -sigma, sigma)
+        self._qat_eval_cache = None
 
-    def forward(self, white_indices, white_values, black_indices, black_values):
+    def train(self, mode: bool = True):
+        # A validation cache is valid only until parameters may change again.
+        # Lightning switches the module back to train mode before optimization,
+        # so clearing here prevents a later validation epoch from seeing stale
+        # fake-quantized FT tensors.
+        if mode:
+            self._qat_eval_cache = None
+        return super().train(mode)
+
+    def forward(self, white_indices, white_values, black_indices, black_values,
+                qat_mode="off"):
         # The complex model's generated CuPy kernel is tuned and cached for its
         # 1280-wide FT.  Generating the first 1536-wide kernel takes minutes on
         # the supported Windows toolchain.  embedding_bag provides the same
         # sparse weighted row sum using a native PyTorch kernel, without a
         # multi-gigabyte [batch, active, width] intermediate.
+        if qat_mode == "off":
+            weight, bias = self.weight, self.bias
+        elif not self.training and self._qat_eval_cache is not None:
+            weight, bias = self._qat_eval_cache
+        else:
+            # nn.bin stores both FT tensors as int16 at scale 127. C++ doubles
+            # them after loading; the exact EWM path below accounts for that.
+            weight = _fake_quantize(
+                self.weight, FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX)
+            bias = _fake_quantize(
+                self.bias, FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX)
+            if not self.training:
+                # Validation has many batches but no parameter updates. Avoid
+                # requantizing the 112.6M-entry FT for every batch.
+                self._qat_eval_cache = (weight.detach(), bias.detach())
+
         def accumulate(indices, values):
             batch, active = indices.shape
             valid = indices >= 0
@@ -101,8 +224,8 @@ class SimpleFeatureTransformer(nn.Module):
                 0, batch * active, active, dtype=torch.long,
                 device=indices.device)
             return F.embedding_bag(
-                safe_indices, self.weight, offsets,
-                per_sample_weights=safe_values, mode="sum") + self.bias
+                safe_indices, weight, offsets,
+                per_sample_weights=safe_values, mode="sum") + bias
 
         return (accumulate(white_indices, white_values),
                 accumulate(black_indices, black_values))
@@ -153,13 +276,29 @@ class SimpleStack(nn.Module):
             with torch.no_grad():
                 self.fc1.weight[:, 30:].zero_()
 
-    def forward(self, x, side_input=None, collect_diagnostics=False):
-        h0 = self.fc0(x)
+    def forward(self, x, side_input=None, collect_diagnostics=False,
+                qat_mode="off"):
+        quantize_weights = qat_mode != "off"
+        quantize_activations = qat_mode in ("weight_activation", "full")
+
+        def affine(layer, value):
+            if not quantize_weights:
+                return layer(value)
+            weight, bias = _fake_dense_parameters(layer)
+            return F.linear(value, weight, bias)
+
+        h0 = affine(self.fc0, x)
+        if quantize_activations:
+            h0 = _fake_raw_grid(h0)
         hidden_pre = h0[:, :15]
-        # Canonical SFNN squares the raw affine output before clipping.
-        hidden2 = torch.clamp(
-            hidden_pre.square() * (127.0 / 128.0), 0.0, 1.0)
-        hidden = torch.clamp(hidden_pre, 0.0, 1.0)
+        if quantize_activations:
+            hidden = _simple_qat_activation(hidden_pre, squared=False)
+            hidden2 = _simple_qat_activation(hidden_pre, squared=True)
+        else:
+            # Canonical SFNN squares the raw affine output before clipping.
+            hidden2 = torch.clamp(
+                hidden_pre.square() * (FT_QUANT_SCALE / 128.0), 0.0, 1.0)
+            hidden = torch.clamp(hidden_pre, 0.0, 1.0)
         main_h = torch.cat((hidden2, hidden), dim=1)
         if self.side_input_dim:
             if side_input is None:
@@ -167,11 +306,21 @@ class SimpleStack(nn.Module):
             fc1_input = torch.cat((main_h, side_input), dim=1)
         else:
             fc1_input = main_h
-        fc1_pre = self.fc1(fc1_input)
-        h1 = torch.clamp(fc1_pre, 0.0, 1.0)
-        deep = self.fc2(h1)
+        fc1_pre = affine(self.fc1, fc1_input)
+        if quantize_activations:
+            fc1_pre = _fake_raw_grid(fc1_pre)
+            h1 = _simple_qat_activation(fc1_pre, squared=False)
+        else:
+            h1 = torch.clamp(fc1_pre, 0.0, 1.0)
+        deep = affine(self.fc2, h1)
         shortcut = h0[:, 15:16]
         output = deep + shortcut
+        if qat_mode == "full":
+            # C++ adds deep and shortcut in their common raw 1/8128 domain.
+            deep_raw = torch.round(deep * DENSE_BIAS_SCALE)
+            shortcut_raw = torch.round(shortcut * DENSE_BIAS_SCALE)
+            output = _ste(
+                output, (deep_raw + shortcut_raw) / DENSE_BIAS_SCALE)
         if collect_diagnostics:
             diagnostics = {
                 "fc0_pre": h0[:, :15],
@@ -226,6 +375,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         use_direct_side_input=False,
         use_shared_psqt=False,
         use_bucket_importance_base_loss=False,
+        simple_qat_mode="off",
         **unused,
     ):
         super().__init__()
@@ -274,6 +424,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.simple_debug_log_interval = int(simple_debug_log_interval)
         self.use_bucket_importance_base_loss = bool(
             use_bucket_importance_base_loss)
+        self.simple_qat_mode = str(simple_qat_mode)
+        if self.simple_qat_mode not in SIMPLE_QAT_MODES:
+            raise ValueError(
+                f"simple_qat_mode must be one of {SIMPLE_QAT_MODES}, got "
+                f"{self.simple_qat_mode!r}")
         self.register_buffer(
             "_bucket_importance_weights",
             torch.tensor(SIMPLE_BUCKET_IMPORTANCE_NORMALIZED),
@@ -363,7 +518,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 black_values, layer_stack_indices, ply=None, material=None,
                 **unused):
         tw, tb = self.input(
-            white_indices, white_values, black_indices, black_values)
+            white_indices, white_values, black_indices, black_values,
+            qat_mode=self.simple_qat_mode)
         us = us.view(-1, 1)
         them = them.view(-1, 1)
         # The loader exposes BLACK in white_* and WHITE in black_*; us/them
@@ -371,12 +527,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         # Each 1536-wide accumulator contains two 768-wide factor lanes.
         # Element-wise multiplication emits 768 values per perspective, then
         # side-to-move ordering concatenates friend and enemy perspectives.
-        def ewm(t):
-            a, b = t[:, :FT_WIDTH // 2], t[:, FT_WIDTH // 2:]
-            return (torch.clamp(a, 0.0, 2.0)
-                    * torch.clamp(b, 0.0, 2.0)
-                    * (127.0 / 128.0))
-        ew, eb = ewm(tw), ewm(tb)
+        ew = _simple_qat_ewm(tw, self.simple_qat_mode)
+        eb = _simple_qat_ewm(tb, self.simple_qat_mode)
         transformed = us * torch.cat((ew, eb), dim=1) \
             + them * torch.cat((eb, ew), dim=1)
         side_raw = None
@@ -406,7 +558,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                     bucket_out, bucket_diagnostics = stack(
                         transformed[mask],
                         None if side_h is None else side_h[mask],
-                        collect_diagnostics=True)
+                        collect_diagnostics=True,
+                        qat_mode=self.simple_qat_mode)
                     out[mask] = bucket_out
                     if self.use_shared_psqt:
                         psqt_deep[mask] = bucket_diagnostics["deep"].view(-1)
@@ -417,7 +570,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 else:
                     out[mask] = stack(
                         transformed[mask],
-                        None if side_h is None else side_h[mask])
+                        None if side_h is None else side_h[mask],
+                        qat_mode=self.simple_qat_mode)
         psqt_snapshot = None
         if self.use_shared_psqt:
             white_psqt, black_psqt = self.shared_psqt(
@@ -722,7 +876,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         if capture:
             # FT uses int16 at scale 127. Upstream does not clamp it to the
             # dense int8 range, so only report serializer-bound violations.
-            ft_limit = 32767.0 / FT_SERIALIZER_SCALE
+            ft_limit = FT_QUANT_MAX / FT_SERIALIZER_SCALE
             ft = self.input.weight.detach()
             captured["FT(int16 contract)"] = {
                 "w_min": ft.min(),
