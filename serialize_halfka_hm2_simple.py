@@ -16,6 +16,7 @@ from simple_halfka_hm2_model import (
 )
 from simple_pp3wide import (
     PP3WIDE_FEATURES, PP3WIDE_QUANT_SCALE, PP3WIDE_TYPE,
+    PP3WIDE64_TYPE, PP3WIDE64_WIDTH,
 )
 
 
@@ -34,6 +35,14 @@ DESCRIPTION_PP3WIDE = (
     "ModelType=SFNNWithoutPsqt;"
     "Features=HalfKA_hm2_NoDG(Friend)+PP3WidePL[73305+15552->1536x2],"
     "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL-v3{LayerStack=9}"
+)
+FT_HASH_PP3WIDE64 = FT_HASH ^ 0x50335764
+NETWORK_HASH_PP3WIDE64 = NETWORK_HASH ^ 0x50335064
+DESCRIPTION_PP3WIDE64 = (
+    "ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2_NoDG(Friend)+PP3WidePL64"
+    "[73305->1536x2;15552->64x2->EWM64->Proj16],"
+    "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4{LayerStack=9}"
 )
 Q_ONE = 127.0
 HIDDEN_WEIGHT_SCALE = 64.0
@@ -84,13 +93,17 @@ def serialize_model(model, output, ft_compression="none"):
             "ply/material Simple side-input is Python-training-only; its C++ "
             "serializer/schema has intentionally not been implemented")
     buf = bytearray()
-    pp_enabled = getattr(model, "simple_local_pair_feature", "off") == PP3WIDE_TYPE
+    pp_type = getattr(model, "simple_local_pair_feature", "off")
+    pp_enabled = pp_type == PP3WIDE_TYPE
+    pp64_enabled = pp_type == PP3WIDE64_TYPE
     _u32(buf, VERSION)
     _u32(buf, OUTER_HASH)
-    desc = (DESCRIPTION_PP3WIDE if pp_enabled else DESCRIPTION).encode("utf-8")
+    desc = (DESCRIPTION_PP3WIDE64 if pp64_enabled
+            else DESCRIPTION_PP3WIDE if pp_enabled else DESCRIPTION).encode("utf-8")
     _u32(buf, len(desc))
     buf.extend(desc)
-    _u32(buf, FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
+    _u32(buf, FT_HASH_PP3WIDE64 if pp64_enabled
+         else FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
     _write_tensor(
         buf, model.input.bias.mul(Q_ONE).round().to(torch.int16),
         ft_compression)
@@ -101,14 +114,20 @@ def serialize_model(model, output, ft_compression="none"):
     _write_tensor(
         buf, effective_ft_weight.mul(Q_ONE).round().to(torch.int16),
         ft_compression)
-    if pp_enabled:
+    if pp_enabled or pp64_enabled:
         if model.pp3wide is None:
             raise ValueError("PP3Wide architecture is missing its component")
         pp = model.pp3wide.weight.detach().mul(PP3WIDE_QUANT_SCALE) \
             .round().clamp(-127, 127).to(torch.int8).cpu().numpy()
         buf.extend(pp.tobytes())
+        if pp64_enabled:
+            projection = model.pp3wide.projection.weight.detach() \
+                .mul(HIDDEN_WEIGHT_SCALE).round().clamp(-127, 127) \
+                .to(torch.int8).cpu().numpy()
+            buf.extend(projection.tobytes())
     for stack in model.layer_stacks:
-        _u32(buf, NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
+        _u32(buf, NETWORK_HASH_PP3WIDE64 if pp64_enabled
+             else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
         _write_fc(buf, stack.fc0)
         _write_fc(buf, stack.fc1)
         _write_fc(buf, stack.fc2)
@@ -192,30 +211,44 @@ def deserialize_model(source, feature_set):
             raise ValueError("HalfKA_HM2 simple outer hash mismatch")
         description_size = _read_u32(stream)
         description = stream.read(description_size).decode("utf-8")
-        if description not in (DESCRIPTION, DESCRIPTION_PP3WIDE):
+        if description not in (
+                DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64):
             raise ValueError(
                 "HalfKA_HM2 simple architecture description mismatch: "
                 f"{description!r}")
         pp_enabled = description == DESCRIPTION_PP3WIDE
-        expected_ft_hash = FT_HASH_PP3WIDE if pp_enabled else FT_HASH
+        pp64_enabled = description == DESCRIPTION_PP3WIDE64
+        expected_ft_hash = (FT_HASH_PP3WIDE64 if pp64_enabled
+                            else FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
         if _read_u32(stream) != expected_ft_hash:
             raise ValueError("HalfKA_HM2 simple FT hash mismatch")
 
         model = SimpleHalfKAHM2NNUE(
             feature_set=feature_set,
-            simple_local_pair_feature=(PP3WIDE_TYPE if pp_enabled else "off"))
+            simple_local_pair_feature=(
+                PP3WIDE64_TYPE if pp64_enabled
+                else PP3WIDE_TYPE if pp_enabled else "off"))
         bias = _read_ft_tensor(stream, FT_WIDTH)
         weight = _read_ft_tensor(stream, FT_INPUTS * FT_WIDTH)
         _copy_parameter(model.input.bias, bias, Q_ONE)
         _copy_parameter(model.input.weight, weight, Q_ONE)
-        if pp_enabled:
+        if pp_enabled or pp64_enabled:
             pp = _read_array(
-                stream, np.int8, PP3WIDE_FEATURES * FT_WIDTH)
+                stream, np.int8,
+                PP3WIDE_FEATURES * (
+                    PP3WIDE64_WIDTH if pp64_enabled else FT_WIDTH))
             _copy_parameter(model.pp3wide.weight, pp, PP3WIDE_QUANT_SCALE)
+            if pp64_enabled:
+                projection = _read_array(
+                    stream, np.int8, 16 * PP3WIDE64_WIDTH)
+                _copy_parameter(
+                    model.pp3wide.projection.weight, projection,
+                    HIDDEN_WEIGHT_SCALE)
 
         for stack in model.layer_stacks:
             expected_network_hash = (
-                NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
+                NETWORK_HASH_PP3WIDE64 if pp64_enabled
+                else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
             if _read_u32(stream) != expected_network_hash:
                 raise ValueError("HalfKA_HM2 simple network hash mismatch")
             _read_fc(stream, stack.fc0)
@@ -233,9 +266,12 @@ def validate_roundtrip(blob, ft_compression="none"):
     assert _read_u32(stream) == OUTER_HASH
     n = _read_u32(stream)
     description = stream.read(n).decode("utf-8")
-    assert description in (DESCRIPTION, DESCRIPTION_PP3WIDE)
+    assert description in (DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64)
     pp_enabled = description == DESCRIPTION_PP3WIDE
-    assert _read_u32(stream) == (FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
+    pp64_enabled = description == DESCRIPTION_PP3WIDE64
+    assert _read_u32(stream) == (
+        FT_HASH_PP3WIDE64 if pp64_enabled
+        else FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
     if ft_compression == "none":
         ft_bytes = (FT_WIDTH + FT_INPUTS * FT_WIDTH) * 2
         if len(stream.read(ft_bytes)) != ft_bytes:
@@ -245,9 +281,13 @@ def validate_roundtrip(blob, ft_compression="none"):
         _read_leb(stream, FT_INPUTS * FT_WIDTH)
     else:
         raise ValueError(f"unsupported FT compression: {ft_compression}")
-    if pp_enabled:
-        pp_bytes = PP3WIDE_FEATURES * FT_WIDTH
+    if pp_enabled or pp64_enabled:
+        pp_bytes = PP3WIDE_FEATURES * (
+            PP3WIDE64_WIDTH if pp64_enabled else FT_WIDTH)
         if len(stream.read(pp_bytes)) != pp_bytes:
+            raise EOFError
+        if pp64_enabled and len(stream.read(16 * PP3WIDE64_WIDTH)) \
+                != 16 * PP3WIDE64_WIDTH:
             raise EOFError
     # Validate exact tensor order/size for all nine stacks.
     fc_sizes = (
@@ -257,7 +297,8 @@ def validate_roundtrip(blob, ft_compression="none"):
     )
     for _ in range(LAYER_STACKS):
         assert _read_u32(stream) == (
-            NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
+            NETWORK_HASH_PP3WIDE64 if pp64_enabled
+            else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
         for size in fc_sizes:
             if len(stream.read(size)) != size:
                 raise EOFError
@@ -306,8 +347,9 @@ def main():
         validate_roundtrip(blob, ft_compression=args.ft_compression)
         print(f"wrote {output}: {len(blob):,} bytes")
         print(f"FT compression: {args.ft_compression}")
-        print(DESCRIPTION_PP3WIDE if getattr(
-            model, "simple_local_pair_feature", "off") == PP3WIDE_TYPE
+        pp_type = getattr(model, "simple_local_pair_feature", "off")
+        print(DESCRIPTION_PP3WIDE64 if pp_type == PP3WIDE64_TYPE
+              else DESCRIPTION_PP3WIDE if pp_type == PP3WIDE_TYPE
               else DESCRIPTION)
     else:
         raise ValueError("output must be .pt, .nnue or .bin")

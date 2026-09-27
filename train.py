@@ -14,7 +14,9 @@ from simple_halfka_hm2_model import (
     SIMPLE_LOCAL_PAIR_FEATURES,
     SimpleHalfKAHM2NNUE,
 )
-from simple_pp3wide import PP3WIDE_INIT_MODES, PP3WIDE_TYPE
+from simple_pp3wide import (
+    PP3WIDE_INIT_MODES, PP3WIDE_TYPE, PP3WIDE64_TYPE,
+)
 from optimizer_presets import available_optimizer_presets
 from optimizer_layouts import (
     PARAMETER_SUBGROUPS,
@@ -658,7 +660,7 @@ def main():
   parser.add_argument(
       "--simple-local-pair-feature", choices=SIMPLE_LOCAL_PAIR_FEATURES,
       default="off",
-      help=("Experiment 120 local sparse pair component. "
+      help=("Experiment 120/121 local sparse pair component. "
             f"Use {PP3WIDE_TYPE} for board-only unpromoted pawn/lance "
             "PP_3Wide; default: off."))
   parser.add_argument(
@@ -670,6 +672,15 @@ def main():
   parser.add_argument(
       "--simple-pp3wide-seed", type=int, default=120,
       help="Independent deterministic PP initialization seed.")
+  parser.add_argument(
+      "--simple-pp3wide64-table-nonzero-rate", type=float, default=0.05,
+      help="PP64 table +/-16 q127 initialization density (default: 0.05).")
+  parser.add_argument(
+      "--simple-pp3wide64-proj-nonzero-rate", type=float, default=0.05,
+      help="PP64 projection +/-1 q64 initialization density (default: 0.05).")
+  parser.add_argument(
+      "--simple-pp3wide64-seed", type=int, default=121,
+      help="Independent deterministic PP64 initialization seed.")
   parser.add_argument(
       "--simple-validation-cohort-report", action="store_true",
       help=("Print natural-validation bucket/ply/|material| probability and "
@@ -951,6 +962,12 @@ def main():
         "--architecture halfka_hm2_simple")
   if not 0.0 <= args.simple_pp3wide_nonzero_rate <= 1.0:
     raise ValueError("--simple-pp3wide-nonzero-rate must be in [0,1]")
+  if not 0.0 <= args.simple_pp3wide64_table_nonzero_rate <= 1.0:
+    raise ValueError(
+        "--simple-pp3wide64-table-nonzero-rate must be in [0,1]")
+  if not 0.0 <= args.simple_pp3wide64_proj_nonzero_rate <= 1.0:
+    raise ValueError(
+        "--simple-pp3wide64-proj-nonzero-rate must be in [0,1]")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
   if simple_architecture:
     print(f"Simple QAT training mode: {simple_qat_mode}")
@@ -1033,7 +1050,12 @@ def main():
           args.simple_local_pair_feature if simple_architecture else "off"),
       simple_pp3wide_init=args.simple_pp3wide_init,
       simple_pp3wide_nonzero_rate=args.simple_pp3wide_nonzero_rate,
-      simple_pp3wide_seed=args.simple_pp3wide_seed)
+      simple_pp3wide_seed=args.simple_pp3wide_seed,
+      simple_pp3wide64_table_nonzero_rate=(
+          args.simple_pp3wide64_table_nonzero_rate),
+      simple_pp3wide64_proj_nonzero_rate=(
+          args.simple_pp3wide64_proj_nonzero_rate),
+      simple_pp3wide64_seed=args.simple_pp3wide64_seed)
     if simple_architecture:
       # Kept outside the complex constructor surface: this is training-only
       # and never changes the inference architecture/hash.
@@ -1108,6 +1130,11 @@ def main():
               "simple_pp3wide_init": args.simple_pp3wide_init,
               "simple_pp3wide_nonzero_rate": args.simple_pp3wide_nonzero_rate,
               "simple_pp3wide_seed": args.simple_pp3wide_seed,
+              "simple_pp3wide64_table_nonzero_rate": (
+                  args.simple_pp3wide64_table_nonzero_rate),
+              "simple_pp3wide64_proj_nonzero_rate": (
+                  args.simple_pp3wide64_proj_nonzero_rate),
+              "simple_pp3wide64_seed": args.simple_pp3wide64_seed,
           }
       else:
           architecture_kwargs = M.nnue_architecture_kwargs(architecture)
@@ -1272,6 +1299,12 @@ def main():
         resume_overrides["simple_pp3wide_nonzero_rate"] = (
             args.simple_pp3wide_nonzero_rate)
         resume_overrides["simple_pp3wide_seed"] = args.simple_pp3wide_seed
+        resume_overrides["simple_pp3wide64_table_nonzero_rate"] = (
+            args.simple_pp3wide64_table_nonzero_rate)
+        resume_overrides["simple_pp3wide64_proj_nonzero_rate"] = (
+            args.simple_pp3wide64_proj_nonzero_rate)
+        resume_overrides["simple_pp3wide64_seed"] = (
+            args.simple_pp3wide64_seed)
         if args.resume_training_state:
           source_checkpoint = torch.load(
               args.resume_from_model, map_location="cpu", weights_only=False)
@@ -1581,7 +1614,7 @@ def main():
     train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), getattr(nnue, "simple_local_pair_feature", "off") == PP3WIDE_TYPE)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), getattr(nnue, "simple_local_pair_feature", "off") in (PP3WIDE_TYPE, PP3WIDE64_TYPE))
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()

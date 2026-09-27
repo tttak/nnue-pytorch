@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 
 PP3WIDE_TYPE = "pawn_lance_pp3wide"
+PP3WIDE64_TYPE = "pawn_lance_pp3wide64"
 PP3WIDE_INIT_MODES = ("zero", "quantized_random")
 PP3WIDE_STATES = 4  # relative owner (friend/enemy) x (pawn/lance)
 PP3WIDE_SAME_FILE_PAIRS = 9 * 36
@@ -21,6 +22,14 @@ PP3WIDE_FEATURES = PP3WIDE_SQUARE_PAIRS * PP3WIDE_STATES**2
 PP3WIDE_MAX_ACTIVE = 256
 PP3WIDE_QUANT_SCALE = 127.0
 PP3WIDE_SCHEMA_VERSION = 1
+PP3WIDE64_SCHEMA_VERSION = 1
+PP3WIDE64_WIDTH = 64
+PP3WIDE64_TRANSFORMED = 64
+PP3WIDE64_PROJECTION_OUTPUTS = 16
+# A +/-1 table cannot survive the EWM >>9 after summing only ~43 active
+# relations.  Use a still-small, exactly representable q127 quantum so both
+# the PP table and projection have a non-zero fixed forward at initialization.
+PP3WIDE64_INIT_TABLE_QUANTUM = 16
 PP3WIDE_MAPPING_VERSION = "pl_board_unordered_file1_hm2mirror_v1"
 
 
