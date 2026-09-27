@@ -2,6 +2,7 @@
 #include <memory>
 #include <string>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <iterator>
@@ -118,6 +119,316 @@ inline void append(const Position& pos, const Color perspective,
 }
 
 } // namespace SimplePp3Wide
+
+namespace SimpleLocalPair64 {
+
+constexpr int kClasses = 8;
+constexpr int kStates = 16;
+constexpr int kSquarePairs = 720;
+constexpr int kDimensions = kSquarePairs * kStates * kStates;
+
+struct LocalPiece { int square; int state; };
+
+inline int mirror_square(const int sq) {
+    return (8 - sq / 9) * 9 + sq % 9;
+}
+
+inline int compact_square_pair(int a, int b) {
+    if (b < a) std::swap(a, b);
+    if (a == b) return -1;
+    static const auto table = [] {
+        std::array<std::int16_t, 81 * 81> result{};
+        result.fill(-1);
+        int index = 0;
+        for (int x = 0; x < 81; ++x) {
+            const int fx = x / 9, rx = x % 9;
+            for (int y = x + 1; y < 81; ++y) {
+                const int fy = y / 9, ry = y % 9;
+                if (fy - fx <= 2 && std::abs(ry - rx) <= 2)
+                    result[x * 81 + y] = static_cast<std::int16_t>(index++);
+            }
+        }
+        return result;
+    }();
+    return table[a * 81 + b];
+}
+
+inline void append(const Position& pos, const Color perspective,
+                   const int batch_index,
+                   std::vector<std::int32_t>& indices,
+                   std::vector<std::int32_t>& batch_indices) {
+    int king = static_cast<int>(pos.king_square(perspective));
+    if (perspective == WHITE) king = 80 - king;
+    const bool mirror = king >= static_cast<int>(SQ_61);
+    std::vector<LocalPiece> pieces;
+    pieces.reserve(40);
+    const PieceType classes[kClasses] = {
+        LANCE, KNIGHT, SILVER, GOLDS, BISHOP, HORSE, ROOK, DRAGON};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const Color owner = static_cast<Color>(c);
+        for (int pc = 0; pc < kClasses; ++pc) {
+            Bitboard bb = pos.pieces(owner, classes[pc]);
+            while (bb) {
+                int sq = static_cast<int>(bb.pop());
+                if (perspective == WHITE) sq = 80 - sq;
+                if (mirror) sq = mirror_square(sq);
+                pieces.push_back({
+                    sq, (c ^ static_cast<int>(perspective)) * kClasses + pc});
+            }
+        }
+    }
+    std::sort(pieces.begin(), pieces.end(), [](const LocalPiece& a,
+                                                const LocalPiece& b) {
+        return a.square < b.square
+            || (a.square == b.square && a.state < b.state);
+    });
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        for (std::size_t j = i + 1; j < pieces.size(); ++j) {
+            if (pieces[j].square / 9 - pieces[i].square / 9 > 2) break;
+            const int pair = compact_square_pair(
+                pieces[i].square, pieces[j].square);
+            if (pair < 0) continue;
+            indices.push_back(pair * kStates * kStates
+                              + pieces[i].state * kStates + pieces[j].state);
+            batch_indices.push_back(batch_index);
+        }
+}
+
+static_assert(kDimensions == 184320);
+
+} // namespace SimpleLocalPair64
+
+namespace SimpleKsgLocalPair64 {
+
+constexpr int kClasses = 3;
+constexpr int kStates = 6;
+constexpr int kSquarePairs = 720;
+constexpr int kDimensions = kSquarePairs * kStates * kStates;
+
+struct LocalPiece { int square; int state; };
+
+inline int mirror_square(const int sq) {
+    return (8 - sq / 9) * 9 + sq % 9;
+}
+
+inline int compact_square_pair(int a, int b) {
+    if (b < a) std::swap(a, b);
+    if (a == b) return -1;
+    static const auto table = [] {
+        std::array<std::int16_t, 81 * 81> result{};
+        result.fill(-1);
+        int index = 0;
+        for (int x = 0; x < 81; ++x) {
+            const int fx = x / 9, rx = x % 9;
+            for (int y = x + 1; y < 81; ++y) {
+                const int fy = y / 9, ry = y % 9;
+                if (fy - fx <= 2 && std::abs(ry - rx) <= 2)
+                    result[x * 81 + y] = static_cast<std::int16_t>(index++);
+            }
+        }
+        return result;
+    }();
+    return table[a * 81 + b];
+}
+
+inline void append(const Position& pos, const Color perspective,
+                   const int batch_index,
+                   std::vector<std::int32_t>& indices,
+                   std::vector<std::int32_t>& batch_indices) {
+    int king = static_cast<int>(pos.king_square(perspective));
+    if (perspective == WHITE) king = 80 - king;
+    const bool mirror = king >= static_cast<int>(SQ_61);
+    std::vector<LocalPiece> pieces;
+    pieces.reserve(24);
+    const PieceType classes[kClasses] = {KNIGHT, SILVER, GOLDS};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const Color owner = static_cast<Color>(c);
+        for (int pc = 0; pc < kClasses; ++pc) {
+            Bitboard bb = pos.pieces(owner, classes[pc]);
+            while (bb) {
+                int sq = static_cast<int>(bb.pop());
+                if (perspective == WHITE) sq = 80 - sq;
+                if (mirror) sq = mirror_square(sq);
+                pieces.push_back({
+                    sq, (c ^ static_cast<int>(perspective)) * kClasses + pc});
+            }
+        }
+    }
+    std::sort(pieces.begin(), pieces.end(), [](const LocalPiece& a,
+                                                const LocalPiece& b) {
+        return a.square < b.square
+            || (a.square == b.square && a.state < b.state);
+    });
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        for (std::size_t j = i + 1; j < pieces.size(); ++j) {
+            if (pieces[j].square / 9 - pieces[i].square / 9 > 2) break;
+            const int pair = compact_square_pair(
+                pieces[i].square, pieces[j].square);
+            if (pair < 0) continue;
+            indices.push_back(pair * kStates * kStates
+                              + pieces[i].state * kStates + pieces[j].state);
+            batch_indices.push_back(batch_index);
+        }
+}
+
+static_assert(kDimensions == 25920);
+
+} // namespace SimpleKsgLocalPair64
+
+namespace SimpleGsLocalPair64 {
+
+constexpr int kClasses = 2;
+constexpr int kStates = 4;
+constexpr int kSquarePairs = 720;
+constexpr int kDimensions = kSquarePairs * kStates * kStates;
+
+struct LocalPiece { int square; int state; };
+
+inline int mirror_square(const int sq) {
+    return (8 - sq / 9) * 9 + sq % 9;
+}
+
+inline int compact_square_pair(int a, int b) {
+    if (b < a) std::swap(a, b);
+    if (a == b) return -1;
+    static const auto table = [] {
+        std::array<std::int16_t, 81 * 81> result{};
+        result.fill(-1);
+        int index = 0;
+        for (int x = 0; x < 81; ++x) {
+            const int fx = x / 9, rx = x % 9;
+            for (int y = x + 1; y < 81; ++y) {
+                const int fy = y / 9, ry = y % 9;
+                if (fy - fx <= 2 && std::abs(ry - rx) <= 2)
+                    result[x * 81 + y] = static_cast<std::int16_t>(index++);
+            }
+        }
+        return result;
+    }();
+    return table[a * 81 + b];
+}
+
+inline void append(const Position& pos, const Color perspective,
+                   const int batch_index,
+                   std::vector<std::int32_t>& indices,
+                   std::vector<std::int32_t>& batch_indices) {
+    int king = static_cast<int>(pos.king_square(perspective));
+    if (perspective == WHITE) king = 80 - king;
+    const bool mirror = king >= static_cast<int>(SQ_61);
+    std::vector<LocalPiece> pieces;
+    pieces.reserve(20);
+    const PieceType classes[kClasses] = {SILVER, GOLDS};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const Color owner = static_cast<Color>(c);
+        for (int pc = 0; pc < kClasses; ++pc) {
+            Bitboard bb = pos.pieces(owner, classes[pc]);
+            while (bb) {
+                int sq = static_cast<int>(bb.pop());
+                if (perspective == WHITE) sq = 80 - sq;
+                if (mirror) sq = mirror_square(sq);
+                pieces.push_back({
+                    sq, (c ^ static_cast<int>(perspective)) * kClasses + pc});
+            }
+        }
+    }
+    std::sort(pieces.begin(), pieces.end(), [](const LocalPiece& a,
+                                                const LocalPiece& b) {
+        return a.square < b.square
+            || (a.square == b.square && a.state < b.state);
+    });
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        for (std::size_t j = i + 1; j < pieces.size(); ++j) {
+            if (pieces[j].square / 9 - pieces[i].square / 9 > 2) break;
+            const int pair = compact_square_pair(
+                pieces[i].square, pieces[j].square);
+            if (pair < 0) continue;
+            indices.push_back(pair * kStates * kStates
+                              + pieces[i].state * kStates + pieces[j].state);
+            batch_indices.push_back(batch_index);
+        }
+}
+
+static_assert(kDimensions == 11520);
+
+} // namespace SimpleGsLocalPair64
+
+namespace SimpleGsLocalPair32D1 {
+
+constexpr int kClasses = 2;
+constexpr int kStates = 4;
+constexpr int kSquarePairs = 272;
+constexpr int kDimensions = kSquarePairs * kStates * kStates;
+
+struct LocalPiece { int square; int state; };
+
+inline int mirror_square(const int sq) {
+    return (8 - sq / 9) * 9 + sq % 9;
+}
+
+inline int compact_square_pair(int a, int b) {
+    if (b < a) std::swap(a, b);
+    if (a == b) return -1;
+    static const auto table = [] {
+        std::array<std::int16_t, 81 * 81> result{};
+        result.fill(-1);
+        int index = 0;
+        for (int x = 0; x < 81; ++x) {
+            const int fx = x / 9, rx = x % 9;
+            for (int y = x + 1; y < 81; ++y) {
+                const int fy = y / 9, ry = y % 9;
+                if (fy - fx <= 1 && std::abs(ry - rx) <= 1)
+                    result[x * 81 + y] = static_cast<std::int16_t>(index++);
+            }
+        }
+        return result;
+    }();
+    return table[a * 81 + b];
+}
+
+inline void append(const Position& pos, const Color perspective,
+                   const int batch_index,
+                   std::vector<std::int32_t>& indices,
+                   std::vector<std::int32_t>& batch_indices) {
+    int king = static_cast<int>(pos.king_square(perspective));
+    if (perspective == WHITE) king = 80 - king;
+    const bool mirror = king >= static_cast<int>(SQ_61);
+    std::vector<LocalPiece> pieces;
+    pieces.reserve(20);
+    const PieceType classes[kClasses] = {SILVER, GOLDS};
+    for (int c = 0; c < COLOR_NB; ++c) {
+        const Color owner = static_cast<Color>(c);
+        for (int pc = 0; pc < kClasses; ++pc) {
+            Bitboard bb = pos.pieces(owner, classes[pc]);
+            while (bb) {
+                int sq = static_cast<int>(bb.pop());
+                if (perspective == WHITE) sq = 80 - sq;
+                if (mirror) sq = mirror_square(sq);
+                pieces.push_back({
+                    sq, (c ^ static_cast<int>(perspective)) * kClasses + pc});
+            }
+        }
+    }
+    std::sort(pieces.begin(), pieces.end(), [](const LocalPiece& a,
+                                                const LocalPiece& b) {
+        return a.square < b.square
+            || (a.square == b.square && a.state < b.state);
+    });
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        for (std::size_t j = i + 1; j < pieces.size(); ++j) {
+            if (pieces[j].square / 9 - pieces[i].square / 9 > 1) break;
+            const int pair = compact_square_pair(
+                pieces[i].square, pieces[j].square);
+            if (pair < 0) continue;
+            indices.push_back(pair * kStates * kStates
+                              + pieces[i].state * kStates + pieces[j].state);
+            batch_indices.push_back(batch_index);
+        }
+}
+
+static_assert(kSquarePairs == 272);
+static_assert(kDimensions == 4352);
+
+} // namespace SimpleGsLocalPair32D1
 
 namespace PairRelationSideInput {
 
@@ -633,7 +944,11 @@ struct SparseBatch
     SparseBatch(FeatureSet<Ts...>, const std::vector<TrainingDataEntry>& entries,
                 const bool generate_pair_relations = false,
                 const bool generate_mobility_tactical = false,
-                const bool generate_simple_pp3wide = false)
+                const bool generate_simple_pp3wide = false,
+                const bool generate_simple_localpair64 = false,
+                const bool generate_simple_ksg_localpair64 = false,
+                const bool generate_simple_gs_localpair64 = false,
+                const bool generate_simple_gs_localpair32_d1 = false)
     {
         num_inputs = FeatureSet<Ts...>::INPUTS;
         size = entries.size();
@@ -673,7 +988,10 @@ struct SparseBatch
                 static_cast<std::uint8_t>(entries[i].mirror_applied));
             fill_entry(FeatureSet<Ts...>{}, i, entries[i],
                        generate_pair_relations, generate_mobility_tactical,
-                       generate_simple_pp3wide);
+                       generate_simple_pp3wide, generate_simple_localpair64,
+                       generate_simple_ksg_localpair64,
+                       generate_simple_gs_localpair64,
+                       generate_simple_gs_localpair32_d1);
         }
     }
 
@@ -732,7 +1050,11 @@ private:
     void fill_entry(FeatureSet<Ts...>, int i, const TrainingDataEntry& e,
                     const bool generate_pair_relations,
                     const bool generate_mobility_tactical,
-                    const bool generate_simple_pp3wide)
+                    const bool generate_simple_pp3wide,
+                    const bool generate_simple_localpair64,
+                    const bool generate_simple_ksg_localpair64,
+                    const bool generate_simple_gs_localpair64,
+                    const bool generate_simple_gs_localpair32_d1)
     {
         is_white[i] = static_cast<float>(e.pos->side_to_move() == Color::BLACK);
         outcome[i] = (e.result + 1.0f) / 2.0f;
@@ -770,6 +1092,38 @@ private:
                 *e.pos, BLACK, i, pp3wide_white_indices,
                 pp3wide_white_batch_indices);
             SimplePp3Wide::append(
+                *e.pos, WHITE, i, pp3wide_black_indices,
+                pp3wide_black_batch_indices);
+        }
+        if (generate_simple_localpair64) {
+            SimpleLocalPair64::append(
+                *e.pos, BLACK, i, pp3wide_white_indices,
+                pp3wide_white_batch_indices);
+            SimpleLocalPair64::append(
+                *e.pos, WHITE, i, pp3wide_black_indices,
+                pp3wide_black_batch_indices);
+        }
+        if (generate_simple_ksg_localpair64) {
+            SimpleKsgLocalPair64::append(
+                *e.pos, BLACK, i, pp3wide_white_indices,
+                pp3wide_white_batch_indices);
+            SimpleKsgLocalPair64::append(
+                *e.pos, WHITE, i, pp3wide_black_indices,
+                pp3wide_black_batch_indices);
+        }
+        if (generate_simple_gs_localpair64) {
+            SimpleGsLocalPair64::append(
+                *e.pos, BLACK, i, pp3wide_white_indices,
+                pp3wide_white_batch_indices);
+            SimpleGsLocalPair64::append(
+                *e.pos, WHITE, i, pp3wide_black_indices,
+                pp3wide_black_batch_indices);
+        }
+        if (generate_simple_gs_localpair32_d1) {
+            SimpleGsLocalPair32D1::append(
+                *e.pos, BLACK, i, pp3wide_white_indices,
+                pp3wide_white_batch_indices);
+            SimpleGsLocalPair32D1::append(
                 *e.pos, WHITE, i, pp3wide_black_indices,
                 pp3wide_black_batch_indices);
         }
@@ -844,7 +1198,7 @@ struct FeaturedBatchStream : Stream<StorageT>
 
     static constexpr int num_feature_threads_per_reading_thread = 2;
 
-    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false, const bool generate_mobility_tactical = false, const bool generate_simple_pp3wide = false) :
+    FeaturedBatchStream(int concurrency, const char* filename1, const char* filename2, const char* filename3, float train1_rate, float train2_rate, float skiprate, float mirror, int batch_size, bool cyclic, std::function<bool(const TrainingDataEntry&)> skipPredicate, const char* ranking_target3_filename = nullptr, const bool generate_pair_relations = false, const bool generate_mobility_tactical = false, const bool generate_simple_pp3wide = false, const bool generate_simple_localpair64 = false, const bool generate_simple_ksg_localpair64 = false, const bool generate_simple_gs_localpair64 = false, const bool generate_simple_gs_localpair32_d1 = false) :
         BaseType(
             std::max(
                 1,
@@ -865,7 +1219,11 @@ struct FeaturedBatchStream : Stream<StorageT>
         m_batch_size(batch_size),
         m_generate_pair_relations(generate_pair_relations),
         m_generate_mobility_tactical(generate_mobility_tactical),
-        m_generate_simple_pp3wide(generate_simple_pp3wide)
+        m_generate_simple_pp3wide(generate_simple_pp3wide),
+        m_generate_simple_localpair64(generate_simple_localpair64),
+        m_generate_simple_ksg_localpair64(generate_simple_ksg_localpair64),
+        m_generate_simple_gs_localpair64(generate_simple_gs_localpair64),
+        m_generate_simple_gs_localpair32_d1(generate_simple_gs_localpair32_d1)
     {
         m_stop_flag.store(false);
 
@@ -890,7 +1248,11 @@ struct FeaturedBatchStream : Stream<StorageT>
                 auto batch = new StorageT(
                     FeatureSet{}, entries, m_generate_pair_relations,
                     m_generate_mobility_tactical,
-                    m_generate_simple_pp3wide);
+                    m_generate_simple_pp3wide,
+                    m_generate_simple_localpair64,
+                    m_generate_simple_ksg_localpair64,
+                    m_generate_simple_gs_localpair64,
+                    m_generate_simple_gs_localpair32_d1);
 
                 {
                     std::unique_lock lock(m_batch_mutex);
@@ -967,6 +1329,10 @@ private:
     bool m_generate_pair_relations;
     bool m_generate_mobility_tactical;
     bool m_generate_simple_pp3wide;
+    bool m_generate_simple_localpair64;
+    bool m_generate_simple_ksg_localpair64;
+    bool m_generate_simple_gs_localpair64;
+    bool m_generate_simple_gs_localpair32_d1;
     std::deque<StorageT*> m_batches;
     std::mutex m_batch_mutex;
     std::mutex m_stream_mutex;
@@ -1126,6 +1492,98 @@ extern "C" {
             return new SparseBatch(
                 FeatureSet<HalfKA_HM2_NoDG>{}, entries, false, false, true);
         fprintf(stderr, "PP3Wide requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT SparseBatch* get_sparse_batch_from_fens_localpair64(
+        const char* feature_set_c, int num_fens, const char* const* fens,
+        int* scores, int* plies, int* results)
+    {
+        EnsureInitialize();
+        std::vector<TrainingDataEntry> entries;
+        entries.reserve(num_fens);
+        for (int i = 0; i < num_fens; ++i) {
+            auto& e = entries.emplace_back();
+            e.pos->set(fens[i], &e.stateInfo, Threads.main());
+            e.move = MOVE_NONE;
+            e.score = scores[i];
+            e.ply = plies[i];
+            e.result = results[i];
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM2_NoDG>{}, entries,
+                false, false, false, true);
+        fprintf(stderr, "LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT SparseBatch* get_sparse_batch_from_fens_ksg_localpair64(
+        const char* feature_set_c, int num_fens, const char* const* fens,
+        int* scores, int* plies, int* results)
+    {
+        EnsureInitialize();
+        std::vector<TrainingDataEntry> entries;
+        entries.reserve(num_fens);
+        for (int i = 0; i < num_fens; ++i) {
+            auto& e = entries.emplace_back();
+            e.pos->set(fens[i], &e.stateInfo, Threads.main());
+            e.move = MOVE_NONE;
+            e.score = scores[i];
+            e.ply = plies[i];
+            e.result = results[i];
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM2_NoDG>{}, entries,
+                false, false, false, false, true);
+        fprintf(stderr, "KSG LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT SparseBatch* get_sparse_batch_from_fens_gs_localpair64(
+        const char* feature_set_c, int num_fens, const char* const* fens,
+        int* scores, int* plies, int* results)
+    {
+        EnsureInitialize();
+        std::vector<TrainingDataEntry> entries;
+        entries.reserve(num_fens);
+        for (int i = 0; i < num_fens; ++i) {
+            auto& e = entries.emplace_back();
+            e.pos->set(fens[i], &e.stateInfo, Threads.main());
+            e.move = MOVE_NONE;
+            e.score = scores[i];
+            e.ply = plies[i];
+            e.result = results[i];
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM2_NoDG>{}, entries,
+                false, false, false, false, false, true);
+        fprintf(stderr, "GS LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT SparseBatch* get_sparse_batch_from_fens_gs_localpair32_d1(
+        const char* feature_set_c, int num_fens, const char* const* fens,
+        int* scores, int* plies, int* results)
+    {
+        EnsureInitialize();
+        std::vector<TrainingDataEntry> entries;
+        entries.reserve(num_fens);
+        for (int i = 0; i < num_fens; ++i) {
+            auto& e = entries.emplace_back();
+            e.pos->set(fens[i], &e.stateInfo, Threads.main());
+            e.move = MOVE_NONE;
+            e.score = scores[i];
+            e.ply = plies[i];
+            e.result = results[i];
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new SparseBatch(
+                FeatureSet<HalfKA_HM2_NoDG>{}, entries,
+                false, false, false, false, false, false, true);
+        fprintf(stderr, "GS LocalPair32 D1 requires HalfKA_HM2_NoDG\n");
         return nullptr;
     }
 
@@ -1445,6 +1903,223 @@ extern "C" {
                 train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
                 ranking_target3_filename, false, false, true);
         fprintf(stderr, "PP3Wide requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_localpair64(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [
+                random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && (e.isCapturingMove() || e.isInCheck()));
+            };
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, false, false, true);
+        fprintf(stderr, "LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_localpair64(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, false, false, true);
+        fprintf(stderr, "LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_ksg_localpair64(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [
+                random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && (e.isCapturingMove() || e.isInCheck()));
+            };
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, false, false, false, true);
+        fprintf(stderr, "KSG LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_ksg_localpair64(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, false, false, false, true);
+        fprintf(stderr, "KSG LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_gs_localpair64(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && (e.isCapturingMove() || e.isInCheck()));
+            };
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, false, false, false, false, true);
+        fprintf(stderr, "GS LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair64(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, false, false, false, false,
+                true);
+        fprintf(stderr, "GS LocalPair64 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL create_sparse_batch_stream_gs_localpair32_d1(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        std::function<bool(const TrainingDataEntry&)> skipPredicate = nullptr;
+        if (filtered || random_fen_skipping) {
+            skipPredicate = [random_fen_skipping,
+                prob = double(random_fen_skipping) / (random_fen_skipping + 1),
+                filtered](const TrainingDataEntry& e) {
+                auto do_skip = [&]() {
+                    std::bernoulli_distribution distrib(prob);
+                    auto& prng = rng::get_thread_local_rng();
+                    return distrib(prng);
+                };
+                return (random_fen_skipping && do_skip())
+                    || (filtered && (e.isCapturingMove() || e.isInCheck()));
+            };
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic,
+                skipPredicate, nullptr, false, false, false, false, false,
+                false, true);
+        fprintf(stderr, "GS LocalPair32 D1 requires HalfKA_HM2_NoDG\n");
+        return nullptr;
+    }
+
+    EXPORT Stream<SparseBatch>* CDECL
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1(
+        const char* feature_set_c, int concurrency, const char* filename1,
+        const char* filename2, const char* filename3,
+        const char* ranking_target3_filename, float train1_rate,
+        float train2_rate, float skiprate, float mirror, int batch_size,
+        int cyclic, int filtered, int random_fen_skipping)
+    {
+        EnsureInitialize();
+        if (filtered || random_fen_skipping) {
+            fprintf(stderr,
+                "ranking-target3 stream requires filtering and random skipping disabled\n");
+            return nullptr;
+        }
+        if (std::string_view(feature_set_c) == "HalfKA_HM2_NoDG")
+            return new FeaturedBatchStream<FeatureSet<HalfKA_HM2_NoDG>, SparseBatch>(
+                concurrency, filename1, filename2, filename3, train1_rate,
+                train2_rate, skiprate, mirror, batch_size, cyclic, nullptr,
+                ranking_target3_filename, false, false, false, false, false,
+                false, true);
+        fprintf(stderr, "GS LocalPair32 D1 requires HalfKA_HM2_NoDG\n");
         return nullptr;
     }
 

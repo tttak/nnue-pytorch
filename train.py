@@ -17,6 +17,11 @@ from simple_halfka_hm2_model import (
 from simple_pp3wide import (
     PP3WIDE_INIT_MODES, PP3WIDE_TYPE, PP3WIDE64_TYPE,
 )
+from simple_local_pair64 import LOCALPAIR64_TYPE
+from simple_ksg_local_pair64 import KSG_LOCALPAIR64_TYPE
+from simple_gs_local_pair64 import GS_LOCALPAIR64_TYPE
+from simple_gs_local_pair32 import GS_LOCALPAIR32_TYPE
+from simple_gs_local_pair32_d1 import GS_LOCALPAIR32_D1_TYPE
 from optimizer_presets import available_optimizer_presets
 from optimizer_layouts import (
     PARAMETER_SUBGROUPS,
@@ -518,14 +523,14 @@ class TextLogPrintTee:
       self._stream.close()
       self._closed = True
 
-def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False):
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
   train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename1, train_filename2, train_filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_pp3wide=simple_pp3wide)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_pp3wide=simple_pp3wide)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -681,6 +686,15 @@ def main():
   parser.add_argument(
       "--simple-pp3wide64-seed", type=int, default=121,
       help="Independent deterministic PP64 initialization seed.")
+  parser.add_argument(
+      "--simple-localpair64-table-nonzero-rate", type=float, default=0.05,
+      help="LocalPair64 table +/-16 q127 initialization density.")
+  parser.add_argument(
+      "--simple-localpair64-proj-nonzero-rate", type=float, default=0.05,
+      help="LocalPair64 projection +/-1 q64 initialization density.")
+  parser.add_argument(
+      "--simple-localpair64-seed", type=int, default=122,
+      help="Independent deterministic LocalPair64 initialization seed.")
   parser.add_argument(
       "--simple-validation-cohort-report", action="store_true",
       help=("Print natural-validation bucket/ply/|material| probability and "
@@ -968,6 +982,12 @@ def main():
   if not 0.0 <= args.simple_pp3wide64_proj_nonzero_rate <= 1.0:
     raise ValueError(
         "--simple-pp3wide64-proj-nonzero-rate must be in [0,1]")
+  if not 0.0 <= args.simple_localpair64_table_nonzero_rate <= 1.0:
+    raise ValueError(
+        "--simple-localpair64-table-nonzero-rate must be in [0,1]")
+  if not 0.0 <= args.simple_localpair64_proj_nonzero_rate <= 1.0:
+    raise ValueError(
+        "--simple-localpair64-proj-nonzero-rate must be in [0,1]")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
   if simple_architecture:
     print(f"Simple QAT training mode: {simple_qat_mode}")
@@ -1055,7 +1075,12 @@ def main():
           args.simple_pp3wide64_table_nonzero_rate),
       simple_pp3wide64_proj_nonzero_rate=(
           args.simple_pp3wide64_proj_nonzero_rate),
-      simple_pp3wide64_seed=args.simple_pp3wide64_seed)
+      simple_pp3wide64_seed=args.simple_pp3wide64_seed,
+      simple_localpair64_table_nonzero_rate=(
+          args.simple_localpair64_table_nonzero_rate),
+      simple_localpair64_proj_nonzero_rate=(
+          args.simple_localpair64_proj_nonzero_rate),
+      simple_localpair64_seed=args.simple_localpair64_seed)
     if simple_architecture:
       # Kept outside the complex constructor surface: this is training-only
       # and never changes the inference architecture/hash.
@@ -1135,8 +1160,61 @@ def main():
               "simple_pp3wide64_proj_nonzero_rate": (
                   args.simple_pp3wide64_proj_nonzero_rate),
               "simple_pp3wide64_seed": args.simple_pp3wide64_seed,
+              "simple_localpair64_table_nonzero_rate": (
+                  args.simple_localpair64_table_nonzero_rate),
+              "simple_localpair64_proj_nonzero_rate": (
+                  args.simple_localpair64_proj_nonzero_rate),
+              "simple_localpair64_seed": args.simple_localpair64_seed,
           }
+          # Initialization controls apply only when attaching a new branch.
+          # A complete .pt with the same branch already contains learned
+          # tensors, so retain its provenance metadata instead of replacing
+          # it with argparse defaults during a weight-only continuation.
+          saved_local_pair = architecture.get(
+              "simple_local_pair_feature", "off")
+          simple_pair_migration = (
+              saved_local_pair != args.simple_local_pair_feature)
+          if (saved_local_pair == args.simple_local_pair_feature
+              and saved_local_pair != "off"):
+              architecture_kwargs["simple_pp3wide_init"] = architecture.get(
+                  "simple_pp3wide_init", "zero")
+              if saved_local_pair == PP3WIDE_TYPE:
+                  architecture_kwargs.update({
+                      "simple_pp3wide_nonzero_rate": architecture.get(
+                          "simple_pp3wide_nonzero_rate",
+                          args.simple_pp3wide_nonzero_rate),
+                      "simple_pp3wide_seed": architecture.get(
+                          "simple_pp3wide_seed", args.simple_pp3wide_seed),
+                  })
+              elif saved_local_pair == PP3WIDE64_TYPE:
+                  architecture_kwargs.update({
+                      "simple_pp3wide64_table_nonzero_rate": architecture.get(
+                          "simple_pp3wide64_table_nonzero_rate",
+                          args.simple_pp3wide64_table_nonzero_rate),
+                      "simple_pp3wide64_proj_nonzero_rate": architecture.get(
+                          "simple_pp3wide64_proj_nonzero_rate",
+                          args.simple_pp3wide64_proj_nonzero_rate),
+                      "simple_pp3wide64_seed": architecture.get(
+                          "simple_pp3wide64_seed",
+                          args.simple_pp3wide64_seed),
+                  })
+              elif saved_local_pair in (
+                      LOCALPAIR64_TYPE, KSG_LOCALPAIR64_TYPE,
+                      GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE,
+                      GS_LOCALPAIR32_D1_TYPE):
+                  architecture_kwargs.update({
+                      "simple_localpair64_table_nonzero_rate": architecture.get(
+                          "simple_localpair64_table_nonzero_rate",
+                          args.simple_localpair64_table_nonzero_rate),
+                      "simple_localpair64_proj_nonzero_rate": architecture.get(
+                          "simple_localpair64_proj_nonzero_rate",
+                          args.simple_localpair64_proj_nonzero_rate),
+                      "simple_localpair64_seed": architecture.get(
+                          "simple_localpair64_seed",
+                          args.simple_localpair64_seed),
+                  })
       else:
+          simple_pair_migration = False
           architecture_kwargs = M.nnue_architecture_kwargs(architecture)
       if not simple_architecture and requested_side_input is not None:
           architecture_kwargs.update({
@@ -1212,11 +1290,17 @@ def main():
       # checkpoint_dict を使って、形状が一致するものだけを抽出
       pretrained_dict = {
           k: v for k, v in checkpoint_dict.items() 
-          if k in model_dict and v.shape == model_dict[k].shape
+          if (k in model_dict and v.shape == model_dict[k].shape
+              and not (simple_pair_migration and k.startswith("pp3wide.")))
       }
 
       # 形状が合わないもの（Factorized化で入力数が増えた場合など）をログに出す
       for k in checkpoint_dict.keys():
+          if simple_pair_migration and k.startswith("pp3wide."):
+              print(
+                  f"Skipping parameter {k}: Simple local-pair migration "
+                  "keeps the newly initialized target branch")
+              continue
           if k in model_dict and checkpoint_dict[k].shape != model_dict[k].shape:
               print(f"Skipping parameter {k} due to shape mismatch: {checkpoint_dict[k].shape} vs {model_dict[k].shape}")
           elif k not in model_dict:
@@ -1305,6 +1389,12 @@ def main():
             args.simple_pp3wide64_proj_nonzero_rate)
         resume_overrides["simple_pp3wide64_seed"] = (
             args.simple_pp3wide64_seed)
+        resume_overrides["simple_localpair64_table_nonzero_rate"] = (
+            args.simple_localpair64_table_nonzero_rate)
+        resume_overrides["simple_localpair64_proj_nonzero_rate"] = (
+            args.simple_localpair64_proj_nonzero_rate)
+        resume_overrides["simple_localpair64_seed"] = (
+            args.simple_localpair64_seed)
         if args.resume_training_state:
           source_checkpoint = torch.load(
               args.resume_from_model, map_location="cpu", weights_only=False)
@@ -1614,7 +1704,8 @@ def main():
     train, val = data_loader_py(args.train1, args.val, feature_set, batch_size, main_device)
   else:
     print('Using c++ data loader')
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), getattr(nnue, "simple_local_pair_feature", "off") in (PP3WIDE_TYPE, PP3WIDE64_TYPE))
+    local_pair_type = getattr(nnue, "simple_local_pair_feature", "off")
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), local_pair_type in (PP3WIDE_TYPE, PP3WIDE64_TYPE), local_pair_type == LOCALPAIR64_TYPE, local_pair_type == KSG_LOCALPAIR64_TYPE, local_pair_type in (GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE), local_pair_type == GS_LOCALPAIR32_D1_TYPE)
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()

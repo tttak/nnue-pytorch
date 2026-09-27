@@ -18,6 +18,23 @@ from simple_pp3wide import (
     PP3WIDE_FEATURES, PP3WIDE_QUANT_SCALE, PP3WIDE_TYPE,
     PP3WIDE64_TYPE, PP3WIDE64_WIDTH,
 )
+from simple_local_pair64 import (
+    LOCALPAIR64_FEATURES, LOCALPAIR64_TYPE, LOCALPAIR64_WIDTH,
+)
+from simple_ksg_local_pair64 import (
+    KSG_LOCALPAIR64_FEATURES, KSG_LOCALPAIR64_TYPE,
+    KSG_LOCALPAIR64_WIDTH,
+)
+from simple_gs_local_pair64 import (
+    GS_LOCALPAIR64_FEATURES, GS_LOCALPAIR64_TYPE, GS_LOCALPAIR64_WIDTH,
+)
+from simple_gs_local_pair32 import (
+    GS_LOCALPAIR32_FEATURES, GS_LOCALPAIR32_TYPE, GS_LOCALPAIR32_WIDTH,
+)
+from simple_gs_local_pair32_d1 import (
+    GS_LOCALPAIR32_D1_FEATURES, GS_LOCALPAIR32_D1_TYPE,
+    GS_LOCALPAIR32_D1_WIDTH,
+)
 
 
 VERSION = 0x7AF32F16
@@ -43,6 +60,47 @@ DESCRIPTION_PP3WIDE64 = (
     "Features=HalfKA_hm2_NoDG(Friend)+PP3WidePL64"
     "[73305->1536x2;15552->64x2->EWM64->Proj16],"
     "Network=SFNN-1536-HalfKAHM2-NoDG-PP3WPL64-v4{LayerStack=9}"
+)
+FT_HASH_LOCALPAIR64 = FT_HASH ^ 0x4C503634
+NETWORK_HASH_LOCALPAIR64 = NETWORK_HASH ^ 0x4C503634
+DESCRIPTION_LOCALPAIR64 = (
+    "ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2_NoDG(Friend)+LocalPair64-L4"
+    "[73305->1536x2;184320->64x2->EWM64->Proj16],"
+    "Network=SFNN-1536-HalfKAHM2-NoDG-LocalPair64-v1{LayerStack=9}"
+)
+FT_HASH_KSG_LOCALPAIR64 = FT_HASH ^ 0x4B534732
+NETWORK_HASH_KSG_LOCALPAIR64 = NETWORK_HASH ^ 0x4B534732
+DESCRIPTION_KSG_LOCALPAIR64 = (
+    "ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2_NoDG(Friend)+KSGLocalPair64-R2"
+    "[73305->1536x2;25920->64x2->EWM64->Proj16],"
+    "Network=SFNN-1536-HalfKAHM2-NoDG-KSGLocalPair64-v1{LayerStack=9}"
+)
+FT_HASH_GS_LOCALPAIR64 = FT_HASH ^ 0x47535235
+NETWORK_HASH_GS_LOCALPAIR64 = NETWORK_HASH ^ 0x47535235
+DESCRIPTION_GS_LOCALPAIR64 = (
+    "ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2_NoDG(Friend)+GSLocalPair64-R5"
+    "[73305->1536x2;11520->64x2->EWM64->Proj16],"
+    "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair64-R5-v1{LayerStack=9}"
+)
+FT_HASH_GS_LOCALPAIR32 = FT_HASH ^ 0x47533332
+NETWORK_HASH_GS_LOCALPAIR32 = NETWORK_HASH ^ 0x47533332
+DESCRIPTION_GS_LOCALPAIR32 = (
+    "ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2_NoDG(Friend)+GSLocalPair32-R5"
+    "[73305->1536x2;11520->32x2->EWM32->Proj16],"
+    "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-v1{LayerStack=9}"
+)
+FT_HASH_GS_LOCALPAIR32_D1 = FT_HASH ^ 0x47334431
+NETWORK_HASH_GS_LOCALPAIR32_D1 = NETWORK_HASH ^ 0x47334431
+DESCRIPTION_GS_LOCALPAIR32_D1 = (
+    "ModelType=SFNNWithoutPsqt;"
+    "Features=HalfKA_hm2_NoDG(Friend)+GSLocalPair32-R5-D1"
+    "[73305->1536x2;4352->32x2->EWM32->Proj16],"
+    "Network=SFNN-1536-HalfKAHM2-NoDG-GSLocalPair32-R5-D1-v1"
+    "{LayerStack=9}"
 )
 Q_ONE = 127.0
 HIDDEN_WEIGHT_SCALE = 64.0
@@ -96,13 +154,28 @@ def serialize_model(model, output, ft_compression="none"):
     pp_type = getattr(model, "simple_local_pair_feature", "off")
     pp_enabled = pp_type == PP3WIDE_TYPE
     pp64_enabled = pp_type == PP3WIDE64_TYPE
+    local64_enabled = pp_type == LOCALPAIR64_TYPE
+    ksg64_enabled = pp_type == KSG_LOCALPAIR64_TYPE
+    gs64_enabled = pp_type == GS_LOCALPAIR64_TYPE
+    gs32_enabled = pp_type == GS_LOCALPAIR32_TYPE
+    gs32_d1_enabled = pp_type == GS_LOCALPAIR32_D1_TYPE
     _u32(buf, VERSION)
     _u32(buf, OUTER_HASH)
-    desc = (DESCRIPTION_PP3WIDE64 if pp64_enabled
+    desc = (DESCRIPTION_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+            else DESCRIPTION_GS_LOCALPAIR32 if gs32_enabled
+            else DESCRIPTION_GS_LOCALPAIR64 if gs64_enabled
+            else DESCRIPTION_KSG_LOCALPAIR64 if ksg64_enabled
+            else DESCRIPTION_LOCALPAIR64 if local64_enabled
+            else DESCRIPTION_PP3WIDE64 if pp64_enabled
             else DESCRIPTION_PP3WIDE if pp_enabled else DESCRIPTION).encode("utf-8")
     _u32(buf, len(desc))
     buf.extend(desc)
-    _u32(buf, FT_HASH_PP3WIDE64 if pp64_enabled
+    _u32(buf, FT_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+         else FT_HASH_GS_LOCALPAIR32 if gs32_enabled
+         else FT_HASH_GS_LOCALPAIR64 if gs64_enabled
+         else FT_HASH_KSG_LOCALPAIR64 if ksg64_enabled
+         else FT_HASH_LOCALPAIR64 if local64_enabled
+         else FT_HASH_PP3WIDE64 if pp64_enabled
          else FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
     _write_tensor(
         buf, model.input.bias.mul(Q_ONE).round().to(torch.int16),
@@ -114,19 +187,24 @@ def serialize_model(model, output, ft_compression="none"):
     _write_tensor(
         buf, effective_ft_weight.mul(Q_ONE).round().to(torch.int16),
         ft_compression)
-    if pp_enabled or pp64_enabled:
+    if pp_enabled or pp64_enabled or local64_enabled or ksg64_enabled or gs64_enabled or gs32_enabled or gs32_d1_enabled:
         if model.pp3wide is None:
             raise ValueError("PP3Wide architecture is missing its component")
         pp = model.pp3wide.weight.detach().mul(PP3WIDE_QUANT_SCALE) \
             .round().clamp(-127, 127).to(torch.int8).cpu().numpy()
         buf.extend(pp.tobytes())
-        if pp64_enabled:
+        if pp64_enabled or local64_enabled or ksg64_enabled or gs64_enabled or gs32_enabled or gs32_d1_enabled:
             projection = model.pp3wide.projection.weight.detach() \
                 .mul(HIDDEN_WEIGHT_SCALE).round().clamp(-127, 127) \
                 .to(torch.int8).cpu().numpy()
             buf.extend(projection.tobytes())
     for stack in model.layer_stacks:
-        _u32(buf, NETWORK_HASH_PP3WIDE64 if pp64_enabled
+        _u32(buf, NETWORK_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+             else NETWORK_HASH_GS_LOCALPAIR32 if gs32_enabled
+             else NETWORK_HASH_GS_LOCALPAIR64 if gs64_enabled
+             else NETWORK_HASH_KSG_LOCALPAIR64 if ksg64_enabled
+             else NETWORK_HASH_LOCALPAIR64 if local64_enabled
+             else NETWORK_HASH_PP3WIDE64 if pp64_enabled
              else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
         _write_fc(buf, stack.fc0)
         _write_fc(buf, stack.fc1)
@@ -212,13 +290,26 @@ def deserialize_model(source, feature_set):
         description_size = _read_u32(stream)
         description = stream.read(description_size).decode("utf-8")
         if description not in (
-                DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64):
+                DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64,
+                DESCRIPTION_LOCALPAIR64, DESCRIPTION_KSG_LOCALPAIR64,
+                DESCRIPTION_GS_LOCALPAIR64, DESCRIPTION_GS_LOCALPAIR32,
+                DESCRIPTION_GS_LOCALPAIR32_D1):
             raise ValueError(
                 "HalfKA_HM2 simple architecture description mismatch: "
                 f"{description!r}")
         pp_enabled = description == DESCRIPTION_PP3WIDE
         pp64_enabled = description == DESCRIPTION_PP3WIDE64
-        expected_ft_hash = (FT_HASH_PP3WIDE64 if pp64_enabled
+        local64_enabled = description == DESCRIPTION_LOCALPAIR64
+        ksg64_enabled = description == DESCRIPTION_KSG_LOCALPAIR64
+        gs64_enabled = description == DESCRIPTION_GS_LOCALPAIR64
+        gs32_enabled = description == DESCRIPTION_GS_LOCALPAIR32
+        gs32_d1_enabled = description == DESCRIPTION_GS_LOCALPAIR32_D1
+        expected_ft_hash = (FT_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+                            else FT_HASH_GS_LOCALPAIR32 if gs32_enabled
+                            else FT_HASH_GS_LOCALPAIR64 if gs64_enabled
+                            else FT_HASH_KSG_LOCALPAIR64 if ksg64_enabled
+                            else FT_HASH_LOCALPAIR64 if local64_enabled
+                            else FT_HASH_PP3WIDE64 if pp64_enabled
                             else FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
         if _read_u32(stream) != expected_ft_hash:
             raise ValueError("HalfKA_HM2 simple FT hash mismatch")
@@ -226,28 +317,53 @@ def deserialize_model(source, feature_set):
         model = SimpleHalfKAHM2NNUE(
             feature_set=feature_set,
             simple_local_pair_feature=(
-                PP3WIDE64_TYPE if pp64_enabled
+                GS_LOCALPAIR32_D1_TYPE if gs32_d1_enabled
+                else GS_LOCALPAIR32_TYPE if gs32_enabled
+                else GS_LOCALPAIR64_TYPE if gs64_enabled
+                else KSG_LOCALPAIR64_TYPE if ksg64_enabled
+                else LOCALPAIR64_TYPE if local64_enabled
+                else PP3WIDE64_TYPE if pp64_enabled
                 else PP3WIDE_TYPE if pp_enabled else "off"))
         bias = _read_ft_tensor(stream, FT_WIDTH)
         weight = _read_ft_tensor(stream, FT_INPUTS * FT_WIDTH)
         _copy_parameter(model.input.bias, bias, Q_ONE)
         _copy_parameter(model.input.weight, weight, Q_ONE)
-        if pp_enabled or pp64_enabled:
+        if pp_enabled or pp64_enabled or local64_enabled or ksg64_enabled or gs64_enabled or gs32_enabled or gs32_d1_enabled:
+            feature_count = (
+                GS_LOCALPAIR32_D1_FEATURES if gs32_d1_enabled
+                else GS_LOCALPAIR32_FEATURES if gs32_enabled
+                else GS_LOCALPAIR64_FEATURES if gs64_enabled
+                else KSG_LOCALPAIR64_FEATURES if ksg64_enabled
+                else LOCALPAIR64_FEATURES if local64_enabled
+                else PP3WIDE_FEATURES)
             pp = _read_array(
                 stream, np.int8,
-                PP3WIDE_FEATURES * (
-                    PP3WIDE64_WIDTH if pp64_enabled else FT_WIDTH))
+                feature_count * (
+                    GS_LOCALPAIR32_D1_WIDTH if gs32_d1_enabled
+                    else GS_LOCALPAIR32_WIDTH if gs32_enabled
+                    else GS_LOCALPAIR64_WIDTH if gs64_enabled
+                    else KSG_LOCALPAIR64_WIDTH if ksg64_enabled
+                    else LOCALPAIR64_WIDTH if local64_enabled
+                    else PP3WIDE64_WIDTH if pp64_enabled else FT_WIDTH))
             _copy_parameter(model.pp3wide.weight, pp, PP3WIDE_QUANT_SCALE)
-            if pp64_enabled:
+            if pp64_enabled or local64_enabled or ksg64_enabled or gs64_enabled or gs32_enabled or gs32_d1_enabled:
                 projection = _read_array(
-                    stream, np.int8, 16 * PP3WIDE64_WIDTH)
+                    stream, np.int8, 16 * (
+                        GS_LOCALPAIR32_D1_WIDTH if gs32_d1_enabled
+                        else GS_LOCALPAIR32_WIDTH if gs32_enabled
+                        else PP3WIDE64_WIDTH))
                 _copy_parameter(
                     model.pp3wide.projection.weight, projection,
                     HIDDEN_WEIGHT_SCALE)
 
         for stack in model.layer_stacks:
             expected_network_hash = (
-                NETWORK_HASH_PP3WIDE64 if pp64_enabled
+                NETWORK_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+                else NETWORK_HASH_GS_LOCALPAIR32 if gs32_enabled
+                else NETWORK_HASH_GS_LOCALPAIR64 if gs64_enabled
+                else NETWORK_HASH_KSG_LOCALPAIR64 if ksg64_enabled
+                else NETWORK_HASH_LOCALPAIR64 if local64_enabled
+                else NETWORK_HASH_PP3WIDE64 if pp64_enabled
                 else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
             if _read_u32(stream) != expected_network_hash:
                 raise ValueError("HalfKA_HM2 simple network hash mismatch")
@@ -266,11 +382,25 @@ def validate_roundtrip(blob, ft_compression="none"):
     assert _read_u32(stream) == OUTER_HASH
     n = _read_u32(stream)
     description = stream.read(n).decode("utf-8")
-    assert description in (DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64)
+    assert description in (
+        DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64,
+        DESCRIPTION_LOCALPAIR64, DESCRIPTION_KSG_LOCALPAIR64,
+        DESCRIPTION_GS_LOCALPAIR64, DESCRIPTION_GS_LOCALPAIR32,
+        DESCRIPTION_GS_LOCALPAIR32_D1)
     pp_enabled = description == DESCRIPTION_PP3WIDE
     pp64_enabled = description == DESCRIPTION_PP3WIDE64
+    local64_enabled = description == DESCRIPTION_LOCALPAIR64
+    ksg64_enabled = description == DESCRIPTION_KSG_LOCALPAIR64
+    gs64_enabled = description == DESCRIPTION_GS_LOCALPAIR64
+    gs32_enabled = description == DESCRIPTION_GS_LOCALPAIR32
+    gs32_d1_enabled = description == DESCRIPTION_GS_LOCALPAIR32_D1
     assert _read_u32(stream) == (
-        FT_HASH_PP3WIDE64 if pp64_enabled
+        FT_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+        else FT_HASH_GS_LOCALPAIR32 if gs32_enabled
+        else FT_HASH_GS_LOCALPAIR64 if gs64_enabled
+        else FT_HASH_KSG_LOCALPAIR64 if ksg64_enabled
+        else FT_HASH_LOCALPAIR64 if local64_enabled
+        else FT_HASH_PP3WIDE64 if pp64_enabled
         else FT_HASH_PP3WIDE if pp_enabled else FT_HASH)
     if ft_compression == "none":
         ft_bytes = (FT_WIDTH + FT_INPUTS * FT_WIDTH) * 2
@@ -281,13 +411,27 @@ def validate_roundtrip(blob, ft_compression="none"):
         _read_leb(stream, FT_INPUTS * FT_WIDTH)
     else:
         raise ValueError(f"unsupported FT compression: {ft_compression}")
-    if pp_enabled or pp64_enabled:
-        pp_bytes = PP3WIDE_FEATURES * (
-            PP3WIDE64_WIDTH if pp64_enabled else FT_WIDTH)
+    if pp_enabled or pp64_enabled or local64_enabled or ksg64_enabled or gs64_enabled or gs32_enabled or gs32_d1_enabled:
+        pp_bytes = (
+            GS_LOCALPAIR32_D1_FEATURES if gs32_d1_enabled
+            else GS_LOCALPAIR32_FEATURES if gs32_enabled
+            else GS_LOCALPAIR64_FEATURES if gs64_enabled
+            else KSG_LOCALPAIR64_FEATURES if ksg64_enabled
+            else LOCALPAIR64_FEATURES if local64_enabled
+            else PP3WIDE_FEATURES) * (
+            GS_LOCALPAIR32_D1_WIDTH if gs32_d1_enabled
+            else GS_LOCALPAIR32_WIDTH if gs32_enabled
+            else GS_LOCALPAIR64_WIDTH if gs64_enabled
+            else KSG_LOCALPAIR64_WIDTH if ksg64_enabled
+            else LOCALPAIR64_WIDTH if local64_enabled
+            else PP3WIDE64_WIDTH if pp64_enabled else FT_WIDTH)
         if len(stream.read(pp_bytes)) != pp_bytes:
             raise EOFError
-        if pp64_enabled and len(stream.read(16 * PP3WIDE64_WIDTH)) \
-                != 16 * PP3WIDE64_WIDTH:
+        projection_width = (GS_LOCALPAIR32_D1_WIDTH if gs32_d1_enabled
+                            else GS_LOCALPAIR32_WIDTH if gs32_enabled
+                            else PP3WIDE64_WIDTH)
+        if (pp64_enabled or local64_enabled or ksg64_enabled or gs64_enabled or gs32_enabled or gs32_d1_enabled) and len(stream.read(16 * projection_width)) \
+                != 16 * projection_width:
             raise EOFError
     # Validate exact tensor order/size for all nine stacks.
     fc_sizes = (
@@ -297,7 +441,12 @@ def validate_roundtrip(blob, ft_compression="none"):
     )
     for _ in range(LAYER_STACKS):
         assert _read_u32(stream) == (
-            NETWORK_HASH_PP3WIDE64 if pp64_enabled
+            NETWORK_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+            else NETWORK_HASH_GS_LOCALPAIR32 if gs32_enabled
+            else NETWORK_HASH_GS_LOCALPAIR64 if gs64_enabled
+            else NETWORK_HASH_KSG_LOCALPAIR64 if ksg64_enabled
+            else NETWORK_HASH_LOCALPAIR64 if local64_enabled
+            else NETWORK_HASH_PP3WIDE64 if pp64_enabled
             else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
         for size in fc_sizes:
             if len(stream.read(size)) != size:
@@ -348,7 +497,13 @@ def main():
         print(f"wrote {output}: {len(blob):,} bytes")
         print(f"FT compression: {args.ft_compression}")
         pp_type = getattr(model, "simple_local_pair_feature", "off")
-        print(DESCRIPTION_PP3WIDE64 if pp_type == PP3WIDE64_TYPE
+        print(DESCRIPTION_GS_LOCALPAIR32_D1
+              if pp_type == GS_LOCALPAIR32_D1_TYPE
+              else DESCRIPTION_GS_LOCALPAIR32 if pp_type == GS_LOCALPAIR32_TYPE
+              else DESCRIPTION_GS_LOCALPAIR64 if pp_type == GS_LOCALPAIR64_TYPE
+              else DESCRIPTION_KSG_LOCALPAIR64 if pp_type == KSG_LOCALPAIR64_TYPE
+              else DESCRIPTION_LOCALPAIR64 if pp_type == LOCALPAIR64_TYPE
+              else DESCRIPTION_PP3WIDE64 if pp_type == PP3WIDE64_TYPE
               else DESCRIPTION_PP3WIDE if pp_type == PP3WIDE_TYPE
               else DESCRIPTION)
     else:

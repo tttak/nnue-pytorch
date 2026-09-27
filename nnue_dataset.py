@@ -65,7 +65,10 @@ class SparseBatch(ctypes.Structure):
 
     def get_tensors(self, device, include_ranking_target=False,
                     side_input="none", pair_relation_side_input=False,
-                    simple_pp3wide=False):
+                    simple_pp3wide=False, simple_localpair64=False,
+                    simple_ksg_localpair64=False,
+                    simple_gs_localpair64=False,
+                    simple_gs_localpair32_d1=False):
         white_values = torch.from_numpy(np.ctypeslib.as_array(self.white_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         black_values = torch.from_numpy(np.ctypeslib.as_array(self.black_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         white_indices = torch.from_numpy(np.ctypeslib.as_array(self.white, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
@@ -134,7 +137,9 @@ class SparseBatch(ctypes.Structure):
             pair_batch_indices = torch.from_numpy(batch_np).long().pin_memory().to(
                 device=device, non_blocking=True)
             result += (pair_indices, pair_batch_indices)
-        if simple_pp3wide:
+        if (simple_pp3wide or simple_localpair64
+                or simple_ksg_localpair64 or simple_gs_localpair64
+                or simple_gs_localpair32_d1):
             accessors = (
                 (get_sparse_batch_pp3wide_white_count,
                  get_sparse_batch_pp3wide_white_indices,
@@ -191,7 +196,9 @@ class TrainingDataProvider:
         random_fen_skipping=0,
         device='cpu',
         ranking_target3=None, side_input="none",
-        pair_relation_side_input=False, simple_pp3wide=False):
+        pair_relation_side_input=False, simple_pp3wide=False,
+        simple_localpair64=False, simple_ksg_localpair64=False,
+        simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
 
         self.feature_set = feature_set.encode('utf-8')
         self.create_stream = create_stream
@@ -215,10 +222,22 @@ class TrainingDataProvider:
         self.side_input = side_input
         self.pair_relation_side_input = bool(pair_relation_side_input)
         self.simple_pp3wide = bool(simple_pp3wide)
+        self.simple_localpair64 = bool(simple_localpair64)
+        self.simple_ksg_localpair64 = bool(simple_ksg_localpair64)
+        self.simple_gs_localpair64 = bool(simple_gs_localpair64)
+        self.simple_gs_localpair32_d1 = bool(simple_gs_localpair32_d1)
 
         if batch_size:
             if ranking_target3:
-                if self.simple_pp3wide:
+                if self.simple_gs_localpair32_d1:
+                    create = create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1
+                elif self.simple_gs_localpair64:
+                    create = create_sparse_batch_stream_with_ranking_target3_gs_localpair64
+                elif self.simple_ksg_localpair64:
+                    create = create_sparse_batch_stream_with_ranking_target3_ksg_localpair64
+                elif self.simple_localpair64:
+                    create = create_sparse_batch_stream_with_ranking_target3_localpair64
+                elif self.simple_pp3wide:
                     create = create_sparse_batch_stream_with_ranking_target3_pp3wide
                 elif self.pair_relation_side_input:
                     create = create_sparse_batch_stream_with_ranking_target3_pair_relation
@@ -237,7 +256,15 @@ class TrainingDataProvider:
                     skiprate, mirror, batch_size, cyclic, filtered,
                     random_fen_skipping)
             else:
-                if self.simple_pp3wide:
+                if self.simple_gs_localpair32_d1:
+                    create = create_sparse_batch_stream_gs_localpair32_d1
+                elif self.simple_gs_localpair64:
+                    create = create_sparse_batch_stream_gs_localpair64
+                elif self.simple_ksg_localpair64:
+                    create = create_sparse_batch_stream_ksg_localpair64
+                elif self.simple_localpair64:
+                    create = create_sparse_batch_stream_localpair64
+                elif self.simple_pp3wide:
                     create = create_sparse_batch_stream_pp3wide
                 elif self.pair_relation_side_input:
                     create = create_sparse_batch_stream_pair_relation
@@ -264,7 +291,11 @@ class TrainingDataProvider:
                 self.device, include_ranking_target=bool(self.ranking_target3),
                 side_input=self.side_input,
                 pair_relation_side_input=self.pair_relation_side_input,
-                simple_pp3wide=self.simple_pp3wide)
+                simple_pp3wide=self.simple_pp3wide,
+                simple_localpair64=self.simple_localpair64,
+                simple_ksg_localpair64=self.simple_ksg_localpair64,
+                simple_gs_localpair64=self.simple_gs_localpair64,
+                simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
             self.destroy_part(v)
             return tensors
         else:
@@ -394,6 +425,70 @@ except AttributeError:
     get_sparse_batch_pp3wide_black_batch_indices = None
 
 try:
+    create_sparse_batch_stream_localpair64 = (
+        dll.create_sparse_batch_stream_localpair64)
+    create_sparse_batch_stream_localpair64.restype = ctypes.c_void_p
+    create_sparse_batch_stream_localpair64.argtypes = (
+        create_sparse_batch_stream.argtypes)
+    create_sparse_batch_stream_with_ranking_target3_localpair64 = (
+        dll.create_sparse_batch_stream_with_ranking_target3_localpair64)
+    create_sparse_batch_stream_with_ranking_target3_localpair64.restype = (
+        ctypes.c_void_p)
+    create_sparse_batch_stream_with_ranking_target3_localpair64.argtypes = (
+        create_sparse_batch_stream_with_ranking_target3.argtypes)
+except AttributeError:
+    create_sparse_batch_stream_localpair64 = None
+    create_sparse_batch_stream_with_ranking_target3_localpair64 = None
+
+try:
+    create_sparse_batch_stream_ksg_localpair64 = (
+        dll.create_sparse_batch_stream_ksg_localpair64)
+    create_sparse_batch_stream_ksg_localpair64.restype = ctypes.c_void_p
+    create_sparse_batch_stream_ksg_localpair64.argtypes = (
+        create_sparse_batch_stream.argtypes)
+    create_sparse_batch_stream_with_ranking_target3_ksg_localpair64 = (
+        dll.create_sparse_batch_stream_with_ranking_target3_ksg_localpair64)
+    create_sparse_batch_stream_with_ranking_target3_ksg_localpair64.restype = (
+        ctypes.c_void_p)
+    create_sparse_batch_stream_with_ranking_target3_ksg_localpair64.argtypes = (
+        create_sparse_batch_stream_with_ranking_target3.argtypes)
+except AttributeError:
+    create_sparse_batch_stream_ksg_localpair64 = None
+    create_sparse_batch_stream_with_ranking_target3_ksg_localpair64 = None
+
+try:
+    create_sparse_batch_stream_gs_localpair64 = (
+        dll.create_sparse_batch_stream_gs_localpair64)
+    create_sparse_batch_stream_gs_localpair64.restype = ctypes.c_void_p
+    create_sparse_batch_stream_gs_localpair64.argtypes = (
+        create_sparse_batch_stream.argtypes)
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair64 = (
+        dll.create_sparse_batch_stream_with_ranking_target3_gs_localpair64)
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair64.restype = (
+        ctypes.c_void_p)
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair64.argtypes = (
+        create_sparse_batch_stream_with_ranking_target3.argtypes)
+except AttributeError:
+    create_sparse_batch_stream_gs_localpair64 = None
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair64 = None
+
+try:
+    create_sparse_batch_stream_gs_localpair32_d1 = (
+        dll.create_sparse_batch_stream_gs_localpair32_d1)
+    create_sparse_batch_stream_gs_localpair32_d1.restype = ctypes.c_void_p
+    create_sparse_batch_stream_gs_localpair32_d1.argtypes = (
+        create_sparse_batch_stream.argtypes)
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1 = (
+        dll.create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1)
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1.restype = (
+        ctypes.c_void_p)
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1.argtypes = (
+        create_sparse_batch_stream_with_ranking_target3.argtypes)
+except AttributeError:
+    create_sparse_batch_stream_gs_localpair32_d1 = None
+    create_sparse_batch_stream_with_ranking_target3_gs_localpair32_d1 = None
+
+try:
     # Generic provenance ABI; unlike Pair Relation diagnostics this is useful
     # for every sparse-batch architecture.
     get_sparse_batch_source_sfen = dll.get_sparse_batch_source_sfen
@@ -424,10 +519,46 @@ try:
         get_sparse_batch_from_fens.argtypes)
 except AttributeError:
     get_sparse_batch_from_fens_pp3wide = None
+try:
+    get_sparse_batch_from_fens_localpair64 = (
+        dll.get_sparse_batch_from_fens_localpair64)
+    get_sparse_batch_from_fens_localpair64.restype = SparseBatchPtr
+    get_sparse_batch_from_fens_localpair64.argtypes = (
+        get_sparse_batch_from_fens.argtypes)
+except AttributeError:
+    get_sparse_batch_from_fens_localpair64 = None
+try:
+    get_sparse_batch_from_fens_ksg_localpair64 = (
+        dll.get_sparse_batch_from_fens_ksg_localpair64)
+    get_sparse_batch_from_fens_ksg_localpair64.restype = SparseBatchPtr
+    get_sparse_batch_from_fens_ksg_localpair64.argtypes = (
+        get_sparse_batch_from_fens.argtypes)
+except AttributeError:
+    get_sparse_batch_from_fens_ksg_localpair64 = None
+try:
+    get_sparse_batch_from_fens_gs_localpair64 = (
+        dll.get_sparse_batch_from_fens_gs_localpair64)
+    get_sparse_batch_from_fens_gs_localpair64.restype = SparseBatchPtr
+    get_sparse_batch_from_fens_gs_localpair64.argtypes = (
+        get_sparse_batch_from_fens.argtypes)
+except AttributeError:
+    get_sparse_batch_from_fens_gs_localpair64 = None
+try:
+    get_sparse_batch_from_fens_gs_localpair32_d1 = (
+        dll.get_sparse_batch_from_fens_gs_localpair32_d1)
+    get_sparse_batch_from_fens_gs_localpair32_d1.restype = SparseBatchPtr
+    get_sparse_batch_from_fens_gs_localpair32_d1.argtypes = (
+        get_sparse_batch_from_fens.argtypes)
+except AttributeError:
+    get_sparse_batch_from_fens_gs_localpair32_d1 = None
 
 def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results,
                                 pair_relation_side_input=False,
-                                simple_pp3wide=False):
+                                simple_pp3wide=False,
+                                simple_localpair64=False,
+                                simple_ksg_localpair64=False,
+                                simple_gs_localpair64=False,
+                                simple_gs_localpair32_d1=False):
     results_ = (ctypes.c_int*len(scores))()
     scores_ = (ctypes.c_int*len(plies))()
     plies_ = (ctypes.c_int*len(results))()
@@ -439,7 +570,14 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results,
         plies_[i] = v
     for i, v in enumerate(results):
         results_[i] = v
-    create = (get_sparse_batch_from_fens_pp3wide if simple_pp3wide else
+    create = (get_sparse_batch_from_fens_gs_localpair32_d1
+              if simple_gs_localpair32_d1 else
+              get_sparse_batch_from_fens_gs_localpair64
+              if simple_gs_localpair64 else
+              get_sparse_batch_from_fens_ksg_localpair64
+              if simple_ksg_localpair64 else
+              get_sparse_batch_from_fens_localpair64 if simple_localpair64 else
+              get_sparse_batch_from_fens_pp3wide if simple_pp3wide else
               get_sparse_batch_from_fens_pair_relation
               if pair_relation_side_input else get_sparse_batch_from_fens)
     if create is None:
@@ -448,7 +586,7 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results,
     return b
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False):
+    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
@@ -469,10 +607,11 @@ class SparseBatchProvider(TrainingDataProvider):
             random_fen_skipping,
             device,
             ranking_target3, side_input, pair_relation_side_input,
-            simple_pp3wide)
+            simple_pp3wide, simple_localpair64, simple_ksg_localpair64,
+            simple_gs_localpair64, simple_gs_localpair32_d1)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False):
+  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
     self.filename1 = filename1
@@ -492,9 +631,13 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.side_input = side_input
     self.pair_relation_side_input = bool(pair_relation_side_input)
     self.simple_pp3wide = bool(simple_pp3wide)
+    self.simple_localpair64 = bool(simple_localpair64)
+    self.simple_ksg_localpair64 = bool(simple_ksg_localpair64)
+    self.simple_gs_localpair64 = bool(simple_gs_localpair64)
+    self.simple_gs_localpair32_d1 = bool(simple_gs_localpair32_d1)
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input, simple_pp3wide=self.simple_pp3wide)
+    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input, simple_pp3wide=self.simple_pp3wide, simple_localpair64=self.simple_localpair64, simple_ksg_localpair64=self.simple_ksg_localpair64, simple_gs_localpair64=self.simple_gs_localpair64, simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):

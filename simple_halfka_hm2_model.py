@@ -23,6 +23,36 @@ from simple_pp3wide import (
     PP3WIDE64_TRANSFORMED, PP3WIDE64_TYPE, PP3WIDE64_WIDTH,
     PP3WIDE64_INIT_TABLE_QUANTUM,
 )
+from simple_local_pair64 import (
+    LOCALPAIR64_FEATURES, LOCALPAIR64_INIT_TABLE_QUANTUM,
+    LOCALPAIR64_MAPPING_VERSION, LOCALPAIR64_PROJECTION_OUTPUTS,
+    LOCALPAIR64_SCHEMA_VERSION, LOCALPAIR64_TRANSFORMED, LOCALPAIR64_TYPE,
+    LOCALPAIR64_WIDTH,
+)
+from simple_ksg_local_pair64 import (
+    KSG_LOCALPAIR64_FEATURES, KSG_LOCALPAIR64_INIT_TABLE_QUANTUM,
+    KSG_LOCALPAIR64_MAPPING_VERSION, KSG_LOCALPAIR64_PROJECTION_OUTPUTS,
+    KSG_LOCALPAIR64_SCHEMA_VERSION, KSG_LOCALPAIR64_TRANSFORMED,
+    KSG_LOCALPAIR64_TYPE, KSG_LOCALPAIR64_WIDTH,
+)
+from simple_gs_local_pair64 import (
+    GS_LOCALPAIR64_FEATURES, GS_LOCALPAIR64_INIT_TABLE_QUANTUM,
+    GS_LOCALPAIR64_MAPPING_VERSION, GS_LOCALPAIR64_PROJECTION_OUTPUTS,
+    GS_LOCALPAIR64_SCHEMA_VERSION, GS_LOCALPAIR64_TRANSFORMED,
+    GS_LOCALPAIR64_TYPE, GS_LOCALPAIR64_WIDTH,
+)
+from simple_gs_local_pair32 import (
+    GS_LOCALPAIR32_FEATURES, GS_LOCALPAIR32_INIT_TABLE_QUANTUM,
+    GS_LOCALPAIR32_MAPPING_VERSION, GS_LOCALPAIR32_PROJECTION_OUTPUTS,
+    GS_LOCALPAIR32_SCHEMA_VERSION, GS_LOCALPAIR32_TRANSFORMED,
+    GS_LOCALPAIR32_TYPE, GS_LOCALPAIR32_WIDTH,
+)
+from simple_gs_local_pair32_d1 import (
+    GS_LOCALPAIR32_D1_FEATURES, GS_LOCALPAIR32_D1_INIT_TABLE_QUANTUM,
+    GS_LOCALPAIR32_D1_MAPPING_VERSION, GS_LOCALPAIR32_D1_PROJECTION_OUTPUTS,
+    GS_LOCALPAIR32_D1_SCHEMA_VERSION, GS_LOCALPAIR32_D1_TRANSFORMED,
+    GS_LOCALPAIR32_D1_TYPE, GS_LOCALPAIR32_D1_WIDTH,
+)
 
 SIMPLE_SCHEMA_VERSION = 2
 ARCHITECTURE_TYPE = "halfka_hm2_simple"
@@ -68,7 +98,49 @@ SIMPLE_DIRECT_SIDE_INPUT_DIM = 2
 SIMPLE_SHARED_PSQT_TYPE = "halfka_hm2_shared_psqt_v1"
 SIMPLE_QAT_MODES = ("off", "weights", "weight_activation", "full")
 SIMPLE_QAT_RECOMMENDED_MODE = "full"
-SIMPLE_LOCAL_PAIR_FEATURES = ("off", PP3WIDE_TYPE, PP3WIDE64_TYPE)
+SIMPLE_LOCAL_PAIR_FEATURES = (
+    "off", PP3WIDE_TYPE, PP3WIDE64_TYPE, LOCALPAIR64_TYPE,
+    KSG_LOCALPAIR64_TYPE, GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE,
+    GS_LOCALPAIR32_D1_TYPE)
+LOCALPAIR64_TYPES = (
+    LOCALPAIR64_TYPE, KSG_LOCALPAIR64_TYPE, GS_LOCALPAIR64_TYPE)
+LOCALPAIR_TYPES = (
+    *LOCALPAIR64_TYPES, GS_LOCALPAIR32_TYPE, GS_LOCALPAIR32_D1_TYPE)
+LOCALPAIR_SCHEMA = {
+    LOCALPAIR64_TYPE: LOCALPAIR64_SCHEMA_VERSION,
+    KSG_LOCALPAIR64_TYPE: KSG_LOCALPAIR64_SCHEMA_VERSION,
+    GS_LOCALPAIR64_TYPE: GS_LOCALPAIR64_SCHEMA_VERSION,
+    GS_LOCALPAIR32_TYPE: GS_LOCALPAIR32_SCHEMA_VERSION,
+    GS_LOCALPAIR32_D1_TYPE: GS_LOCALPAIR32_D1_SCHEMA_VERSION,
+}
+LOCALPAIR_MAPPING = {
+    LOCALPAIR64_TYPE: LOCALPAIR64_MAPPING_VERSION,
+    KSG_LOCALPAIR64_TYPE: KSG_LOCALPAIR64_MAPPING_VERSION,
+    GS_LOCALPAIR64_TYPE: GS_LOCALPAIR64_MAPPING_VERSION,
+    GS_LOCALPAIR32_TYPE: GS_LOCALPAIR32_MAPPING_VERSION,
+    GS_LOCALPAIR32_D1_TYPE: GS_LOCALPAIR32_D1_MAPPING_VERSION,
+}
+LOCALPAIR_FEATURE_COUNT = {
+    LOCALPAIR64_TYPE: LOCALPAIR64_FEATURES,
+    KSG_LOCALPAIR64_TYPE: KSG_LOCALPAIR64_FEATURES,
+    GS_LOCALPAIR64_TYPE: GS_LOCALPAIR64_FEATURES,
+    GS_LOCALPAIR32_TYPE: GS_LOCALPAIR32_FEATURES,
+    GS_LOCALPAIR32_D1_TYPE: GS_LOCALPAIR32_D1_FEATURES,
+}
+LOCALPAIR_WIDTH = {
+    LOCALPAIR64_TYPE: LOCALPAIR64_WIDTH,
+    KSG_LOCALPAIR64_TYPE: KSG_LOCALPAIR64_WIDTH,
+    GS_LOCALPAIR64_TYPE: GS_LOCALPAIR64_WIDTH,
+    GS_LOCALPAIR32_TYPE: GS_LOCALPAIR32_WIDTH,
+    GS_LOCALPAIR32_D1_TYPE: GS_LOCALPAIR32_D1_WIDTH,
+}
+LOCALPAIR_TABLE_QUANTUM = {
+    LOCALPAIR64_TYPE: LOCALPAIR64_INIT_TABLE_QUANTUM,
+    KSG_LOCALPAIR64_TYPE: KSG_LOCALPAIR64_INIT_TABLE_QUANTUM,
+    GS_LOCALPAIR64_TYPE: GS_LOCALPAIR64_INIT_TABLE_QUANTUM,
+    GS_LOCALPAIR32_TYPE: GS_LOCALPAIR32_INIT_TABLE_QUANTUM,
+    GS_LOCALPAIR32_D1_TYPE: GS_LOCALPAIR32_D1_INIT_TABLE_QUANTUM,
+}
 BUCKET_STAT_NAMES = (
     "count", "weight", "loss", "prob_mae", "cp_mae",
     "importance_weighted_loss",
@@ -356,7 +428,8 @@ class SimplePp3Wide(nn.Module):
     """Experiment 120 board-only unpromoted pawn/lance local-pair FT."""
 
     def __init__(self, width=FT_WIDTH, initialization="zero",
-                 nonzero_rate=0.05, seed=120):
+                 nonzero_rate=0.05, seed=120,
+                 feature_count=PP3WIDE_FEATURES):
         super().__init__()
         if initialization not in PP3WIDE_INIT_MODES:
             raise ValueError(
@@ -366,7 +439,7 @@ class SimplePp3Wide(nn.Module):
         self.initialization = initialization
         self.nonzero_rate = float(nonzero_rate)
         self.seed = int(seed)
-        self.weight = nn.Parameter(torch.zeros(PP3WIDE_FEATURES, width))
+        self.weight = nn.Parameter(torch.zeros(feature_count, width))
         if initialization == "quantized_random":
             # Construct directly on the exported int8 grid.  A local CPU RNG
             # keeps model initialization from perturbing the data-stream RNG.
@@ -413,10 +486,14 @@ class SimplePp3Wide64(SimplePp3Wide):
     """Experiment 121: 64-wide PP accumulator plus shared 64->16 projection."""
 
     def __init__(self, initialization="zero", table_nonzero_rate=0.05,
-                 projection_nonzero_rate=0.05, seed=121):
+                 projection_nonzero_rate=0.05, seed=121,
+                 feature_count=PP3WIDE_FEATURES,
+                 table_quantum=PP3WIDE64_INIT_TABLE_QUANTUM,
+                 latent_width=PP3WIDE64_WIDTH):
         super().__init__(
-            width=PP3WIDE64_WIDTH, initialization="zero",
-            nonzero_rate=table_nonzero_rate, seed=seed)
+            width=latent_width, initialization="zero",
+            nonzero_rate=table_nonzero_rate, seed=seed,
+            feature_count=feature_count)
         if initialization not in PP3WIDE_INIT_MODES:
             raise ValueError(
                 f"PP3Wide64 init must be one of {PP3WIDE_INIT_MODES}")
@@ -426,8 +503,11 @@ class SimplePp3Wide64(SimplePp3Wide):
         self.nonzero_rate = float(table_nonzero_rate)
         self.projection_nonzero_rate = float(projection_nonzero_rate)
         self.seed = int(seed)
+        if latent_width <= 0 or latent_width % 2:
+            raise ValueError("pair latent width must be positive and even")
+        self.latent_width = int(latent_width)
         self.projection = nn.Linear(
-            PP3WIDE64_TRANSFORMED, PP3WIDE64_PROJECTION_OUTPUTS, bias=False)
+            self.latent_width, PP3WIDE64_PROJECTION_OUTPUTS, bias=False)
         nn.init.zeros_(self.projection.weight)
         if initialization == "quantized_random":
             # Initialize both halves directly on their deployment grids. Local
@@ -445,7 +525,7 @@ class SimplePp3Wide64(SimplePp3Wide):
                     dtype=torch.int8).float().mul_(2).sub_(1)
                 self.weight.copy_(
                     table_active.float() * table_signs
-                    * PP3WIDE64_INIT_TABLE_QUANTUM
+                    * table_quantum
                     / PP3WIDE_QUANT_SCALE)
                 proj_active = torch.rand(
                     self.projection.weight.shape,
@@ -474,6 +554,78 @@ class SimplePp3Wide64(SimplePp3Wide):
             if qat_mode in ("weight_activation", "full"):
                 projected = _fake_raw_grid(projected)
         return projected, transformed
+
+
+class SimpleLocalPair64(SimplePp3Wide64):
+    """Experiment 122 L4 Chebyshev-distance-2 local piece-pair branch."""
+
+    def __init__(self, initialization="zero", table_nonzero_rate=0.05,
+                 projection_nonzero_rate=0.05, seed=122):
+        super().__init__(
+            initialization=initialization,
+            table_nonzero_rate=table_nonzero_rate,
+            projection_nonzero_rate=projection_nonzero_rate,
+            seed=seed,
+            feature_count=LOCALPAIR64_FEATURES,
+            table_quantum=LOCALPAIR64_INIT_TABLE_QUANTUM)
+
+
+class SimpleKsgLocalPair64(SimplePp3Wide64):
+    """Experiment 123 R2 knight/silver/gold-like local-pair branch."""
+
+    def __init__(self, initialization="zero", table_nonzero_rate=0.05,
+                 projection_nonzero_rate=0.05, seed=123):
+        super().__init__(
+            initialization=initialization,
+            table_nonzero_rate=table_nonzero_rate,
+            projection_nonzero_rate=projection_nonzero_rate,
+            seed=seed,
+            feature_count=KSG_LOCALPAIR64_FEATURES,
+            table_quantum=KSG_LOCALPAIR64_INIT_TABLE_QUANTUM)
+
+
+class SimpleGsLocalPair64(SimplePp3Wide64):
+    """Experiment 124 R5 silver/gold-like local-pair branch."""
+
+    def __init__(self, initialization="zero", table_nonzero_rate=0.05,
+                 projection_nonzero_rate=0.05, seed=124):
+        super().__init__(
+            initialization=initialization,
+            table_nonzero_rate=table_nonzero_rate,
+            projection_nonzero_rate=projection_nonzero_rate,
+            seed=seed,
+            feature_count=GS_LOCALPAIR64_FEATURES,
+            table_quantum=GS_LOCALPAIR64_INIT_TABLE_QUANTUM)
+
+
+class SimpleGsLocalPair32(SimplePp3Wide64):
+    """Experiment 125: the exact R5 relation set with latent width 32."""
+
+    def __init__(self, initialization="zero", table_nonzero_rate=0.05,
+                 projection_nonzero_rate=0.05, seed=125):
+        super().__init__(
+            initialization=initialization,
+            table_nonzero_rate=table_nonzero_rate,
+            projection_nonzero_rate=projection_nonzero_rate,
+            seed=seed,
+            feature_count=GS_LOCALPAIR32_FEATURES,
+            table_quantum=GS_LOCALPAIR32_INIT_TABLE_QUANTUM,
+            latent_width=GS_LOCALPAIR32_WIDTH)
+
+
+class SimpleGsLocalPair32D1(SimplePp3Wide64):
+    """Experiment 126: R5 latent32 restricted to Chebyshev radius 1."""
+
+    def __init__(self, initialization="zero", table_nonzero_rate=0.05,
+                 projection_nonzero_rate=0.05, seed=126):
+        super().__init__(
+            initialization=initialization,
+            table_nonzero_rate=table_nonzero_rate,
+            projection_nonzero_rate=projection_nonzero_rate,
+            seed=seed,
+            feature_count=GS_LOCALPAIR32_D1_FEATURES,
+            table_quantum=GS_LOCALPAIR32_D1_INIT_TABLE_QUANTUM,
+            latent_width=GS_LOCALPAIR32_D1_WIDTH)
 
 
 class SimpleSharedPsqt(nn.Module):
@@ -638,6 +790,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_pp3wide64_table_nonzero_rate=0.05,
         simple_pp3wide64_proj_nonzero_rate=0.05,
         simple_pp3wide64_seed=121,
+        simple_localpair64_table_nonzero_rate=0.05,
+        simple_localpair64_proj_nonzero_rate=0.05,
+        simple_localpair64_seed=122,
         **unused,
     ):
         super().__init__()
@@ -671,6 +826,10 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError(
                 "simple_local_pair_feature must be one of "
                 f"{SIMPLE_LOCAL_PAIR_FEATURES}")
+        # Stable diagnostic label for freshly constructed and migrated models.
+        # Older pickled models happened to carry this attribute dynamically;
+        # constructor-created models must define it explicitly as well.
+        self.pp3wide_type = self.simple_local_pair_feature
         if self.simple_local_pair_feature == PP3WIDE_TYPE:
             self.pp3wide = SimplePp3Wide(
                 initialization=simple_pp3wide_init,
@@ -682,6 +841,36 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 table_nonzero_rate=simple_pp3wide64_table_nonzero_rate,
                 projection_nonzero_rate=simple_pp3wide64_proj_nonzero_rate,
                 seed=simple_pp3wide64_seed)
+        elif self.simple_local_pair_feature == LOCALPAIR64_TYPE:
+            self.pp3wide = SimpleLocalPair64(
+                initialization=simple_pp3wide_init,
+                table_nonzero_rate=simple_localpair64_table_nonzero_rate,
+                projection_nonzero_rate=simple_localpair64_proj_nonzero_rate,
+                seed=simple_localpair64_seed)
+        elif self.simple_local_pair_feature == KSG_LOCALPAIR64_TYPE:
+            self.pp3wide = SimpleKsgLocalPair64(
+                initialization=simple_pp3wide_init,
+                table_nonzero_rate=simple_localpair64_table_nonzero_rate,
+                projection_nonzero_rate=simple_localpair64_proj_nonzero_rate,
+                seed=simple_localpair64_seed)
+        elif self.simple_local_pair_feature == GS_LOCALPAIR64_TYPE:
+            self.pp3wide = SimpleGsLocalPair64(
+                initialization=simple_pp3wide_init,
+                table_nonzero_rate=simple_localpair64_table_nonzero_rate,
+                projection_nonzero_rate=simple_localpair64_proj_nonzero_rate,
+                seed=simple_localpair64_seed)
+        elif self.simple_local_pair_feature == GS_LOCALPAIR32_TYPE:
+            self.pp3wide = SimpleGsLocalPair32(
+                initialization=simple_pp3wide_init,
+                table_nonzero_rate=simple_localpair64_table_nonzero_rate,
+                projection_nonzero_rate=simple_localpair64_proj_nonzero_rate,
+                seed=simple_localpair64_seed)
+        elif self.simple_local_pair_feature == GS_LOCALPAIR32_D1_TYPE:
+            self.pp3wide = SimpleGsLocalPair32D1(
+                initialization=simple_pp3wide_init,
+                table_nonzero_rate=simple_localpair64_table_nonzero_rate,
+                projection_nonzero_rate=simple_localpair64_proj_nonzero_rate,
+                seed=simple_localpair64_seed)
         else:
             self.pp3wide = None
         self.simple_pp3wide_init = str(simple_pp3wide_init)
@@ -692,6 +881,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.simple_pp3wide64_proj_nonzero_rate = float(
             simple_pp3wide64_proj_nonzero_rate)
         self.simple_pp3wide64_seed = int(simple_pp3wide64_seed)
+        self.simple_localpair64_table_nonzero_rate = float(
+            simple_localpair64_table_nonzero_rate)
+        self.simple_localpair64_proj_nonzero_rate = float(
+            simple_localpair64_proj_nonzero_rate)
+        self.simple_localpair64_seed = int(simple_localpair64_seed)
         self.shared_psqt = (
             SimpleSharedPsqt() if self.use_shared_psqt else None)
         self.side_proj = (
@@ -759,9 +953,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 "max_weight": MAX_HIDDEN_WEIGHT,
             },
         ]
-        if self.simple_local_pair_feature == PP3WIDE64_TYPE:
+        if self.simple_local_pair_feature in (
+                PP3WIDE64_TYPE, *LOCALPAIR_TYPES):
             self.weight_clipping.append({
-                "name": "PP64Projection",
+                "name": ("LocalPair64Projection"
+                         if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                         else "PP64Projection"),
                 "params": [self.pp3wide.projection.weight],
                 "min_weight": -MAX_HIDDEN_WEIGHT,
                 "max_weight": MAX_HIDDEN_WEIGHT,
@@ -795,23 +992,34 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 if self.simple_ft_virtual_factorization == "shared" else None),
             "simple_local_pair_feature": self.simple_local_pair_feature,
             "simple_pp3wide_schema_version": (
-                (PP3WIDE64_SCHEMA_VERSION
+                (LOCALPAIR_SCHEMA[self.simple_local_pair_feature]
+                 if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                 else PP3WIDE64_SCHEMA_VERSION
                  if self.simple_local_pair_feature == PP3WIDE64_TYPE
                  else PP3WIDE_SCHEMA_VERSION)
                 if self.pp3wide is not None else None),
             "simple_pp3wide_mapping_version": (
-                PP3WIDE_MAPPING_VERSION if self.pp3wide is not None else None),
+                (LOCALPAIR_MAPPING[self.simple_local_pair_feature]
+                 if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                 else PP3WIDE_MAPPING_VERSION)
+                if self.pp3wide is not None else None),
             "simple_pp3wide_dimensions": (
-                PP3WIDE_FEATURES if self.pp3wide is not None else 0),
+                (LOCALPAIR_FEATURE_COUNT[self.simple_local_pair_feature]
+                 if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                 else PP3WIDE_FEATURES)
+                if self.pp3wide is not None else 0),
             "simple_pp3wide_export_dtype": (
                 "int8_q127" if self.pp3wide is not None else "none"),
             "simple_pp3wide_width": (
-                PP3WIDE64_WIDTH
+                LOCALPAIR_WIDTH[self.simple_local_pair_feature]
+                if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                else PP3WIDE64_WIDTH
                 if self.simple_local_pair_feature == PP3WIDE64_TYPE
                 else FT_WIDTH if self.pp3wide is not None else 0),
             "simple_pp3wide_projection": (
-                "shared_64x16_int8_q64_no_bias"
-                if self.simple_local_pair_feature == PP3WIDE64_TYPE
+                f"shared_{self.pp3wide.projection.in_features}x16_int8_q64_no_bias"
+                if self.simple_local_pair_feature in (
+                    PP3WIDE64_TYPE, *LOCALPAIR_TYPES)
                 else "none"),
             "simple_pp3wide_init": (
                 self.simple_pp3wide_init if self.pp3wide is not None else None),
@@ -830,6 +1038,18 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "simple_pp3wide64_init_table_quantum": (
                 PP3WIDE64_INIT_TABLE_QUANTUM
                 if self.simple_local_pair_feature == PP3WIDE64_TYPE else None),
+            "simple_localpair64_table_nonzero_rate": (
+                self.simple_localpair64_table_nonzero_rate
+                if self.simple_local_pair_feature in LOCALPAIR_TYPES else 0.0),
+            "simple_localpair64_proj_nonzero_rate": (
+                self.simple_localpair64_proj_nonzero_rate
+                if self.simple_local_pair_feature in LOCALPAIR_TYPES else 0.0),
+            "simple_localpair64_seed": (
+                self.simple_localpair64_seed
+                if self.simple_local_pair_feature in LOCALPAIR_TYPES else None),
+            "simple_localpair64_init_table_quantum": (
+                LOCALPAIR_TABLE_QUANTUM[self.simple_local_pair_feature]
+                if self.simple_local_pair_feature in LOCALPAIR_TYPES else None),
             "use_side_input": use_side_input,
             "simple_side_input_type": (
                 getattr(self, "simple_side_input_type", "none")
@@ -983,7 +1203,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 self._simple_debug_snapshot["psqt"] = psqt_snapshot
             if self.pp3wide is not None:
                 pp_cat = torch.cat((pp_white, pp_black)).float()
+                pp_indices = torch.cat((
+                    pp3wide_white_indices.long(),
+                    pp3wide_black_indices.long()))
                 self._simple_debug_snapshot["pp3wide"] = {
+                    "variant": self.simple_local_pair_feature,
                     "accumulator_rms": pp_cat.square().mean().sqrt(),
                     "mean_abs": pp_cat.abs().mean(),
                     "merged_ratio": (
@@ -998,12 +1222,16 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                         (pp3wide_white_indices.numel()
                          + pp3wide_black_indices.numel())
                         / max(2 * white_indices.shape[0], 1)),
+                    "active_total": int(pp_indices.numel()),
+                    "unique_rows": int(torch.unique(pp_indices).numel()),
+                    "feature_count": int(self.pp3wide.weight.shape[0]),
                     "nonzero_weight_ratio": (
                         (torch.round(self.pp3wide.weight.detach()
                                      * PP3WIDE_QUANT_SCALE) != 0)
                         .float().mean()),
                 }
-                if self.simple_local_pair_feature == PP3WIDE64_TYPE:
+                if self.simple_local_pair_feature in (
+                        PP3WIDE64_TYPE, *LOCALPAIR_TYPES):
                     self._simple_debug_snapshot["pp3wide"].update({
                         "transformed_abs_mean": pp_transformed.float().abs().mean(),
                         "projection_abs_mean": pp_fc0_residual.float().abs().mean(),
@@ -1499,13 +1727,19 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             gradients.append(weight_grad.detach().float().reshape(-1))
         if bias_grad is not None:
             gradients.append(bias_grad.detach().float().reshape(-1))
-        grad_mean = (
-            torch.cat(gradients).abs().mean()
-            if gradients else weight.new_zeros(()))
+        gradient = (
+            gradients[0] if len(gradients) == 1
+            else torch.cat(gradients) if gradients
+            else None)
+        grad_mean = (gradient.abs().mean()
+                     if gradient is not None else weight.new_zeros(()))
+        grad_norm = (gradient.norm()
+                     if gradient is not None else weight.new_zeros(()))
         return {
-            "grad_mean": grad_mean,
+            "grad_mean": grad_mean, "grad_norm": grad_norm,
             "active": int(weight.numel() + bias.numel()
                           if active is None else active),
+            "w_norm": weight.norm(),
             "w_mean": weight.mean(), "w_min": weight.min(),
             "w_max": weight.max(), "w_std": weight.std(unbiased=False),
             "b_mean": bias.mean(), "b_min": bias.min(),
@@ -1557,6 +1791,34 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 layer_stats["SideProj_2x4"] = self._layer_stat_row(
                     side_linear.weight, side_linear.bias,
                     side_linear.weight.grad, side_linear.bias.grad)
+            if self.pp3wide is not None:
+                pair_label = (
+                    ("KSGLocalPair64_Table"
+                     if self.simple_local_pair_feature == KSG_LOCALPAIR64_TYPE
+                     else "LocalPair64_Table")
+                    if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                    else "PP3Wide64_Table"
+                    if self.simple_local_pair_feature == PP3WIDE64_TYPE
+                    else "PP3Wide_Table")
+                pair_weight = self.pp3wide.weight
+                pair_zero_bias = pair_weight.new_zeros(1)
+                layer_stats[pair_label] = self._layer_stat_row(
+                    pair_weight, pair_zero_bias,
+                    pair_weight.grad, None,
+                    active=int(pair_weight.numel()))
+                if self.simple_local_pair_feature in (
+                        PP3WIDE64_TYPE, *LOCALPAIR_TYPES):
+                    projection = self.pp3wide.projection.weight
+                    projection_label = (
+                        ("KSGLocalPair64_Proj"
+                         if self.simple_local_pair_feature == KSG_LOCALPAIR64_TYPE
+                         else "LocalPair64_Proj")
+                        if self.simple_local_pair_feature in LOCALPAIR_TYPES
+                        else "PP3Wide64_Proj")
+                    layer_stats[projection_label] = self._layer_stat_row(
+                        projection, projection.new_zeros(1),
+                        projection.grad, None,
+                        active=int(projection.numel()))
             self._simple_debug_layer_stats = layer_stats
             snapshot = self._simple_debug_snapshot
             snapshot["ft_pre_step"] = {
@@ -1685,7 +1947,15 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
 
         if self.pp3wide is not None and "pp3wide" in snapshot:
             pp = snapshot["pp3wide"]
-            print(f"[PP3Wide Stats](Step {display_step}, current batch snapshot)")
+            pair_heading = (
+                ("KSG LocalPair64 Stats"
+                 if pp.get("variant") == KSG_LOCALPAIR64_TYPE
+                 else "LocalPair64 Stats")
+                if pp.get("variant") in LOCALPAIR_TYPES
+                else "PP3Wide64 Stats"
+                if pp.get("variant") == PP3WIDE64_TYPE
+                else "PP3Wide Stats")
+            print(f"[{pair_heading}](Step {display_step}, current batch snapshot)")
             print(
                 "  accumulator RMS / mean abs : "
                 f"{host_scalar(pp['accumulator_rms']):.6e} / "
@@ -1697,8 +1967,50 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 "  active features/perspective: "
                 f"{float(pp['active_mean']):.3f}")
             print(
+                "  active total / unique rows : "
+                f"{int(pp['active_total']):,} / {int(pp['unique_rows']):,} "
+                f"({int(pp['unique_rows']) / max(int(pp['feature_count']), 1):.4%} "
+                "of table)")
+            print(
                 "  quantized nonzero weights   : "
                 f"{host_scalar(pp['nonzero_weight_ratio']):.4%}")
+            if pp.get("variant") in (PP3WIDE64_TYPE, *LOCALPAIR_TYPES):
+                print(
+                    "  EWM transformed abs mean    : "
+                    f"{host_scalar(pp['transformed_abs_mean']):.6e}")
+                print(
+                    "  projected residual abs mean : "
+                    f"{host_scalar(pp['projection_abs_mean']):.6e}")
+                print(
+                    "  residual / FC0 pre-act ratio: "
+                    f"{host_scalar(pp['merged_ratio']):.6e}")
+                print(
+                    "  projection q-nonzero weights: "
+                    f"{host_scalar(pp['projection_nonzero_weight_ratio']):.4%}")
+                table_key = (
+                    ("KSGLocalPair64_Table"
+                     if pp.get("variant") == KSG_LOCALPAIR64_TYPE
+                     else "LocalPair64_Table")
+                    if pp.get("variant") in LOCALPAIR_TYPES
+                    else "PP3Wide64_Table")
+                projection_key = (
+                    ("KSGLocalPair64_Proj"
+                     if pp.get("variant") == KSG_LOCALPAIR64_TYPE
+                     else "LocalPair64_Proj")
+                    if pp.get("variant") in LOCALPAIR_TYPES
+                    else "PP3Wide64_Proj")
+                layer_stats = self._simple_debug_layer_stats or {}
+                if table_key in layer_stats and projection_key in layer_stats:
+                    table_stats = layer_stats[table_key]
+                    projection_stats = layer_stats[projection_key]
+                    print(
+                        "  table weight / grad norm    : "
+                        f"{host_scalar(table_stats['w_norm']):.6e} / "
+                        f"{host_scalar(table_stats['grad_norm']):.6e}")
+                    print(
+                        "  projection weight/grad norm : "
+                        f"{host_scalar(projection_stats['w_norm']):.6e} / "
+                        f"{host_scalar(projection_stats['grad_norm']):.6e}")
 
         if self.use_side_input:
             side = {
@@ -1986,8 +2298,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             return
         current_lr = float(param_groups[0]["lr"])
         print("[Simple optimizer learning rates]")
+        ft_group_name = "HalfKA_HM2 FT"
+        if self.pp3wide is not None:
+            ft_group_name += f" + {self.pp3wide_type} branch"
         group_names = (
-            "HalfKA_HM2 FT",
+            ft_group_name,
              ("9 bucket layer stacks + side projection"
               if self.use_projected_side_input else
               "9 bucket layer stacks + direct side"
@@ -2120,11 +2435,17 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError(
                 "PP3Wide checkpoint cannot load into PP-OFF architecture")
         if saved_local_pair == current_local_pair and saved_local_pair != "off":
+            expected_mapping = (
+                LOCALPAIR_MAPPING[saved_local_pair]
+                if saved_local_pair in LOCALPAIR_TYPES
+                else PP3WIDE_MAPPING_VERSION)
             if metadata.get("simple_pp3wide_mapping_version") \
-                    != PP3WIDE_MAPPING_VERSION:
+                    != expected_mapping:
                 raise ValueError("Simple PP3Wide mapping version mismatch")
             expected_schema = (
-                PP3WIDE64_SCHEMA_VERSION
+                LOCALPAIR_SCHEMA[saved_local_pair]
+                if saved_local_pair in LOCALPAIR_TYPES
+                else PP3WIDE64_SCHEMA_VERSION
                 if saved_local_pair == PP3WIDE64_TYPE
                 else PP3WIDE_SCHEMA_VERSION)
             if int(metadata.get("simple_pp3wide_schema_version", -1)) \
