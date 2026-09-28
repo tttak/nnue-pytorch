@@ -523,14 +523,14 @@ class TextLogPrintTee:
       self._stream.close()
       self._closed = True
 
-def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_bucket_mode="k3k3", simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
   train_infinite = nnue_dataset.SparseBatchDataset(features_name, train_filename1, train_filename2, train_filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, num_workers=num_workers,
-                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
+                                                   filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_bucket_mode=simple_bucket_mode, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
-                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
+                                                   random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_bucket_mode=simple_bucket_mode, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -541,6 +541,19 @@ def data_loader_py(train_filename, val_filename, feature_set, batch_size, main_d
   train = DataLoader(nnue_bin_dataset.NNUEBinData(train_filename, feature_set), batch_size=batch_size, shuffle=True, num_workers=4)
   val = DataLoader(nnue_bin_dataset.NNUEBinData(val_filename, feature_set), batch_size=32)
   return train, val
+
+def migrate_simple_bucket_heads(model, source_mode, target_mode, policy):
+  """Apply the Experiment 130 weight-only head migration contract."""
+  clone = policy == "clone_b08" or (policy == "auto" and source_mode != target_mode)
+  if not clone:
+    print(f"Simple bucket migration: native ({source_mode} -> {target_mode})")
+    return
+  source_state = {k: v.detach().clone()
+                  for k, v in model.layer_stacks[8].state_dict().items()}
+  for stack in model.layer_stacks:
+    stack.load_state_dict(source_state, strict=True)
+  print(f"Simple bucket migration: clone_b08 ({source_mode} -> {target_mode}); "
+        "optimizer/scheduler start fresh")
 
 class NetworkSaveCheckpoint(pytorch_lightning.callbacks.Checkpoint):
   def __init__(
@@ -668,6 +681,14 @@ def main():
       help=("Experiment 120/121 local sparse pair component. "
             f"Use {PP3WIDE_TYPE} for board-only unpromoted pawn/lance "
             "PP_3Wide; default: off."))
+  parser.add_argument(
+      "--simple-bucket-mode",
+      choices=("k3k3", "phase9", "kingfree_tree"), default="k3k3",
+      help="Simple 9-stack routing contract (Experiment 130).")
+  parser.add_argument(
+      "--simple-bucket-migration", choices=("auto", "native", "clone_b08"),
+      default="auto",
+      help="Weight-only routing migration; auto clones B08 on mode changes.")
   parser.add_argument(
       "--simple-pp3wide-init", choices=PP3WIDE_INIT_MODES, default="zero",
       help="Initialization used only when a new PP3Wide branch is created.")
@@ -1068,6 +1089,8 @@ def main():
           if simple_architecture else "off"),
       simple_local_pair_feature=(
           args.simple_local_pair_feature if simple_architecture else "off"),
+      simple_bucket_mode=(
+          args.simple_bucket_mode if simple_architecture else "k3k3"),
       simple_pp3wide_init=args.simple_pp3wide_init,
       simple_pp3wide_nonzero_rate=args.simple_pp3wide_nonzero_rate,
       simple_pp3wide_seed=args.simple_pp3wide_seed,
@@ -1152,6 +1175,7 @@ def main():
               "simple_ft_virtual_factorization": (
                   args.simple_ft_virtual_factorization),
               "simple_local_pair_feature": args.simple_local_pair_feature,
+              "simple_bucket_mode": args.simple_bucket_mode,
               "simple_pp3wide_init": args.simple_pp3wide_init,
               "simple_pp3wide_nonzero_rate": args.simple_pp3wide_nonzero_rate,
               "simple_pp3wide_seed": args.simple_pp3wide_seed,
@@ -1342,6 +1366,11 @@ def main():
       if (simple_architecture and source_effective_ft is not None
           and target_factorization == "shared"):
           nnue.input.mean_decompose_(source_effective_ft)
+      if simple_architecture:
+          migrate_simple_bucket_heads(
+              nnue, architecture.get("simple_bucket_mode",
+                                     architecture.get("bucket_scheme", "k3k3")),
+              args.simple_bucket_mode, args.simple_bucket_migration)
 
     # 「.ckpt」の場合
     else:
@@ -1379,6 +1408,7 @@ def main():
             args.simple_ft_virtual_factorization)
         resume_overrides["simple_local_pair_feature"] = (
             args.simple_local_pair_feature)
+        resume_overrides["simple_bucket_mode"] = args.simple_bucket_mode
         resume_overrides["simple_pp3wide_init"] = args.simple_pp3wide_init
         resume_overrides["simple_pp3wide_nonzero_rate"] = (
             args.simple_pp3wide_nonzero_rate)
@@ -1488,6 +1518,24 @@ def main():
       nnue = ModelClass.load_from_checkpoint(
           args.resume_from_model, feature_set=feature_set, strict=False,
           **resume_overrides)
+      if simple_architecture:
+        source_checkpoint = torch.load(
+            args.resume_from_model, map_location="cpu", weights_only=False)
+        source_metadata = (source_checkpoint.get("architecture")
+                           or source_checkpoint.get("nnue_architecture") or {})
+        source_bucket = source_metadata.get(
+            "simple_bucket_mode", source_metadata.get("bucket_scheme", "k3k3"))
+        if args.resume_training_state and source_bucket != args.simple_bucket_mode:
+          raise ValueError(
+              "cannot change Simple bucket mode while restoring optimizer "
+              f"state: checkpoint={source_bucket}, requested="
+              f"{args.simple_bucket_mode}. Use --resume-from-model for "
+              "clone_b08 weight migration.")
+        if not args.resume_training_state:
+          migrate_simple_bucket_heads(
+              nnue, source_bucket, args.simple_bucket_mode,
+              args.simple_bucket_migration)
+        del source_checkpoint
       if (simple_architecture and simple_any_side_input
           and not nnue.use_side_input):
         raise ValueError("failed to construct requested Simple side-input model")
@@ -1705,7 +1753,7 @@ def main():
   else:
     print('Using c++ data loader')
     local_pair_type = getattr(nnue, "simple_local_pair_feature", "off")
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), local_pair_type in (PP3WIDE_TYPE, PP3WIDE64_TYPE), local_pair_type == LOCALPAIR64_TYPE, local_pair_type == KSG_LOCALPAIR64_TYPE, local_pair_type in (GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE), local_pair_type == GS_LOCALPAIR32_D1_TYPE)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), getattr(nnue, "simple_bucket_mode", "k3k3"), local_pair_type in (PP3WIDE_TYPE, PP3WIDE64_TYPE), local_pair_type == LOCALPAIR64_TYPE, local_pair_type == KSG_LOCALPAIR64_TYPE, local_pair_type in (GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE), local_pair_type == GS_LOCALPAIR32_D1_TYPE)
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()

@@ -105,6 +105,28 @@ DESCRIPTION_GS_LOCALPAIR32_D1 = (
 Q_ONE = 127.0
 HIDDEN_WEIGHT_SCALE = 64.0
 LEB128_MAGIC = b"COMPRESSED_LEB128"
+BUCKET_HASH_XOR = {
+    "k3k3": 0,
+    "phase9": 0x50483931,
+    "kingfree_tree": 0x4B465435,
+}
+BUCKET_SUFFIX = {
+    "k3k3": "",
+    "phase9": "-BucketPhase9",
+    "kingfree_tree": "-BucketKingFreeTree",
+}
+
+
+def _bucket_description(base, mode):
+    suffix = BUCKET_SUFFIX[mode]
+    return base.replace("{LayerStack=9}", suffix + "{LayerStack=9}")
+
+
+def _split_bucket_description(description):
+    for mode, suffix in BUCKET_SUFFIX.items():
+        if suffix and suffix in description:
+            return description.replace(suffix, ""), mode
+    return description, "k3k3"
 
 
 def _u32(buf, value):
@@ -161,13 +183,15 @@ def serialize_model(model, output, ft_compression="none"):
     gs32_d1_enabled = pp_type == GS_LOCALPAIR32_D1_TYPE
     _u32(buf, VERSION)
     _u32(buf, OUTER_HASH)
-    desc = (DESCRIPTION_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+    base_desc = (DESCRIPTION_GS_LOCALPAIR32_D1 if gs32_d1_enabled
             else DESCRIPTION_GS_LOCALPAIR32 if gs32_enabled
             else DESCRIPTION_GS_LOCALPAIR64 if gs64_enabled
             else DESCRIPTION_KSG_LOCALPAIR64 if ksg64_enabled
             else DESCRIPTION_LOCALPAIR64 if local64_enabled
             else DESCRIPTION_PP3WIDE64 if pp64_enabled
-            else DESCRIPTION_PP3WIDE if pp_enabled else DESCRIPTION).encode("utf-8")
+            else DESCRIPTION_PP3WIDE if pp_enabled else DESCRIPTION)
+    bucket_mode = getattr(model, "simple_bucket_mode", "k3k3")
+    desc = _bucket_description(base_desc, bucket_mode).encode("utf-8")
     _u32(buf, len(desc))
     buf.extend(desc)
     _u32(buf, FT_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
@@ -199,13 +223,14 @@ def serialize_model(model, output, ft_compression="none"):
                 .to(torch.int8).cpu().numpy()
             buf.extend(projection.tobytes())
     for stack in model.layer_stacks:
-        _u32(buf, NETWORK_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
+        _u32(buf, (NETWORK_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
              else NETWORK_HASH_GS_LOCALPAIR32 if gs32_enabled
              else NETWORK_HASH_GS_LOCALPAIR64 if gs64_enabled
              else NETWORK_HASH_KSG_LOCALPAIR64 if ksg64_enabled
              else NETWORK_HASH_LOCALPAIR64 if local64_enabled
              else NETWORK_HASH_PP3WIDE64 if pp64_enabled
              else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
+             ^ BUCKET_HASH_XOR[bucket_mode])
         _write_fc(buf, stack.fc0)
         _write_fc(buf, stack.fc1)
         _write_fc(buf, stack.fc2)
@@ -288,7 +313,8 @@ def deserialize_model(source, feature_set):
         if _read_u32(stream) != OUTER_HASH:
             raise ValueError("HalfKA_HM2 simple outer hash mismatch")
         description_size = _read_u32(stream)
-        description = stream.read(description_size).decode("utf-8")
+        serialized_description = stream.read(description_size).decode("utf-8")
+        description, bucket_mode = _split_bucket_description(serialized_description)
         if description not in (
                 DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64,
                 DESCRIPTION_LOCALPAIR64, DESCRIPTION_KSG_LOCALPAIR64,
@@ -296,7 +322,7 @@ def deserialize_model(source, feature_set):
                 DESCRIPTION_GS_LOCALPAIR32_D1):
             raise ValueError(
                 "HalfKA_HM2 simple architecture description mismatch: "
-                f"{description!r}")
+                f"{serialized_description!r}")
         pp_enabled = description == DESCRIPTION_PP3WIDE
         pp64_enabled = description == DESCRIPTION_PP3WIDE64
         local64_enabled = description == DESCRIPTION_LOCALPAIR64
@@ -316,6 +342,7 @@ def deserialize_model(source, feature_set):
 
         model = SimpleHalfKAHM2NNUE(
             feature_set=feature_set,
+            simple_bucket_mode=bucket_mode,
             simple_local_pair_feature=(
                 GS_LOCALPAIR32_D1_TYPE if gs32_d1_enabled
                 else GS_LOCALPAIR32_TYPE if gs32_enabled
@@ -365,7 +392,7 @@ def deserialize_model(source, feature_set):
                 else NETWORK_HASH_LOCALPAIR64 if local64_enabled
                 else NETWORK_HASH_PP3WIDE64 if pp64_enabled
                 else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
-            if _read_u32(stream) != expected_network_hash:
+            if _read_u32(stream) != (expected_network_hash ^ BUCKET_HASH_XOR[bucket_mode]):
                 raise ValueError("HalfKA_HM2 simple network hash mismatch")
             _read_fc(stream, stack.fc0)
             _read_fc(stream, stack.fc1)
@@ -381,7 +408,8 @@ def validate_roundtrip(blob, ft_compression="none"):
     assert _read_u32(stream) == VERSION
     assert _read_u32(stream) == OUTER_HASH
     n = _read_u32(stream)
-    description = stream.read(n).decode("utf-8")
+    serialized_description = stream.read(n).decode("utf-8")
+    description, bucket_mode = _split_bucket_description(serialized_description)
     assert description in (
         DESCRIPTION, DESCRIPTION_PP3WIDE, DESCRIPTION_PP3WIDE64,
         DESCRIPTION_LOCALPAIR64, DESCRIPTION_KSG_LOCALPAIR64,
@@ -440,7 +468,7 @@ def validate_roundtrip(blob, ft_compression="none"):
         1 * 4 + 1 * 32,
     )
     for _ in range(LAYER_STACKS):
-        assert _read_u32(stream) == (
+        assert _read_u32(stream) == ((
             NETWORK_HASH_GS_LOCALPAIR32_D1 if gs32_d1_enabled
             else NETWORK_HASH_GS_LOCALPAIR32 if gs32_enabled
             else NETWORK_HASH_GS_LOCALPAIR64 if gs64_enabled
@@ -448,6 +476,7 @@ def validate_roundtrip(blob, ft_compression="none"):
             else NETWORK_HASH_LOCALPAIR64 if local64_enabled
             else NETWORK_HASH_PP3WIDE64 if pp64_enabled
             else NETWORK_HASH_PP3WIDE if pp_enabled else NETWORK_HASH)
+            ^ BUCKET_HASH_XOR[bucket_mode])
         for size in fc_sizes:
             if len(stream.read(size)) != size:
                 raise EOFError
@@ -497,7 +526,7 @@ def main():
         print(f"wrote {output}: {len(blob):,} bytes")
         print(f"FT compression: {args.ft_compression}")
         pp_type = getattr(model, "simple_local_pair_feature", "off")
-        print(DESCRIPTION_GS_LOCALPAIR32_D1
+        base_description = (DESCRIPTION_GS_LOCALPAIR32_D1
               if pp_type == GS_LOCALPAIR32_D1_TYPE
               else DESCRIPTION_GS_LOCALPAIR32 if pp_type == GS_LOCALPAIR32_TYPE
               else DESCRIPTION_GS_LOCALPAIR64 if pp_type == GS_LOCALPAIR64_TYPE
@@ -506,6 +535,8 @@ def main():
               else DESCRIPTION_PP3WIDE64 if pp_type == PP3WIDE64_TYPE
               else DESCRIPTION_PP3WIDE if pp_type == PP3WIDE_TYPE
               else DESCRIPTION)
+        print(_bucket_description(
+            base_description, getattr(model, "simple_bucket_mode", "k3k3")))
     else:
         raise ValueError("output must be .pt, .nnue or .bin")
 

@@ -784,6 +784,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_qat_mode="off",
         simple_ft_virtual_factorization="off",
         simple_local_pair_feature="off",
+        simple_bucket_mode="k3k3",
         simple_pp3wide_init="zero",
         simple_pp3wide_nonzero_rate=0.05,
         simple_pp3wide_seed=120,
@@ -822,6 +823,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.input = SimpleFeatureTransformer(
             virtual_factorization=self.simple_ft_virtual_factorization)
         self.simple_local_pair_feature = str(simple_local_pair_feature)
+        self.simple_bucket_mode = str(simple_bucket_mode)
+        if self.simple_bucket_mode not in ("k3k3", "phase9", "kingfree_tree"):
+            raise ValueError("simple_bucket_mode must be k3k3, phase9, or kingfree_tree")
         if self.simple_local_pair_feature not in SIMPLE_LOCAL_PAIR_FEATURES:
             raise ValueError(
                 "simple_local_pair_feature must be one of "
@@ -979,7 +983,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "feature": FEATURE_NAME,
             "ft_width": FT_WIDTH,
             "layer_stack_count": LAYER_STACKS,
-            "bucket_scheme": "k3k3",
+            "bucket_scheme": self.simple_bucket_mode,
+            "simple_bucket_mode": self.simple_bucket_mode,
             "distinguish_golds": False,
             "long_effect_required": False,
             "simple_schema_version": SIMPLE_SCHEMA_VERSION,

@@ -936,6 +936,66 @@ struct FeatureSet
     }
 };
 
+namespace SimpleBucket130 {
+
+inline int promoted_count(const Position& pos) {
+    return (pos.pieces(PRO_PAWN) | pos.pieces(PRO_LANCE)
+            | pos.pieces(PRO_KNIGHT) | pos.pieces(PRO_SILVER)
+            | pos.pieces(HORSE) | pos.pieces(DRAGON)).pop_count();
+}
+
+inline int hand_piece_count(const Position& pos) {
+    int n = 0;
+    for (Color c : {BLACK, WHITE})
+        for (PieceType pt : {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK})
+            n += hand_count(pos.hand_of(c), pt);
+    return n;
+}
+
+inline int major_hand_count(const Position& pos) {
+    int n = 0;
+    for (Color c : {BLACK, WHITE})
+        n += hand_count(pos.hand_of(c), BISHOP)
+           + hand_count(pos.hand_of(c), ROOK);
+    return n;
+}
+
+inline int phase_score(const Position& pos) {
+    // PieceType order is P,L,N,S,B,R,G (not the human-readable contract order).
+    constexpr int values[] = {0, 100, 300, 300, 500, 800, 1000, 600};
+    int score = 200 * promoted_count(pos);
+    for (Color c : {BLACK, WHITE})
+        for (PieceType pt : {PAWN, LANCE, KNIGHT, SILVER, GOLD, BISHOP, ROOK})
+            score += values[static_cast<int>(pt)]
+                   * hand_count(pos.hand_of(c), pt);
+    return score;
+}
+
+inline int phase9(const Position& pos) {
+    constexpr int thresholds[] = {200, 800, 1600, 2000, 2500, 3000, 3700, 4400};
+    const int score = phase_score(pos);
+    int bucket = 0;
+    while (bucket < 8 && score >= thresholds[bucket]) ++bucket;
+    return bucket;
+}
+
+inline int kingfree_tree(const Position& pos) {
+    const int promoted = promoted_count(pos);
+    const int hand = hand_piece_count(pos);
+    if (promoted <= 0) {
+        if (hand <= 2) {
+            if (hand <= 0) return 0;
+            return major_hand_count(pos) <= 0 ? 1 : 4;
+        }
+        if (hand <= 6) return hand <= 4 ? 2 : 3;
+        return 6;
+    }
+    if (promoted <= 1) return hand <= 7 ? 5 : 7;
+    return 8;
+}
+
+} // namespace SimpleBucket130
+
 struct SparseBatch
 {
     static constexpr bool IS_BATCH = true;
@@ -961,6 +1021,8 @@ struct SparseBatch
         white_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
         black_values = new float[size * FeatureSet<Ts...>::MAX_ACTIVE_FEATURES];
         layer_stack_indices = new int[size];
+        simple_bucket_phase9 = new int[size];
+        simple_bucket_kingfree_tree = new int[size];
         material = new float[size];
         kif_group_id = new int[size];
         ply = new int[size];
@@ -1015,6 +1077,10 @@ struct SparseBatch
     int* ply;
     std::uint16_t* side_input_safe_escape;
     float* side_input_mobility_tactical;
+    // Experiment 130 selectors must remain after the complete stable ctypes
+    // prefix above.  They are intentionally exposed only through accessors.
+    int* simple_bucket_phase9;
+    int* simple_bucket_kingfree_tree;
     std::vector<std::int32_t> pair_relation_indices;
     std::vector<std::int32_t> pair_relation_batch_indices;
     std::vector<std::int32_t> pp3wide_white_indices;
@@ -1037,6 +1103,8 @@ struct SparseBatch
         delete[] white_values;
         delete[] black_values;
         delete[] layer_stack_indices;
+        delete[] simple_bucket_phase9;
+        delete[] simple_bucket_kingfree_tree;
         delete[] material;
         delete[] kif_group_id;
         delete[] ply;
@@ -1073,6 +1141,9 @@ private:
             layer_stack_indices[i] = e.pos->stack_index();
         }
         material[i] = e.material;
+        simple_bucket_phase9[i] = SimpleBucket130::phase9(*e.pos);
+        simple_bucket_kingfree_tree[i] =
+            SimpleBucket130::kingfree_tree(*e.pos);
         kif_group_id[i] = e.kif_group_id;
         ply[i] = e.ply;
         side_input_safe_escape[i] =
@@ -2224,6 +2295,18 @@ extern "C" {
     {
         return batch && !batch->mirror_applied.empty()
             ? batch->mirror_applied.data() : nullptr;
+    }
+
+    EXPORT const int* CDECL get_sparse_batch_simple_bucket_phase9(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->simple_bucket_phase9 : nullptr;
+    }
+
+    EXPORT const int* CDECL get_sparse_batch_simple_bucket_kingfree_tree(
+        const SparseBatch* batch)
+    {
+        return batch ? batch->simple_bucket_kingfree_tree : nullptr;
     }
 
 }

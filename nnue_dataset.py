@@ -65,6 +65,7 @@ class SparseBatch(ctypes.Structure):
 
     def get_tensors(self, device, include_ranking_target=False,
                     side_input="none", pair_relation_side_input=False,
+                    simple_bucket_mode="k3k3",
                     simple_pp3wide=False, simple_localpair64=False,
                     simple_ksg_localpair64=False,
                     simple_gs_localpair64=False,
@@ -81,6 +82,19 @@ class SparseBatch(ctypes.Structure):
             self.ranking_target, shape=(self.size, 1))).pin_memory().to(
                 device=device, non_blocking=True)
         layer_stack_indices = torch.from_numpy(np.ctypeslib.as_array(self.layer_stack_indices, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
+        if simple_bucket_mode != "k3k3":
+            accessor = (get_sparse_batch_simple_bucket_phase9
+                        if simple_bucket_mode == "phase9"
+                        else get_sparse_batch_simple_bucket_kingfree_tree
+                        if simple_bucket_mode == "kingfree_tree" else None)
+            if accessor is None:
+                raise RuntimeError(
+                    "training_data_loader lacks Experiment 130 bucket ABI; "
+                    "rebuild training_data_loader.dll")
+            ptr = accessor(ctypes.pointer(self))
+            layer_stack_indices = torch.from_numpy(np.ctypeslib.as_array(
+                ptr, shape=(self.size,))).long().pin_memory().to(
+                    device=device, non_blocking=True)
         material = torch.from_numpy(np.ctypeslib.as_array(self.material, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
         kif_group_id = torch.from_numpy(np.ctypeslib.as_array(self.kif_group_id, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
         ply = torch.from_numpy(np.ctypeslib.as_array(self.ply, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
@@ -196,7 +210,7 @@ class TrainingDataProvider:
         random_fen_skipping=0,
         device='cpu',
         ranking_target3=None, side_input="none",
-        pair_relation_side_input=False, simple_pp3wide=False,
+        pair_relation_side_input=False, simple_bucket_mode="k3k3", simple_pp3wide=False,
         simple_localpair64=False, simple_ksg_localpair64=False,
         simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
 
@@ -221,6 +235,7 @@ class TrainingDataProvider:
         self.ranking_target3 = ranking_target3
         self.side_input = side_input
         self.pair_relation_side_input = bool(pair_relation_side_input)
+        self.simple_bucket_mode = str(simple_bucket_mode)
         self.simple_pp3wide = bool(simple_pp3wide)
         self.simple_localpair64 = bool(simple_localpair64)
         self.simple_ksg_localpair64 = bool(simple_ksg_localpair64)
@@ -291,6 +306,7 @@ class TrainingDataProvider:
                 self.device, include_ranking_target=bool(self.ranking_target3),
                 side_input=self.side_input,
                 pair_relation_side_input=self.pair_relation_side_input,
+                simple_bucket_mode=self.simple_bucket_mode,
                 simple_pp3wide=self.simple_pp3wide,
                 simple_localpair64=self.simple_localpair64,
                 simple_ksg_localpair64=self.simple_ksg_localpair64,
@@ -501,6 +517,19 @@ except AttributeError:
     get_sparse_batch_source_sfen = None
     get_sparse_batch_mirror_applied = None
 
+try:
+    get_sparse_batch_simple_bucket_phase9 = (
+        dll.get_sparse_batch_simple_bucket_phase9)
+    get_sparse_batch_simple_bucket_kingfree_tree = (
+        dll.get_sparse_batch_simple_bucket_kingfree_tree)
+    for fn in (get_sparse_batch_simple_bucket_phase9,
+               get_sparse_batch_simple_bucket_kingfree_tree):
+        fn.restype = ctypes.POINTER(ctypes.c_int)
+        fn.argtypes = [SparseBatchPtr]
+except AttributeError:
+    get_sparse_batch_simple_bucket_phase9 = None
+    get_sparse_batch_simple_bucket_kingfree_tree = None
+
 get_sparse_batch_from_fens = dll.get_sparse_batch_from_fens
 get_sparse_batch_from_fens.restype = SparseBatchPtr
 get_sparse_batch_from_fens.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
@@ -586,7 +615,7 @@ def make_sparse_batch_from_fens(feature_set, fens, scores, plies, results,
     return b
 
 class SparseBatchProvider(TrainingDataProvider):
-    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
+    def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_bucket_mode="k3k3", simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
         super(SparseBatchProvider, self).__init__(
             feature_set,
             create_sparse_batch_stream,
@@ -606,12 +635,12 @@ class SparseBatchProvider(TrainingDataProvider):
             filtered,
             random_fen_skipping,
             device,
-            ranking_target3, side_input, pair_relation_side_input,
+            ranking_target3, side_input, pair_relation_side_input, simple_bucket_mode,
             simple_pp3wide, simple_localpair64, simple_ksg_localpair64,
             simple_gs_localpair64, simple_gs_localpair32_d1)
 
 class SparseBatchDataset(torch.utils.data.IterableDataset):
-  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
+  def __init__(self, feature_set, filename1, filename2, filename3, train1_rate, train2_rate, skiprate, mirror, batch_size, cyclic=True, num_workers=1, filtered=False, random_fen_skipping=0, device='cpu', ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_bucket_mode="k3k3", simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
     super(SparseBatchDataset).__init__()
     self.feature_set = feature_set
     self.filename1 = filename1
@@ -630,6 +659,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.ranking_target3 = ranking_target3
     self.side_input = side_input
     self.pair_relation_side_input = bool(pair_relation_side_input)
+    self.simple_bucket_mode = str(simple_bucket_mode)
     self.simple_pp3wide = bool(simple_pp3wide)
     self.simple_localpair64 = bool(simple_localpair64)
     self.simple_ksg_localpair64 = bool(simple_ksg_localpair64)
@@ -637,7 +667,7 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.simple_gs_localpair32_d1 = bool(simple_gs_localpair32_d1)
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input, simple_pp3wide=self.simple_pp3wide, simple_localpair64=self.simple_localpair64, simple_ksg_localpair64=self.simple_ksg_localpair64, simple_gs_localpair64=self.simple_gs_localpair64, simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
+    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input, simple_bucket_mode=self.simple_bucket_mode, simple_pp3wide=self.simple_pp3wide, simple_localpair64=self.simple_localpair64, simple_ksg_localpair64=self.simple_ksg_localpair64, simple_gs_localpair64=self.simple_gs_localpair64, simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):
