@@ -8,12 +8,16 @@ state can accidentally enter a simple checkpoint.
 from __future__ import annotations
 
 import math
+import hashlib
+from pathlib import Path
 from typing import Any, Dict
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch import nn
 import torch.nn.functional as F
+from simple_frequency_aware_optimizer import FrequencyAwareAdamW
 
 import model as complex_model
 from simple_pp3wide import (
@@ -63,6 +67,11 @@ HALFKA_HM2_KING_BUCKETS = 45
 HALFKA_HM2_PLANES = 1_629
 FT_VIRTUAL_FACTORIZATION_MODES = ("off", "shared")
 FT_VIRTUAL_MAPPING_VERSION = "halfka_hm2_makeindex_mod1629_v1"
+FT_FREQUENCY_LR_MODES = ("off", "mild", "medium")
+FT_FREQUENCY_LR_PRESETS = {
+    "mild": (0.125, 0.75, 1.50),
+    "medium": (0.25, 0.50, 2.00),
+}
 LAYER_STACKS = 9
 # Simple v2 fixed-point contract.  These values mirror the production C++
 # inference implementation and serialize_halfka_hm2_simple.py; QAT must not
@@ -785,6 +794,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_ft_virtual_factorization="off",
         simple_local_pair_feature="off",
         simple_bucket_mode="k3k3",
+        simple_ft_frequency_lr="off",
+        simple_ft_frequency_table=None,
         simple_pp3wide_init="zero",
         simple_pp3wide_nonzero_rate=0.05,
         simple_pp3wide_seed=120,
@@ -822,6 +833,56 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 f"{FT_VIRTUAL_FACTORIZATION_MODES}")
         self.input = SimpleFeatureTransformer(
             virtual_factorization=self.simple_ft_virtual_factorization)
+        self.simple_ft_frequency_lr = str(simple_ft_frequency_lr)
+        if self.simple_ft_frequency_lr not in FT_FREQUENCY_LR_MODES:
+            raise ValueError(
+                f"simple_ft_frequency_lr must be one of {FT_FREQUENCY_LR_MODES}")
+        self.simple_ft_frequency_table = (
+            str(simple_ft_frequency_table) if simple_ft_frequency_table else None)
+        self.simple_ft_frequency_checksum = None
+        self.simple_ft_frequency_alpha = None
+        self.simple_ft_frequency_scale_min = None
+        self.simple_ft_frequency_scale_max = None
+        self.simple_ft_frequency_normalization = "off"
+        self.register_buffer("simple_ft_frequency_scale", None,
+                             persistent=False)
+        if self.simple_ft_frequency_lr != "off":
+            if not self.simple_ft_frequency_table:
+                raise ValueError(
+                    "--simple-ft-frequency-table is required when frequency LR is enabled")
+            table_path = Path(self.simple_ft_frequency_table)
+            raw_bytes = table_path.read_bytes()
+            frequency = np.load(table_path).astype(np.float64)
+            if frequency.shape != (FT_INPUTS,):
+                raise ValueError(
+                    f"frequency table shape must be ({FT_INPUTS},), got {frequency.shape}")
+            alpha, scale_min, scale_max = FT_FREQUENCY_LR_PRESETS[
+                self.simple_ft_frequency_lr]
+            positive = frequency[frequency > 0]
+            if not positive.size or frequency.sum() <= 0:
+                raise ValueError("frequency table has no positive occurrences")
+            reference = float(np.median(positive))
+            raw_scale = (reference / (frequency + 1.0)) ** alpha
+            left, right = 1e-6, 1e6
+            for _ in range(100):
+                normalizer = (left + right) * 0.5
+                scale = np.clip(raw_scale / normalizer, scale_min, scale_max)
+                weighted_mean = float(
+                    np.dot(scale, frequency) / frequency.sum())
+                if weighted_mean > 1.0:
+                    left = normalizer
+                else:
+                    right = normalizer
+            scale = np.clip(
+                raw_scale / ((left + right) * 0.5), scale_min, scale_max)
+            self.simple_ft_frequency_scale = torch.from_numpy(
+                scale.astype(np.float32))
+            self.simple_ft_frequency_checksum = hashlib.sha256(raw_bytes).hexdigest()
+            self.simple_ft_frequency_alpha = alpha
+            self.simple_ft_frequency_scale_min = scale_min
+            self.simple_ft_frequency_scale_max = scale_max
+            self.simple_ft_frequency_normalization = "occurrence_weighted_mean_1"
+        self._frequency_optimizer = None
         self.simple_local_pair_feature = str(simple_local_pair_feature)
         self.simple_bucket_mode = str(simple_bucket_mode)
         if self.simple_bucket_mode not in ("k3k3", "phase9", "kingfree_tree"):
@@ -995,6 +1056,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "simple_ft_virtual_mapping_version": (
                 FT_VIRTUAL_MAPPING_VERSION
                 if self.simple_ft_virtual_factorization == "shared" else None),
+            "simple_ft_frequency_lr": self.simple_ft_frequency_lr,
+            "simple_ft_frequency_table_checksum": self.simple_ft_frequency_checksum,
+            "simple_ft_frequency_alpha": self.simple_ft_frequency_alpha,
+            "simple_ft_frequency_scale_min": self.simple_ft_frequency_scale_min,
+            "simple_ft_frequency_scale_max": self.simple_ft_frequency_scale_max,
+            "simple_ft_frequency_normalization": self.simple_ft_frequency_normalization,
             "simple_local_pair_feature": self.simple_local_pair_feature,
             "simple_pp3wide_schema_version": (
                 (LOCALPAIR_SCHEMA[self.simple_local_pair_feature]
@@ -1344,6 +1411,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
     def _step(self, batch, stage):
         (us, them, wi, wv, bi, bv, outcome, score, bucket, material,
          group, ply, *optional) = batch
+        if stage == "train" and self.simple_ft_frequency_lr != "off":
+            touched = torch.unique(torch.cat((wi[wi >= 0], bi[bi >= 0])))
+            if self._frequency_optimizer is None:
+                raise RuntimeError("frequency-aware optimizer is not configured")
+            self._frequency_optimizer.set_touched_rows(touched)
         pp_kwargs = {}
         if self.pp3wide is not None:
             if len(optional) < 4:
@@ -2401,12 +2473,24 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         ft_parameters = list(self.input.parameters())
         if self.pp3wide is not None:
             ft_parameters.extend(self.pp3wide.parameters())
-        optimizer = torch.optim.AdamW(
+        optimizer_class = (FrequencyAwareAdamW
+                           if self.simple_ft_frequency_lr != "off"
+                           else torch.optim.AdamW)
+        optimizer_kwargs = {}
+        if optimizer_class is FrequencyAwareAdamW:
+            optimizer_kwargs = {
+                "ft_weight": self.input.weight,
+                "row_scale": self.simple_ft_frequency_scale,
+            }
+        optimizer = optimizer_class(
             [
                 {"params": ft_parameters, "lr": self.lr},
                 {"params": downstream, "lr": self.lr},
             ],
-            betas=(0.9, 0.995), eps=1e-7, weight_decay=1e-6)
+            betas=(0.9, 0.995), eps=1e-7, weight_decay=1e-6,
+            **optimizer_kwargs)
+        if isinstance(optimizer, FrequencyAwareAdamW):
+            self._frequency_optimizer = optimizer
         scheduler = torch.optim.lr_scheduler.ExponentialLR(
             optimizer, gamma=self.gamma)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}

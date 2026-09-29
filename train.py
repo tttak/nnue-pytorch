@@ -7,6 +7,7 @@ import hashlib
 import json
 import model as M
 from simple_halfka_hm2_model import (
+    FT_FREQUENCY_LR_MODES,
     FT_VIRTUAL_FACTORIZATION_MODES,
     FT_VIRTUAL_MAPPING_VERSION,
     SIMPLE_QAT_MODES,
@@ -676,6 +677,15 @@ def main():
             "adds a king-position-independent virtual table; export "
             "coalesces it into the unchanged C++ FT. Default: off."))
   parser.add_argument(
+      "--simple-ft-frequency-lr", choices=FT_FREQUENCY_LR_MODES,
+      default="off",
+      help=("Training-only HalfKA_HM2 row-wise actual-update scaling "
+            "(Experiment 134). Default: off."))
+  parser.add_argument(
+      "--simple-ft-frequency-table", default=None,
+      help=("Path to the fixed 73,305-row occurrence .npy table required "
+            "by --simple-ft-frequency-lr mild/medium."))
+  parser.add_argument(
       "--simple-local-pair-feature", choices=SIMPLE_LOCAL_PAIR_FEATURES,
       default="off",
       help=("Experiment 120/121 local sparse pair component. "
@@ -971,6 +981,7 @@ def main():
   simple_any_experimental_path = bool(
       simple_any_side_input or args.use_shared_psqt
       or args.simple_ft_virtual_factorization != "off"
+      or args.simple_ft_frequency_lr != "off"
       or args.simple_local_pair_feature != "off")
   if args.use_side_input and args.use_direct_side_input:
     raise ValueError(
@@ -991,6 +1002,13 @@ def main():
     raise ValueError(
         "--simple-ft-virtual-factorization requires "
         "--architecture halfka_hm2_simple")
+  if args.simple_ft_frequency_lr != "off" and not simple_architecture:
+    raise ValueError(
+        "--simple-ft-frequency-lr requires --architecture halfka_hm2_simple")
+  if (args.simple_ft_frequency_lr != "off"
+      and not args.simple_ft_frequency_table):
+    raise ValueError(
+        "--simple-ft-frequency-table is required when frequency LR is enabled")
   if args.simple_local_pair_feature != "off" and not simple_architecture:
     raise ValueError(
         "--simple-local-pair-feature requires "
@@ -1087,6 +1105,10 @@ def main():
       simple_ft_virtual_factorization=(
           args.simple_ft_virtual_factorization
           if simple_architecture else "off"),
+      simple_ft_frequency_lr=(
+          args.simple_ft_frequency_lr if simple_architecture else "off"),
+      simple_ft_frequency_table=(
+          args.simple_ft_frequency_table if simple_architecture else None),
       simple_local_pair_feature=(
           args.simple_local_pair_feature if simple_architecture else "off"),
       simple_bucket_mode=(
@@ -1406,6 +1428,10 @@ def main():
         resume_overrides["simple_qat_mode"] = simple_qat_mode
         resume_overrides["simple_ft_virtual_factorization"] = (
             args.simple_ft_virtual_factorization)
+        resume_overrides["simple_ft_frequency_lr"] = (
+            args.simple_ft_frequency_lr)
+        resume_overrides["simple_ft_frequency_table"] = (
+            args.simple_ft_frequency_table)
         resume_overrides["simple_local_pair_feature"] = (
             args.simple_local_pair_feature)
         resume_overrides["simple_bucket_mode"] = args.simple_bucket_mode
@@ -1441,6 +1467,23 @@ def main():
                 f"{args.simple_ft_virtual_factorization}. Use "
                 "--resume-from-model without --resume-training-state for "
                 "weight-only conversion and a fresh optimizer.")
+          saved_frequency_lr = source_metadata.get(
+              "simple_ft_frequency_lr", "off")
+          saved_frequency_checksum = source_metadata.get(
+              "simple_ft_frequency_table_checksum")
+          if saved_frequency_lr != args.simple_ft_frequency_lr:
+            raise ValueError(
+                "cannot change Simple FT frequency LR while restoring "
+                f"optimizer state: checkpoint={saved_frequency_lr}, "
+                f"requested={args.simple_ft_frequency_lr}")
+          if args.simple_ft_frequency_lr != "off":
+            requested_checksum = hashlib.sha256(
+                Path(args.simple_ft_frequency_table).read_bytes()).hexdigest()
+            if saved_frequency_checksum != requested_checksum:
+              raise ValueError(
+                  "Simple FT frequency table checksum mismatch while "
+                  "restoring optimizer state: checkpoint="
+                  f"{saved_frequency_checksum}, requested={requested_checksum}")
           del source_checkpoint
         if args.resume_training_state:
           source_checkpoint = torch.load(
