@@ -669,6 +669,22 @@ def main():
       "--simple-qat", action="store_true",
       help=("Alias for --simple-qat-mode full; valid only for "
             "--architecture halfka_hm2_simple."))
+  parser.add_argument("--simple-quant-boundary-reg",
+                      choices=("off", "weak", "mild", "medium"), default="off",
+                      help="Simple full-QAT training-only boundary penalty (default: off).")
+  parser.add_argument("--simple-quant-boundary-band", type=float,
+                      help="Default .025 for weak, .05 for mild/medium.")
+  parser.add_argument("--simple-quant-boundary-ft-interval", type=int,
+                      help="FT penalty every N optimizer steps; weak default 8, otherwise 1.")
+  parser.add_argument("--simple-quant-boundary-ft-weight", type=float, default=0.0)
+  parser.add_argument("--simple-quant-boundary-dense-weight", type=float, default=0.0)
+  parser.add_argument("--simple-quant-boundary-fc0-weight", type=float)
+  parser.add_argument("--simple-quant-boundary-fc1-weight", type=float)
+  parser.add_argument("--simple-quant-boundary-output-weight", type=float)
+  parser.add_argument("--simple-qat-hysteresis", choices=("off", "anti_flip"), default="off")
+  parser.add_argument("--simple-qat-hysteresis-cooldown", type=int, default=32)
+  parser.add_argument("--simple-qat-hysteresis-band", type=float, default=2.6212064783688287e-5)
+  parser.add_argument("--simple-qat-hysteresis-restore-margin", type=float, default=1e-5)
   parser.add_argument(
       "--simple-ft-virtual-factorization",
       choices=FT_VIRTUAL_FACTORIZATION_MODES,
@@ -997,6 +1013,16 @@ def main():
     raise ValueError(
         "--simple-qat/--simple-qat-mode requires "
         "--architecture halfka_hm2_simple")
+  if args.simple_quant_boundary_reg != "off":
+    if not simple_architecture or simple_qat_mode != "full":
+      raise ValueError("Simple boundary penalty requires Simple full QAT")
+    if simple_any_experimental_path or args.simple_base_bucket_importance:
+      raise ValueError("Experiment 144 requires side/factor/frequency/LocalPair OFF")
+  if args.simple_qat_hysteresis != "off":
+    if not simple_architecture or simple_qat_mode != "full" or args.simple_quant_boundary_reg != "off":
+      raise ValueError("anti_flip requires Simple full QAT with boundary regularization OFF")
+    if simple_any_experimental_path or args.simple_base_bucket_importance:
+      raise ValueError("Experiment 146 requires side/factor/frequency/LocalPair OFF")
   if (args.simple_ft_virtual_factorization != "off"
       and not simple_architecture):
     raise ValueError(
@@ -1102,6 +1128,21 @@ def main():
           args.simple_base_bucket_importance
           if simple_architecture else False),
       simple_qat_mode=(simple_qat_mode if simple_architecture else "off"),
+      simple_quant_boundary_reg=(args.simple_quant_boundary_reg
+                                 if simple_architecture else "off"),
+      simple_quant_boundary_band=args.simple_quant_boundary_band,
+      simple_quant_boundary_ft_interval=args.simple_quant_boundary_ft_interval,
+      simple_quant_boundary_ft_weight=args.simple_quant_boundary_ft_weight,
+      simple_quant_boundary_dense_weight=args.simple_quant_boundary_dense_weight,
+      simple_quant_boundary_fc0_weight=args.simple_quant_boundary_fc0_weight,
+      simple_quant_boundary_fc1_weight=args.simple_quant_boundary_fc1_weight,
+      simple_quant_boundary_output_weight=args.simple_quant_boundary_output_weight,
+      enforce_quant_boundary_resume_match=bool(args.resume_training_state),
+      simple_qat_hysteresis=args.simple_qat_hysteresis,
+      simple_qat_hysteresis_cooldown=args.simple_qat_hysteresis_cooldown,
+      simple_qat_hysteresis_band=args.simple_qat_hysteresis_band,
+      simple_qat_hysteresis_restore_margin=args.simple_qat_hysteresis_restore_margin,
+      enforce_hysteresis_resume_match=bool(args.resume_training_state),
       simple_ft_virtual_factorization=(
           args.simple_ft_virtual_factorization
           if simple_architecture else "off"),
@@ -1191,6 +1232,20 @@ def main():
               "use_bucket_importance_base_loss": bool(
                   args.simple_base_bucket_importance),
               "simple_qat_mode": simple_qat_mode,
+              "simple_quant_boundary_reg": args.simple_quant_boundary_reg,
+              "simple_quant_boundary_band": args.simple_quant_boundary_band,
+              "simple_quant_boundary_ft_interval": args.simple_quant_boundary_ft_interval,
+              "simple_quant_boundary_ft_weight": args.simple_quant_boundary_ft_weight,
+              "simple_quant_boundary_dense_weight": args.simple_quant_boundary_dense_weight,
+              "simple_quant_boundary_fc0_weight": args.simple_quant_boundary_fc0_weight,
+              "simple_quant_boundary_fc1_weight": args.simple_quant_boundary_fc1_weight,
+              "simple_quant_boundary_output_weight": args.simple_quant_boundary_output_weight,
+              "enforce_quant_boundary_resume_match": bool(args.resume_training_state),
+              "simple_qat_hysteresis": args.simple_qat_hysteresis,
+              "simple_qat_hysteresis_cooldown": args.simple_qat_hysteresis_cooldown,
+              "simple_qat_hysteresis_band": args.simple_qat_hysteresis_band,
+              "simple_qat_hysteresis_restore_margin": args.simple_qat_hysteresis_restore_margin,
+              "enforce_hysteresis_resume_match": bool(args.resume_training_state),
               "use_shared_psqt": bool(
                   args.use_shared_psqt
                   or architecture.get("use_shared_psqt", False)),
@@ -1426,6 +1481,20 @@ def main():
             args.simple_base_bucket_importance)
         resume_overrides["use_shared_psqt"] = bool(args.use_shared_psqt)
         resume_overrides["simple_qat_mode"] = simple_qat_mode
+        resume_overrides["simple_quant_boundary_reg"] = args.simple_quant_boundary_reg
+        resume_overrides["simple_quant_boundary_band"] = args.simple_quant_boundary_band
+        resume_overrides["simple_quant_boundary_ft_interval"] = args.simple_quant_boundary_ft_interval
+        resume_overrides["simple_quant_boundary_ft_weight"] = args.simple_quant_boundary_ft_weight
+        resume_overrides["simple_quant_boundary_dense_weight"] = args.simple_quant_boundary_dense_weight
+        resume_overrides["simple_quant_boundary_fc0_weight"] = args.simple_quant_boundary_fc0_weight
+        resume_overrides["simple_quant_boundary_fc1_weight"] = args.simple_quant_boundary_fc1_weight
+        resume_overrides["simple_quant_boundary_output_weight"] = args.simple_quant_boundary_output_weight
+        resume_overrides["enforce_quant_boundary_resume_match"] = bool(args.resume_training_state)
+        resume_overrides["simple_qat_hysteresis"] = args.simple_qat_hysteresis
+        resume_overrides["simple_qat_hysteresis_cooldown"] = args.simple_qat_hysteresis_cooldown
+        resume_overrides["simple_qat_hysteresis_band"] = args.simple_qat_hysteresis_band
+        resume_overrides["simple_qat_hysteresis_restore_margin"] = args.simple_qat_hysteresis_restore_margin
+        resume_overrides["enforce_hysteresis_resume_match"] = bool(args.resume_training_state)
         resume_overrides["simple_ft_virtual_factorization"] = (
             args.simple_ft_virtual_factorization)
         resume_overrides["simple_ft_frequency_lr"] = (

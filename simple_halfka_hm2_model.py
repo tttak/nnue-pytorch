@@ -18,6 +18,14 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from simple_frequency_aware_optimizer import FrequencyAwareAdamW
+from simple_quant_boundary import (
+    MODES as QUANT_BOUNDARY_MODES, FORMULA_VERSION as QUANT_BOUNDARY_VERSION,
+    CALIBRATED_PRESETS, boundary_penalty, touched_ft_rows, ft_regularization_due,
+)
+from simple_quant_hysteresis import (
+    HysteresisAdamW, VERSION as HYSTERESIS_VERSION,
+    DEFAULT_COOLDOWN, DEFAULT_BAND, DEFAULT_MARGIN,
+)
 
 import model as complex_model
 from simple_pp3wide import (
@@ -791,6 +799,20 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         use_shared_psqt=False,
         use_bucket_importance_base_loss=False,
         simple_qat_mode="off",
+        simple_quant_boundary_reg="off",
+        simple_quant_boundary_band=None,
+        simple_quant_boundary_ft_interval=None,
+        simple_quant_boundary_ft_weight=0.0,
+        simple_quant_boundary_dense_weight=0.0,
+        simple_quant_boundary_fc0_weight=None,
+        simple_quant_boundary_fc1_weight=None,
+        simple_quant_boundary_output_weight=None,
+        enforce_quant_boundary_resume_match=False,
+        simple_qat_hysteresis="off",
+        simple_qat_hysteresis_cooldown=DEFAULT_COOLDOWN,
+        simple_qat_hysteresis_band=DEFAULT_BAND,
+        simple_qat_hysteresis_restore_margin=DEFAULT_MARGIN,
+        enforce_hysteresis_resume_match=False,
         simple_ft_virtual_factorization="off",
         simple_local_pair_feature="off",
         simple_bucket_mode="k3k3",
@@ -984,6 +1006,61 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError(
                 f"simple_qat_mode must be one of {SIMPLE_QAT_MODES}, got "
                 f"{self.simple_qat_mode!r}")
+        self.simple_quant_boundary_reg = str(simple_quant_boundary_reg)
+        if self.simple_quant_boundary_reg not in QUANT_BOUNDARY_MODES:
+            raise ValueError("unknown Simple quantization boundary mode")
+        default_band = .025 if self.simple_quant_boundary_reg == "weak" else .05
+        if simple_quant_boundary_band is None:
+            simple_quant_boundary_band = default_band
+        if simple_quant_boundary_ft_interval is None:
+            simple_quant_boundary_ft_interval = (
+                8 if self.simple_quant_boundary_reg == "weak" else 1)
+        ft_regularization_due(0, simple_quant_boundary_ft_interval)
+        self.simple_quant_boundary_ft_interval = int(simple_quant_boundary_ft_interval)
+        if self.simple_quant_boundary_reg != "off" and self.simple_qat_mode != "full":
+            raise ValueError("quantization boundary regularization requires full QAT")
+        if (self.simple_quant_boundary_reg != "off" and
+                (simple_ft_virtual_factorization != "off" or
+                 simple_ft_frequency_lr != "off" or
+                 simple_local_pair_feature != "off")):
+            raise ValueError("boundary experiment requires virtual/frequency/LocalPair OFF")
+        if (self.simple_quant_boundary_reg in CALIBRATED_PRESETS and
+                not simple_quant_boundary_ft_weight and
+                not simple_quant_boundary_dense_weight and
+                all(x is None for x in (
+                    simple_quant_boundary_fc0_weight,
+                    simple_quant_boundary_fc1_weight,
+                    simple_quant_boundary_output_weight))):
+            if float(simple_quant_boundary_band) != default_band:
+                raise ValueError(
+                    "boundary band override requires explicit calibrated weights")
+            preset = CALIBRATED_PRESETS[self.simple_quant_boundary_reg]
+            simple_quant_boundary_ft_weight = preset["ft"]
+            simple_quant_boundary_fc0_weight = preset["fc0"]
+            simple_quant_boundary_fc1_weight = preset["fc1"]
+            simple_quant_boundary_output_weight = preset["fc2"]
+        self.simple_quant_boundary_band = float(simple_quant_boundary_band)
+        self.simple_quant_boundary_ft_weight = float(simple_quant_boundary_ft_weight)
+        self.simple_quant_boundary_dense_weight = float(simple_quant_boundary_dense_weight)
+        self.simple_quant_boundary_layer_weights = {
+            name: (self.simple_quant_boundary_dense_weight if value is None
+                   else float(value))
+            for name, value in (
+                ("fc0", simple_quant_boundary_fc0_weight),
+                ("fc1", simple_quant_boundary_fc1_weight),
+                ("fc2", simple_quant_boundary_output_weight))}
+        self.enforce_quant_boundary_resume_match = bool(
+            enforce_quant_boundary_resume_match)
+        if not 0.0 < self.simple_quant_boundary_band < 0.5:
+            raise ValueError("boundary band must be in (0, 0.5)")
+        if (self.simple_quant_boundary_ft_weight < 0.0 or
+                self.simple_quant_boundary_dense_weight < 0.0 or
+                any(x < 0.0 for x in self.simple_quant_boundary_layer_weights.values())):
+            raise ValueError("boundary weights must be nonnegative")
+        if (self.simple_quant_boundary_reg != "off" and
+                not (self.simple_quant_boundary_ft_weight or
+                     any(self.simple_quant_boundary_layer_weights.values()))):
+            raise ValueError("enabled boundary mode requires calibrated weights")
         self.register_buffer(
             "_bucket_importance_weights",
             torch.tensor(SIMPLE_BUCKET_IMPORTANCE_NORMALIZED),
@@ -998,6 +1075,25 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.simple_validation_cohort_report = False
         self._simple_validation_cohorts = None
         self.nnue2score = NNUE_TO_SCORE
+        self.simple_qat_hysteresis = str(simple_qat_hysteresis)
+        self.simple_qat_hysteresis_cooldown = int(simple_qat_hysteresis_cooldown)
+        self.simple_qat_hysteresis_band = float(simple_qat_hysteresis_band)
+        self.simple_qat_hysteresis_restore_margin = float(simple_qat_hysteresis_restore_margin)
+        self.enforce_hysteresis_resume_match = bool(enforce_hysteresis_resume_match)
+        self._hysteresis_rows = None
+        if self.simple_qat_hysteresis not in ("off", "anti_flip"):
+            raise ValueError("unknown Simple QAT hysteresis mode")
+        if self.simple_qat_hysteresis != "off":
+            if (self.simple_qat_mode != "full" or self.simple_quant_boundary_reg != "off"
+                    or self.simple_local_pair_feature != "off"
+                    or self.simple_ft_virtual_factorization != "off"
+                    or self.simple_ft_frequency_lr != "off" or self.use_side_input
+                    or self.use_shared_psqt):
+                raise ValueError("anti_flip requires full QAT, boundary/side/LocalPair/factor/frequency OFF")
+            if not 1 <= self.simple_qat_hysteresis_cooldown <= 63:
+                raise ValueError("hysteresis cooldown must be 1..63")
+            if not 0 < self.simple_qat_hysteresis_band < .5 or not 0 < self.simple_qat_hysteresis_restore_margin < .5:
+                raise ValueError("hysteresis band/margin must be in (0,.5)")
         self.weight_clipping = [
             {
                 "name": "FC0",
@@ -1036,10 +1132,27 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.listwise_ft_grad_scale = 1.0
         self.ranking_disagreement_weight = 1.0
         self.save_hyperparameters(ignore=("feature_set", "unused"))
+        if self.simple_qat_hysteresis == "off":
+            for key in ("simple_qat_hysteresis", "simple_qat_hysteresis_cooldown",
+                        "simple_qat_hysteresis_band", "simple_qat_hysteresis_restore_margin",
+                        "enforce_hysteresis_resume_match"):
+                self.hparams.pop(key, None)
+        if self.simple_quant_boundary_reg == "off":
+            # Preserve the historical OFF checkpoint hyperparameter payload.
+            for key in (
+                    "simple_quant_boundary_reg", "simple_quant_boundary_band",
+                    "simple_quant_boundary_ft_interval",
+                    "simple_quant_boundary_ft_weight",
+                    "simple_quant_boundary_dense_weight",
+                    "simple_quant_boundary_fc0_weight",
+                    "simple_quant_boundary_fc1_weight",
+                    "simple_quant_boundary_output_weight",
+                    "enforce_quant_boundary_resume_match"):
+                self.hparams.pop(key, None)
 
     def architecture_metadata(self, transplant_source=None, mapping_version=None):
         use_side_input = bool(getattr(self, "use_side_input", False))
-        return {
+        metadata = {
             "architecture_type": ARCHITECTURE_TYPE,
             "feature": FEATURE_NAME,
             "ft_width": FT_WIDTH,
@@ -1147,6 +1260,18 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             "transplant_source": transplant_source,
             "transplant_mapping_version": mapping_version,
         }
+        if self.simple_quant_boundary_reg != "off":
+            metadata.update({
+                "simple_quant_boundary_reg": self.simple_quant_boundary_reg,
+                "simple_quant_boundary_band": self.simple_quant_boundary_band,
+                "simple_quant_boundary_ft_interval": self.simple_quant_boundary_ft_interval,
+                "simple_quant_boundary_ft_weight": self.simple_quant_boundary_ft_weight,
+                "simple_quant_boundary_dense_weight": self.simple_quant_boundary_dense_weight,
+                "simple_quant_boundary_layer_weights":
+                    self.simple_quant_boundary_layer_weights,
+                "simple_quant_boundary_formula": QUANT_BOUNDARY_VERSION,
+            })
+        return metadata
 
     def set_feature_set(self, feature_set):
         if feature_set.name != FEATURE_NAME:
@@ -1411,6 +1536,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
     def _step(self, batch, stage):
         (us, them, wi, wv, bi, bv, outcome, score, bucket, material,
          group, ply, *optional) = batch
+        if stage == "train" and self.simple_qat_hysteresis != "off":
+            self._hysteresis_rows = touched_ft_rows(wi, wv, bi, bv)
         if stage == "train" and self.simple_ft_frequency_lr != "off":
             touched = torch.unique(torch.cat((wi[wi >= 0], bi[bi >= 0])))
             if self._frequency_optimizer is None:
@@ -1482,6 +1609,21 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 pair_acc = ((diffs[non_equal] > 0)
                             == (directions[non_equal] > 0)).float().mean()
         total = base_loss + 0.01 * pair_loss + 0.01 * listwise_loss
+        if stage == "train" and self.simple_quant_boundary_reg != "off":
+            boundary_total, ft_reg, dense_regs, ft_applied = self.quant_boundary_loss(
+                wi, wv, bi, bv, self.global_step)
+            total = total + boundary_total
+            self.log("train/quant_boundary_ft_applied", float(ft_applied),
+                     on_step=True, on_epoch=False, batch_size=score.numel())
+            self.log("train/quant_boundary_ft", ft_reg.detach(), on_step=True,
+                     on_epoch=False, batch_size=score.numel())
+            for name, reg in zip(("fc0", "fc1", "output"), dense_regs):
+                self.log(f"train/quant_boundary_{name}", reg.detach(),
+                         on_step=True, on_epoch=False,
+                         batch_size=score.numel())
+            self.log("train/quant_boundary_total", boundary_total.detach(),
+                     on_step=True, on_epoch=False,
+                     batch_size=score.numel())
 
         if stage == "val":
             if self.simple_validation_cohort_report:
@@ -1560,6 +1702,46 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             self.log(f"{stage}/pair_accuracy", pair_acc, on_step=False, on_epoch=True,
                      batch_size=score.numel())
         return total
+
+    def quant_boundary_loss(self, wi, wv, bi, bv, global_step):
+        """Training-only penalty; skipped FT steps do no unique/index selection.
+
+        Callers supply optimizer global_step explicitly for offline probes.
+        No interval multiplier is applied to lambda on execution steps.
+        """
+        ft_reg = self.input.weight.new_zeros(())
+        ft_applied = (self.simple_quant_boundary_reg != "off" and
+                      self.simple_quant_boundary_ft_weight != 0 and
+                      ft_regularization_due(global_step, self.simple_quant_boundary_ft_interval))
+        if ft_applied:
+            touched = touched_ft_rows(wi, wv, bi, bv)
+            if touched.numel():
+                ft_reg = boundary_penalty(
+                    self.input.weight.index_select(0, touched),
+                    FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX,
+                    self.simple_quant_boundary_band)
+        dense_regs = []
+        for name in ("fc0", "fc1", "fc2"):
+            if self.simple_quant_boundary_reg == "weak":
+                # Equal-size bucket tensors: one concatenated mean is the
+                # same margin objective as mean(per-bucket means). Fewer
+                # small CUDA launches keeps skipped-FT steps inexpensive.
+                weights = torch.cat([
+                    getattr(stack, name).weight.reshape(-1)
+                    for stack in self.layer_stacks])
+                dense_regs.append(boundary_penalty(
+                    weights, DENSE_WEIGHT_SCALE, DENSE_WEIGHT_MIN, DENSE_WEIGHT_MAX,
+                    self.simple_quant_boundary_band))
+                continue
+            dense_regs.append(torch.stack([
+                boundary_penalty(getattr(stack, name).weight,
+                                 DENSE_WEIGHT_SCALE, DENSE_WEIGHT_MIN, DENSE_WEIGHT_MAX,
+                                 self.simple_quant_boundary_band)
+                for stack in self.layer_stacks]).mean())
+        total = self.simple_quant_boundary_ft_weight * ft_reg + sum(
+            self.simple_quant_boundary_layer_weights[name] * reg
+            for name, reg in zip(("fc0", "fc1", "fc2"), dense_regs))
+        return total, ft_reg, dense_regs, ft_applied
 
     def training_step(self, batch, batch_idx):
         interval = int(getattr(self, "simple_debug_log_interval", 500))
@@ -2477,6 +2659,16 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                            if self.simple_ft_frequency_lr != "off"
                            else torch.optim.AdamW)
         optimizer_kwargs = {}
+        if self.simple_qat_hysteresis == "anti_flip":
+            optimizer_class = HysteresisAdamW
+            targets = [("FT", self.input.weight, FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX)]
+            for i, stack in enumerate(self.layer_stacks):
+                for name in ("fc0", "fc1", "fc2"):
+                    targets.append((f"{name}/B{i:02d}", getattr(stack, name).weight,
+                                    DENSE_WEIGHT_SCALE, DENSE_WEIGHT_MIN, DENSE_WEIGHT_MAX))
+            optimizer_kwargs.update(targets=targets, row_provider=lambda: self._hysteresis_rows,
+                cooldown=self.simple_qat_hysteresis_cooldown, band=self.simple_qat_hysteresis_band,
+                restore_margin=self.simple_qat_hysteresis_restore_margin)
         if optimizer_class is FrequencyAwareAdamW:
             optimizer_kwargs = {
                 "ft_weight": self.input.weight,
@@ -2501,13 +2693,47 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             getattr(self, "transplant_mapping_version", None))
         checkpoint["architecture"] = metadata
         checkpoint["nnue_architecture"] = metadata
+        if self.simple_qat_hysteresis != "off":
+            # Training-only settings, separate from exported architecture/hash.
+            checkpoint["quant_hysteresis_settings"] = self.hysteresis_settings()
+
+    def hysteresis_settings(self):
+        return {"mode": self.simple_qat_hysteresis,
+                "cooldown": self.simple_qat_hysteresis_cooldown,
+                "band": self.simple_qat_hysteresis_band,
+                "restore_margin": self.simple_qat_hysteresis_restore_margin,
+                "version": HYSTERESIS_VERSION, "coverage": "touched_only"}
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
+        saved_hysteresis = checkpoint.get("quant_hysteresis_settings", {"mode": "off"})
+        expected_hysteresis = self.hysteresis_settings()
+        mismatch = (saved_hysteresis.get("mode") != self.simple_qat_hysteresis or
+                    (self.simple_qat_hysteresis != "off" and saved_hysteresis != expected_hysteresis))
+        if mismatch and self.enforce_hysteresis_resume_match:
+            raise ValueError("Simple QAT hysteresis training-state resume mismatch")
         metadata = checkpoint.get("architecture") or checkpoint.get("nnue_architecture")
         if not metadata or metadata.get("architecture_type") != ARCHITECTURE_TYPE:
             raise ValueError("checkpoint is not a HalfKA_hm2 simple checkpoint")
         if int(metadata.get("simple_schema_version", -1)) != SIMPLE_SCHEMA_VERSION:
             raise ValueError("HalfKA_hm2 simple schema mismatch")
+        saved_boundary = metadata.get("simple_quant_boundary_reg", "off")
+        boundary_settings_mismatch = any(
+            metadata.get(key) != expected for key, expected in (
+                ("simple_quant_boundary_band", self.simple_quant_boundary_band),
+                ("simple_quant_boundary_ft_weight", self.simple_quant_boundary_ft_weight),
+                ("simple_quant_boundary_dense_weight", self.simple_quant_boundary_dense_weight),
+                ("simple_quant_boundary_layer_weights", self.simple_quant_boundary_layer_weights),
+                ("simple_quant_boundary_formula", QUANT_BOUNDARY_VERSION)))
+        boundary_settings_mismatch |= (
+            metadata.get("simple_quant_boundary_ft_interval", 1)
+            != self.simple_quant_boundary_ft_interval)
+        if (saved_boundary != self.simple_quant_boundary_reg or
+                (saved_boundary != "off" and boundary_settings_mismatch)):
+            if getattr(self, "enforce_quant_boundary_resume_match", False):
+                raise ValueError("Simple quantization boundary resume mismatch")
+            print("Weight-only Simple quantization boundary setting change: "
+                  f"checkpoint={saved_boundary}, requested="
+                  f"{self.simple_quant_boundary_reg}; optimizer will start fresh")
         saved_side_input = bool(metadata.get("use_side_input", False))
         saved_side_type = metadata.get("simple_side_input_type", "none")
         saved_shared_psqt = bool(metadata.get("use_shared_psqt", False))
