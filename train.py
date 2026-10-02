@@ -831,6 +831,9 @@ def main():
   parser.add_argument("--random-fen-skipping", default=0, type=int, dest='random_fen_skipping', help="skip fens randomly on average random_fen_skipping before using one.")
   parser.add_argument("--resume-from-model", dest='resume_from_model', help="Initializes training using the weights from the given .pt model")
   parser.add_argument(
+      "--complex-fm-diff-shared", choices=("off", "value"), default=None,
+      help="Train-only FM Diff value factor. New models default off; omitted resume preserves saved mode.")
+  parser.add_argument(
       "--resume-training-state", dest="resume_training_state",
       help="Resume model, optimizer, scheduler, epoch and global step from a Lightning .ckpt.")
   parser.add_argument("--epoch-size", default=1000000, type=int, dest='epoch_size', help="epoch size.")
@@ -990,6 +993,8 @@ def main():
 
   feature_set = features.get_feature_set_from_name(args.features)
   simple_architecture = args.architecture == "halfka_hm2_simple"
+  if simple_architecture and args.complex_fm_diff_shared is not None:
+    raise ValueError("--complex-fm-diff-shared is only supported by Complex NNUE")
   if (args.simple_qat
       and args.simple_qat_mode not in ("off", SIMPLE_QAT_RECOMMENDED_MODE)):
     raise ValueError(
@@ -1105,6 +1110,8 @@ def main():
     torch.manual_seed(args.seed)
   if args.resume_from_model is None:
     nnue = ModelClass(feature_set=feature_set,
+      **({"complex_fm_diff_shared": args.complex_fm_diff_shared or "off"}
+         if not simple_architecture else {}),
       start_lambda=start_lambda,
       max_epoch=max_epoch,
       end_lambda=end_lambda,
@@ -1393,6 +1400,20 @@ def main():
               "Simple FT parameterization conversion: "
               f"{source_factorization} -> {target_factorization}; "
               "optimizer/scheduler start fresh")
+      if not simple_architecture:
+          saved_shared_mode = (
+              "value" if "layer_stacks.fm_diff_value_shared.weight" in checkpoint_dict
+              else "off")
+          target_shared_mode = args.complex_fm_diff_shared or saved_shared_mode
+          nnue.set_fm_diff_shared(target_shared_mode)
+          if saved_shared_mode == "value" and target_shared_mode == "off":
+              checkpoint_dict = dict(checkpoint_dict)
+              w = checkpoint_dict["layer_stacks.fm_diff.weight"].clone().view(nnue.num_ls_buckets, 64, 128)
+              b = checkpoint_dict["layer_stacks.fm_diff.bias"].clone().view(nnue.num_ls_buckets, 64)
+              w[:, 32:] += checkpoint_dict.pop("layer_stacks.fm_diff_value_shared.weight")
+              b[:, 32:] += checkpoint_dict.pop("layer_stacks.fm_diff_value_shared.bias")
+              checkpoint_dict["layer_stacks.fm_diff.weight"] = w.reshape(-1, 128)
+              checkpoint_dict["layer_stacks.fm_diff.bias"] = b.reshape(-1)
       model_dict = nnue.state_dict()
       if architecture is not None:
           print("Resuming .pt architecture:",
@@ -1490,6 +1511,8 @@ def main():
           "freeze_ft_router": args.freeze_ft_router,
           "enforce_optimizer_checkpoint_match": bool(args.resume_training_state),
       })
+      if not simple_architecture and args.complex_fm_diff_shared is not None:
+        resume_overrides["complex_fm_diff_shared"] = args.complex_fm_diff_shared
       if simple_architecture:
         resume_overrides["use_bucket_importance_base_loss"] = bool(
             args.simple_base_bucket_importance)

@@ -406,7 +406,20 @@ def get_parameters(layers):
     return [p for layer in layers for p in layer.parameters()]
 
 
+from complex_fm_shared import (
+    normalize_fm_diff_shared, make_value_factor, effective_diff_parameters,
+    diff_affine, clip_effective_diff,
+)
+
+
 class LayerStacks(nn.Module):
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if not hasattr(self, "complex_fm_diff_shared"):
+            self.complex_fm_diff_shared = "off"
+        if not hasattr(self, "fm_diff_value_shared"):
+            self.fm_diff_value_shared = None
+
     def __init__(self, count, remove_abs_sqr_l2=True, remove_main_sqr_l2=False,
                  phase_output_dimensions=None, l3_dimensions=L3,
                  cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS,
@@ -417,7 +430,8 @@ class LayerStacks(nn.Module):
                  side_input_dim=8, side_input_fusion="l2_residual",
                  safe_escape_experiment=False,
                  pair_relation_side_input=False,
-                 pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION):
+                 pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION,
+                 complex_fm_diff_shared="off"):
         super(LayerStacks, self).__init__()
         # Experiment 76 only. Disabled by default, so the production parameter
         # schema, forward result, serializer, and checkpoints remain unchanged.
@@ -511,6 +525,10 @@ class LayerStacks(nn.Module):
         TOTAL_FM_GLU_OUT = FM_GLU_OUT_PER_BUCKET * count
         self.fm_diff = nn.Linear(128, TOTAL_FM_GLU_OUT)
         self.fm_abs = nn.Linear(128, TOTAL_FM_GLU_OUT)
+        self.complex_fm_diff_shared = normalize_fm_diff_shared(complex_fm_diff_shared)
+        self.fm_diff_value_shared = (
+            make_value_factor(self.fm_diff.weight)
+            if self.complex_fm_diff_shared == "value" else None)
 
         # --- l2, output
         self.l2 = nn.Linear(self.l2_in_total, self.l3_dimensions * count)
@@ -851,14 +869,22 @@ class LayerStacks(nn.Module):
             self.current_phase_for_loss = phase
 
         # --- PHASE 2: FMPath (全12バケット完全並列抽出) ---
-        l1c_diff_all = self.fm_diff(diff_in).reshape(-1, self.count, 64)  # [B, 12, 64]
+        l1c_diff_all = diff_affine(
+            self.fm_diff, self.fm_diff_value_shared, self.count, diff_in
+        ).reshape(-1, self.count, 64)
         l1c_abs_all = self.fm_abs(abs_in).reshape(-1, self.count, 64)   # [B, 12, 64]
 
         gate_d_all, val_d_all = l1c_diff_all.chunk(2, dim=-1)  # 各 [B, 12, 32]
         gate_a_all, val_a_all = l1c_abs_all.chunk(2, dim=-1)  # 各 [B, 12, 32]
+        if getattr(self, "capture_fm_shared_diagnostics", False):
+            self.fm_shared_trace = {"gate": gate_d_all, "value": val_d_all,
+                                    "affine": l1c_diff_all, "input": diff_in,
+                                    "abs_gate": gate_a_all}
 
         rms_d_all = torch.rsqrt(val_d_all.pow(2).mean(dim=-1, keepdim=True) + 1e-8)  # [B, 12, 1]
         val_d_normed_all = val_d_all * rms_d_all
+        if getattr(self, "capture_fm_shared_diagnostics", False):
+            self.fm_shared_trace["normed_value"] = val_d_normed_all
         l1c_diff_gated_all = val_d_normed_all
         l1c_abs_gated_all = val_a_all * torch.sigmoid(gate_a_all)
 
@@ -871,10 +897,15 @@ class LayerStacks(nn.Module):
         # --- PHASE 3: MainPath & Attention 制御 (全12バケット完全独立) ---
         l1c_main_all = self.l1(l1_main).reshape(-1, self.count, 32)  # [B, 12, 32]
         l1f_ = self.l1_fact(l1_main)                                # [B, 32]
+        if getattr(self, "capture_fm_shared_diagnostics", False):
+            self.fm_shared_trace.update({"main_affine": l1c_main_all,
+                                         "main_input": l1_main})
         l1_combined_all = l1c_main_all + l1f_.unsqueeze(1)          # [B, 12, 32]
 
         gate_d_sub_all = gate_d_all - 0.3
         l1_combined_all = l1_combined_all * (0.5 + 0.5 * torch.sigmoid(gate_d_sub_all))
+        if getattr(self, "capture_fm_shared_diagnostics", False):
+            self.fm_shared_trace["main_effective"] = l1_combined_all
 
         l1_val_all, l1_main_bp_all = l1_combined_all.split([31, 1], dim=-1)
 
@@ -1275,8 +1306,10 @@ class LayerStacks(nn.Module):
                 l1.weight.data = self.l1.weight.data[i*32:(i+1)*32, :] + self.l1_fact.weight.data
                 l1.bias.data = self.l1.bias.data[i*32:(i+1)*32] + self.l1_fact.bias.data
 
-                diff_b.weight.data = self.fm_diff.weight.data[i*64:(i+1)*64, :]
-                diff_b.bias.data = self.fm_diff.bias.data[i*64:(i+1)*64]
+                diff_weight, diff_bias = effective_diff_parameters(
+                    self.fm_diff, self.fm_diff_value_shared, self.count)
+                diff_b.weight.data = diff_weight[i*64:(i+1)*64, :].clone()
+                diff_b.bias.data = diff_bias[i*64:(i+1)*64].clone()
                 abs_b.weight.data = self.fm_abs.weight.data[i*64:(i+1)*64, :]
                 abs_b.bias.data = self.fm_abs.bias.data[i*64:(i+1)*64]
 
@@ -1297,7 +1330,33 @@ class LayerStacks(nn.Module):
 
 
 class NNUE(pl.LightningModule):
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION):
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        if not hasattr(self, "complex_fm_diff_shared"):
+            self.complex_fm_diff_shared = "off"
+
+    def set_fm_diff_shared(self, mode):
+        """Model-only migration; effective affine preserved in either direction."""
+        mode = normalize_fm_diff_shared(mode)
+        stacks = self.layer_stacks
+        if mode == self.complex_fm_diff_shared:
+            return
+        if mode == "off":
+            with torch.no_grad():
+                w, b = effective_diff_parameters(stacks.fm_diff, stacks.fm_diff_value_shared, stacks.count)
+                stacks.fm_diff.weight.copy_(w)
+                stacks.fm_diff.bias.copy_(b)
+            stacks.fm_diff_value_shared = None
+            self.hparams.pop("complex_fm_diff_shared", None)
+        else:
+            stacks.fm_diff_value_shared = make_value_factor(stacks.fm_diff.weight)
+            self.save_hyperparameters({"complex_fm_diff_shared": mode})
+        stacks.complex_fm_diff_shared = mode
+        self.complex_fm_diff_shared = mode
+        if getattr(self, "ema_model", None) is not None:
+            self.ema_model = None
+
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off"):
         super(NNUE, self).__init__()
         # Optional training-only attenuation for pairs whose raw teacher and
         # alternate ranking teacher order disagree.  1.0 is exactly legacy.
@@ -1321,6 +1380,7 @@ class NNUE(pl.LightningModule):
         self.optimizer_layout_name = optimizer_layout
         self.reinit_groups = tuple(reinit_groups or ())
         self.reinit_seed = reinit_seed
+        self.complex_fm_diff_shared = normalize_fm_diff_shared(complex_fm_diff_shared)
         self._optimizer_state_size_logged = False
 
         self.input = DoubleFeatureTransformerSlice(feature_set.num_features, L1_MAIN, FM_DIM)
@@ -1407,7 +1467,10 @@ class NNUE(pl.LightningModule):
             side_input_fusion=self.side_input_fusion,
             pair_relation_side_input=self.pair_relation_side_input,
             pair_relation_schema_version=self.pair_relation_schema_version,
+            complex_fm_diff_shared=self.complex_fm_diff_shared,
         )
+        if self.complex_fm_diff_shared != "off":
+            self.save_hyperparameters({"complex_fm_diff_shared": self.complex_fm_diff_shared})
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
         self.gamma = gamma
@@ -1613,6 +1676,7 @@ class NNUE(pl.LightningModule):
                 side_input_fusion=self.side_input_fusion,
                 pair_relation_side_input=self.pair_relation_side_input,
                 pair_relation_schema_version=self.pair_relation_schema_version,
+                complex_fm_diff_shared=self.complex_fm_diff_shared,
             )
         source = dict(fresh.named_parameters())
         with torch.no_grad():
@@ -1698,6 +1762,13 @@ class NNUE(pl.LightningModule):
         for group in self.weight_clipping:
             for p in group['params']:
                 if not p.requires_grad:
+                    continue
+                if (self.complex_fm_diff_shared == "value"
+                        and p is self.layer_stacks.fm_diff.weight):
+                    clip_effective_diff(
+                        self.layer_stacks.fm_diff,
+                        self.layer_stacks.fm_diff_value_shared,
+                        self.num_ls_buckets, group['max_weight'])
                     continue
                 if 'min_weight' in group or 'max_weight' in group:
                     p_data_fp32 = p.data
@@ -3178,6 +3249,22 @@ class NNUE(pl.LightningModule):
                 "pairwise": weights["pairwise"] * pairwise_loss,
                 "listwise": weights["listwise"] * listwise_loss,
             }
+            if self.complex_fm_diff_shared == "value":
+                self.last_training_loss_tensors.update({
+                    "bucket_distill": weights["bucket_distill"] * bucket_distill_loss,
+                    "ema_distill": weights["ema_distill"] * ema_distill_loss,
+                    "fm_residual": weights["fm_residual"] * fm_residual_loss,
+                    "fm_couple": weights["fm_couple"] * fm_couple_loss,
+                    "phase": weights["phase"] * phase_penalty,
+                    "main_aux": weights["main_aux"] * main_aux_loss,
+                    "router_ce": weights["router_ce"] * router_ce_loss,
+                    "ortho": weights["ortho"] * ortho_loss,
+                    "router_load": weights["router_load"] * router_load_loss,
+                    "router_top1": weights["router_top1"] * router_top1_loss,
+                    "router_freq_match": weights["router_freq_match"] * router_frequency_matching_loss,
+                    "router_pairwise": weights["router_pairwise"] * router_pairwise_loss,
+                    "router_margin": weights["router_margin"] * router_margin_loss,
+                })
         if self.training and self.consensus_aux_mode not in ("none", "off"):
             self.log(
                 "train_consensus_aux",
@@ -6805,6 +6892,8 @@ class NNUE(pl.LightningModule):
                 side_input_dim=self.side_input_dim,
                 side_input_fusion=self.side_input_fusion,
                 pair_relation_side_input=self.pair_relation_side_input,
+                pair_relation_schema_version=self.pair_relation_schema_version,
+                complex_fm_diff_shared=self.complex_fm_diff_shared,
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
@@ -6858,6 +6947,11 @@ class NNUE(pl.LightningModule):
 
     def on_save_checkpoint(self, checkpoint):
         """Persist every architecture choice needed for an exact reload."""
+        if self.complex_fm_diff_shared != "off":
+            checkpoint["complex_training_parameterization"] = {
+                "schema_version": 1, "fm_diff_shared": self.complex_fm_diff_shared,
+                "value_rows": [32, 64], "export": "coalesce",
+            }
         architecture = nnue_architecture_metadata(self)
         checkpoint["nnue_architecture"] = architecture
         checkpoint["optimizer_configuration"] = {
@@ -6918,6 +7012,22 @@ class NNUE(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         """過去の余分な EMA キーを安全に削除"""
+        # Lightning merges CLI overrides into hyper_parameters before this
+        # hook. The saved state/schema, not the merged hparams, is authoritative.
+        saved_fm_shared = ("value" if
+            "layer_stacks.fm_diff_value_shared.weight" in checkpoint.get("state_dict", {})
+            else "off")
+        if (self.enforce_optimizer_checkpoint_match
+                and saved_fm_shared != self.complex_fm_diff_shared):
+            raise ValueError("FM shared parameterization mismatch for training-state resume; use model-only migration")
+        if saved_fm_shared == "value" and self.complex_fm_diff_shared == "off":
+            state = checkpoint["state_dict"]
+            w = state["layer_stacks.fm_diff.weight"].clone().view(self.num_ls_buckets, 64, 128)
+            b = state["layer_stacks.fm_diff.bias"].clone().view(self.num_ls_buckets, 64)
+            w[:, 32:] += state.pop("layer_stacks.fm_diff_value_shared.weight")
+            b[:, 32:] += state.pop("layer_stacks.fm_diff_value_shared.bias")
+            state["layer_stacks.fm_diff.weight"] = w.reshape(-1, 128)
+            state["layer_stacks.fm_diff.bias"] = b.reshape(-1)
         if self.enforce_optimizer_checkpoint_match:
             saved = checkpoint.get("optimizer_configuration")
             requested_layout = self.resolved_optimizer_layout()
@@ -7018,8 +7128,20 @@ class NNUE(pl.LightningModule):
                     f"-> current={current_kwargs.get('side_input_type', 'none')}; "
                     "new side parameters keep their zero initialization.")
         state_dict = checkpoint.get("state_dict", {})
-        for k in [k for k in state_dict.keys() if k.startswith("ema_model.")]:
-            del state_dict[k]
+        ema_keys = [k for k in state_dict if k.startswith("ema_model.")]
+        if (self.complex_fm_diff_shared == "value"
+                and self.enforce_optimizer_checkpoint_match and ema_keys):
+            # Full experimental resume must also preserve the EMA loss target.
+            self.ema_model = NNUE(
+                feature_set=self.feature_set,
+                **nnue_architecture_kwargs(nnue_architecture_metadata(self)),
+                complex_fm_diff_shared="value")
+            self.ema_model.eval()
+            for parameter in self.ema_model.parameters():
+                parameter.requires_grad_(False)
+        else:
+            for k in ema_keys:
+                del state_dict[k]
         if (self.remove_abs_sqr_l2
                 and self.phase_output_dimensions == PHASE_CHANNELS_NO_ABS_SQR):
             migrate_phase_proj_state_dict_to_five(state_dict)
@@ -7066,6 +7188,11 @@ class NNUE(pl.LightningModule):
         # layout is selected: configure_optimizers() uses it for the global
         # no-missing/no-duplicate invariant before dispatching parameters to
         # the layout's child optimizers.
+        if self.complex_fm_diff_shared == "value":
+            other_groups.extend([
+                {'params': [self.layer_stacks.fm_diff_value_shared.weight], 'lr': LR, 'weight_decay': 0.0},
+                {'params': [self.layer_stacks.fm_diff_value_shared.bias], 'lr': LR, 'weight_decay': 0.0},
+            ])
         if self.side_input_type != "none":
             if isinstance(self.layer_stacks.side_input_encode, nn.Linear):
                 other_groups.extend([

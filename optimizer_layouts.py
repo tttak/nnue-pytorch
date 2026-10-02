@@ -78,7 +78,8 @@ def parameter_subgroup(name: str) -> str:
                 else "l2_fc1_output")
     if name == "layer_stacks.pair_relation_gate":
         return "l2_fc1_output_control"
-    if name.startswith(("layer_stacks.fm_diff.", "layer_stacks.fm_abs.")):
+    if name.startswith(("layer_stacks.fm_diff.", "layer_stacks.fm_abs.",
+                        "layer_stacks.fm_diff_value_shared.")):
         return "fm_control" if name.endswith(".bias") else "fm"
     if name.startswith("layer_stacks.cross_proj."):
         return "lca_cross_control" if name.endswith(".bias") else "lca_cross"
