@@ -23,9 +23,10 @@ from simple_quant_boundary import (
     CALIBRATED_PRESETS, boundary_penalty, touched_ft_rows, ft_regularization_due,
 )
 from simple_quant_hysteresis import (
-    HysteresisAdamW, VERSION as HYSTERESIS_VERSION,
+    HysteresisAdamW, FrequencyHysteresisAdamW, VERSION as HYSTERESIS_VERSION,
     DEFAULT_COOLDOWN, DEFAULT_BAND, DEFAULT_MARGIN,
 )
+from simple_training_compatibility import validate_hysteresis_options
 
 import model as complex_model
 from simple_pp3wide import (
@@ -85,6 +86,8 @@ LAYER_STACKS = 9
 # inference implementation and serialize_halfka_hm2_simple.py; QAT must not
 # silently inherit constants from Stockfish or from the Complex network.
 FT_QUANT_SCALE = 127.0
+FT_INIT_MODES = ("legacy", "qat_safe")
+FT_INIT_VERSION = "legacy_rescale_v1"
 FT_QUANT_MIN = -32768.0
 FT_QUANT_MAX = 32767.0
 FT_LOAD_MULTIPLIER = 2.0
@@ -279,8 +282,11 @@ def _simple_qat_activation(pre_activation, squared=False):
 
 class SimpleFeatureTransformer(nn.Module):
     def __init__(self, num_inputs: int = FT_INPUTS, width: int = FT_WIDTH,
-                 virtual_factorization: str = "off"):
+                 virtual_factorization: str = "off", initialization: str = "legacy"):
         super().__init__()
+        if initialization not in FT_INIT_MODES:
+            raise ValueError(f"FT initialization must be one of {FT_INIT_MODES}")
+        self.initialization = initialization
         if virtual_factorization not in FT_VIRTUAL_FACTORIZATION_MODES:
             raise ValueError(
                 "virtual_factorization must be one of "
@@ -305,6 +311,13 @@ class SimpleFeatureTransformer(nn.Module):
             self.register_parameter("virtual_weight", None)
             self.register_buffer("virtual_index", None, persistent=False)
         nn.init.uniform_(self.weight, -sigma, sigma)
+        # Preserve the legacy random draws, signs, and all following RNG state.
+        # Only newly constructed scratch weights use this wider q127 range.
+        self.initialization_width = (1.0 / FT_QUANT_SCALE
+                                     if initialization == "qat_safe" else sigma)
+        if initialization == "qat_safe":
+            with torch.no_grad():
+                self.weight.mul_(self.initialization_width / sigma)
         nn.init.uniform_(self.bias, -sigma, sigma)
         self._qat_eval_cache = None
 
@@ -814,6 +827,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_qat_hysteresis_restore_margin=DEFAULT_MARGIN,
         enforce_hysteresis_resume_match=False,
         simple_ft_virtual_factorization="off",
+        simple_ft_init="legacy",
         simple_local_pair_feature="off",
         simple_bucket_mode="k3k3",
         simple_ft_frequency_lr="off",
@@ -854,7 +868,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 "simple_ft_virtual_factorization must be one of "
                 f"{FT_VIRTUAL_FACTORIZATION_MODES}")
         self.input = SimpleFeatureTransformer(
-            virtual_factorization=self.simple_ft_virtual_factorization)
+            virtual_factorization=self.simple_ft_virtual_factorization,
+            initialization=simple_ft_init)
+        self.simple_ft_init = self.input.initialization
         self.simple_ft_frequency_lr = str(simple_ft_frequency_lr)
         if self.simple_ft_frequency_lr not in FT_FREQUENCY_LR_MODES:
             raise ValueError(
@@ -1084,12 +1100,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         if self.simple_qat_hysteresis not in ("off", "anti_flip"):
             raise ValueError("unknown Simple QAT hysteresis mode")
         if self.simple_qat_hysteresis != "off":
-            if (self.simple_qat_mode != "full" or self.simple_quant_boundary_reg != "off"
-                    or self.simple_local_pair_feature != "off"
-                    or self.simple_ft_virtual_factorization != "off"
-                    or self.simple_ft_frequency_lr != "off" or self.use_side_input
-                    or self.use_shared_psqt):
-                raise ValueError("anti_flip requires full QAT, boundary/side/LocalPair/factor/frequency OFF")
+            validate_hysteresis_options(mode=self.simple_qat_hysteresis,
+                qat_mode=self.simple_qat_mode, boundary=self.simple_quant_boundary_reg,
+                factor=self.simple_ft_virtual_factorization, local_pair=self.simple_local_pair_feature,
+                side=self.use_side_input, psqt=self.use_shared_psqt,
+                bucket_importance=self.use_bucket_importance_base_loss)
             if not 1 <= self.simple_qat_hysteresis_cooldown <= 63:
                 raise ValueError("hysteresis cooldown must be 1..63")
             if not 0 < self.simple_qat_hysteresis_band < .5 or not 0 < self.simple_qat_hysteresis_restore_margin < .5:
@@ -1166,6 +1181,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             # C++ architecture/hash/schema because export coalesces the table.
             "simple_ft_virtual_factorization": (
                 self.simple_ft_virtual_factorization),
+            # Initialization provenance only; never part of the runtime hash.
+            "simple_ft_init": getattr(self, "simple_ft_init", "legacy"),
+            "simple_ft_init_width": (1.0 / FT_QUANT_SCALE
+                if getattr(self, "simple_ft_init", "legacy") == "qat_safe"
+                else math.sqrt(1.0 / FT_INPUTS)),
+            "simple_ft_init_formula_version": FT_INIT_VERSION,
             "simple_ft_virtual_mapping_version": (
                 FT_VIRTUAL_MAPPING_VERSION
                 if self.simple_ft_virtual_factorization == "shared" else None),
@@ -2660,7 +2681,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                            else torch.optim.AdamW)
         optimizer_kwargs = {}
         if self.simple_qat_hysteresis == "anti_flip":
-            optimizer_class = HysteresisAdamW
+            optimizer_class = (FrequencyHysteresisAdamW
+                if self.simple_ft_frequency_lr != "off" else HysteresisAdamW)
             targets = [("FT", self.input.weight, FT_QUANT_SCALE, FT_QUANT_MIN, FT_QUANT_MAX)]
             for i, stack in enumerate(self.layer_stacks):
                 for name in ("fc0", "fc1", "fc2"):
@@ -2669,11 +2691,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             optimizer_kwargs.update(targets=targets, row_provider=lambda: self._hysteresis_rows,
                 cooldown=self.simple_qat_hysteresis_cooldown, band=self.simple_qat_hysteresis_band,
                 restore_margin=self.simple_qat_hysteresis_restore_margin)
-        if optimizer_class is FrequencyAwareAdamW:
-            optimizer_kwargs = {
-                "ft_weight": self.input.weight,
-                "row_scale": self.simple_ft_frequency_scale,
-            }
+        if issubclass(optimizer_class, FrequencyAwareAdamW):
+            optimizer_kwargs.update(ft_weight=self.input.weight,
+                                    row_scale=self.simple_ft_frequency_scale)
         optimizer = optimizer_class(
             [
                 {"params": ft_parameters, "lr": self.lr},
@@ -2716,6 +2736,13 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError("checkpoint is not a HalfKA_hm2 simple checkpoint")
         if int(metadata.get("simple_schema_version", -1)) != SIMPLE_SCHEMA_VERSION:
             raise ValueError("HalfKA_hm2 simple schema mismatch")
+        # Loading restores tensors, not a scratch initialization. Keep the
+        # source provenance even when a caller supplied another init option.
+        self.simple_ft_init = metadata.get("simple_ft_init", "legacy")
+        self.input.initialization = self.simple_ft_init
+        self.input.initialization_width = (1.0 / FT_QUANT_SCALE
+            if self.simple_ft_init == "qat_safe" else math.sqrt(1.0 / FT_INPUTS))
+        self.hparams["simple_ft_init"] = self.simple_ft_init
         saved_boundary = metadata.get("simple_quant_boundary_reg", "off")
         boundary_settings_mismatch = any(
             metadata.get(key) != expected for key, expected in (

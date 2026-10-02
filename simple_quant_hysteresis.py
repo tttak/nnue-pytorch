@@ -4,6 +4,7 @@ No forward/serializer quantizer changes. FT coverage is explicitly touched-only;
 zero-gradient AdamW momentum updates on other rows are not intercepted.
 """
 import torch
+from simple_frequency_aware_optimizer import FrequencyAwareAdamW
 
 VERSION = "post_adamw_shallow_reverse_v1"
 MODES = ("off", "anti_flip")
@@ -172,3 +173,26 @@ class HysteresisAdamW(torch.optim.AdamW):
         for name, target in self.row_last_seen.items():
             target.copy_(saved['row_last_seen'][name].to(target.device))
         self.observation_step = int(saved['observation_step'])
+
+
+class FrequencyHysteresisAdamW(HysteresisAdamW, FrequencyAwareAdamW):
+    """Capture bins -> row-scaled AdamW -> anti-flip -> accepted history.
+
+    Cooperative MRO deliberately wraps the existing FrequencyAwareAdamW.step
+    inside HysteresisAdamW.step. Neither standalone optimizer changes.
+    Moments are never corrected. FT coverage remains touched-only.
+    """
+    def state_dict(self):
+        result = super().state_dict()
+        result['frequency_hysteresis'] = {
+            'version': 'frequency_then_anti_flip_v1',
+            'row_scale': self.row_scale.detach().cpu().clone(),
+        }
+        return result
+
+    def load_state_dict(self, state):
+        saved = state.get('frequency_hysteresis')
+        if (saved is None or saved.get('version') != 'frequency_then_anti_flip_v1'
+                or not torch.equal(saved['row_scale'].cpu(), self.row_scale.detach().cpu())):
+            raise ValueError('frequency + anti_flip resume requires identical row scales/update order')
+        super().load_state_dict({k: v for k, v in state.items() if k != 'frequency_hysteresis'})

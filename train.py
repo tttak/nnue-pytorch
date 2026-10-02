@@ -8,6 +8,7 @@ import json
 import model as M
 from simple_halfka_hm2_model import (
     FT_FREQUENCY_LR_MODES,
+    FT_INIT_MODES,
     FT_VIRTUAL_FACTORIZATION_MODES,
     FT_VIRTUAL_MAPPING_VERSION,
     SIMPLE_QAT_MODES,
@@ -698,6 +699,10 @@ def main():
       help=("Training-only HalfKA_HM2 row-wise actual-update scaling "
             "(Experiment 134). Default: off."))
   parser.add_argument(
+      "--simple-ft-init", choices=FT_INIT_MODES, default="legacy",
+      help=("Scratch-only Simple FT weight initialization: legacy or qat_safe "
+            "(uniform +/-1/127). Loaded weights are never reinitialized."))
+  parser.add_argument(
       "--simple-ft-frequency-table", default=None,
       help=("Path to the fixed 73,305-row occurrence .npy table required "
             "by --simple-ft-frequency-lr mild/medium."))
@@ -1019,10 +1024,13 @@ def main():
     if simple_any_experimental_path or args.simple_base_bucket_importance:
       raise ValueError("Experiment 144 requires side/factor/frequency/LocalPair OFF")
   if args.simple_qat_hysteresis != "off":
-    if not simple_architecture or simple_qat_mode != "full" or args.simple_quant_boundary_reg != "off":
-      raise ValueError("anti_flip requires Simple full QAT with boundary regularization OFF")
-    if simple_any_experimental_path or args.simple_base_bucket_importance:
-      raise ValueError("Experiment 146 requires side/factor/frequency/LocalPair OFF")
+    if not simple_architecture:
+      raise ValueError("anti_flip requires --architecture halfka_hm2_simple")
+    from simple_training_compatibility import validate_hysteresis_options
+    validate_hysteresis_options(mode=args.simple_qat_hysteresis, qat_mode=simple_qat_mode,
+        boundary=args.simple_quant_boundary_reg, factor=args.simple_ft_virtual_factorization,
+        local_pair=args.simple_local_pair_feature, side=simple_any_side_input,
+        psqt=args.use_shared_psqt, bucket_importance=args.simple_base_bucket_importance)
   if (args.simple_ft_virtual_factorization != "off"
       and not simple_architecture):
     raise ValueError(
@@ -1054,6 +1062,11 @@ def main():
     raise ValueError(
         "--simple-localpair64-proj-nonzero-rate must be in [0,1]")
   ModelClass = SimpleHalfKAHM2NNUE if simple_architecture else M.NNUE
+  if args.simple_ft_init != "legacy" and not simple_architecture:
+    raise ValueError("--simple-ft-init requires --architecture halfka_hm2_simple")
+  if simple_architecture and args.resume_from_model is not None:
+    print("Simple FT initialization: checkpoint weights/provenance retained; "
+          "--simple-ft-init only applies to scratch creation.")
   if simple_architecture:
     print(f"Simple QAT training mode: {simple_qat_mode}")
   if simple_architecture:
@@ -1146,6 +1159,7 @@ def main():
       simple_ft_virtual_factorization=(
           args.simple_ft_virtual_factorization
           if simple_architecture else "off"),
+      **({"simple_ft_init": args.simple_ft_init} if simple_architecture else {}),
       simple_ft_frequency_lr=(
           args.simple_ft_frequency_lr if simple_architecture else "off"),
       simple_ft_frequency_table=(
