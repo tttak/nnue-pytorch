@@ -807,6 +807,15 @@ def main():
       "--freeze-ft-router", action="store_true",
       help=("Experiment-only: freeze input.weight/input.bias/input.v and "
             "Router weight/bias, excluding them from the optimizer."))
+  fc0_factor = parser.add_mutually_exclusive_group()
+  fc0_factor.add_argument(
+      "--disable-fc0-shared-factor", dest="disable_fc0_shared_factor",
+      action="store_true", default=None,
+      help="Complex experiment B: fold shared FC0 weight/bias into each bucket, then zero/freeze/exclude the shared parameters.")
+  fc0_factor.add_argument(
+      "--enable-fc0-shared-factor", dest="disable_fc0_shared_factor",
+      action="store_false",
+      help="Complex experiment A: enable existing shared+specific FC0. Omitted preserves checkpoint mode; fresh models enable it.")
   parser.add_argument(
       "--ft-stats-after-mode", choices=("periodic", "every_batch"),
       default="periodic",
@@ -929,6 +938,8 @@ def main():
   args = parser.parse_args()
   from simple_bucket_execution import resolve_mode
   args.simple_bucket_execution = resolve_mode(args.simple_bucket_execution, args.architecture)
+  if args.architecture != "complex" and args.disable_fc0_shared_factor is not None:
+    raise ValueError("FC0 shared-factor ablation is Complex-only")
   if args.architecture != "halfka_hm2_simple" and args.simple_bucket_execution != "mask":
     raise ValueError("--simple-bucket-execution index_reuse is Simple-only")
   if args.architecture != "complex" and args.ft_grouped_backward_backend != "sort":
@@ -1135,7 +1146,8 @@ def main():
     torch.manual_seed(args.seed)
   if args.resume_from_model is None:
     nnue = ModelClass(feature_set=feature_set,
-      **({"complex_fm_diff_shared": args.complex_fm_diff_shared or "off"}
+      **({"complex_fm_diff_shared": args.complex_fm_diff_shared or "off",
+          "disable_fc0_shared_factor": bool(args.disable_fc0_shared_factor)}
          if not simple_architecture else {}),
       start_lambda=start_lambda,
       max_epoch=max_epoch,
@@ -1499,7 +1511,24 @@ def main():
 
       # 現在のモデルの state_dict を更新してロード
       model_dict.update(pretrained_dict)
+      if not simple_architecture:
+          # Fresh construction may already be disabled by CLI. Loaded tensors
+          # still require their source-policy fold, not an idempotence check.
+          nnue.set_fc0_shared_factor_disabled(False)
       nnue.load_state_dict(model_dict, strict=False)
+      if not simple_architecture:
+          from fc0_shared_factor import TRAINING_KEY, assert_zero_shared
+          saved_fc0_disabled = (
+              bool(getattr(checkpoint, "disable_fc0_shared_factor", False))
+              if hasattr(checkpoint, "state_dict") else
+              bool(checkpoint.get(TRAINING_KEY, {}).get("disabled", False)))
+          target_fc0_disabled = (saved_fc0_disabled if args.disable_fc0_shared_factor is None
+                                 else args.disable_fc0_shared_factor)
+          if args.resume_training_state and saved_fc0_disabled != target_fc0_disabled:
+              raise ValueError("FC0 shared factor mismatch for training-state resume; use --resume-from-model")
+          if saved_fc0_disabled:
+              assert_zero_shared(nnue.layer_stacks)
+          nnue.set_fc0_shared_factor_disabled(target_fc0_disabled)
       if (simple_architecture and source_effective_ft is not None
           and target_factorization == "shared"):
           nnue.input.mean_decompose_(source_effective_ft)
@@ -1538,6 +1567,8 @@ def main():
       })
       if not simple_architecture and args.complex_fm_diff_shared is not None:
         resume_overrides["complex_fm_diff_shared"] = args.complex_fm_diff_shared
+      if not simple_architecture and args.disable_fc0_shared_factor is not None:
+        resume_overrides["disable_fc0_shared_factor"] = args.disable_fc0_shared_factor
       if simple_architecture:
         resume_overrides["use_bucket_importance_base_loss"] = bool(
             args.simple_base_bucket_importance)
@@ -1795,6 +1826,11 @@ def main():
     # Apply the current process policy after ALL fresh/.pt/.ckpt/resume paths.
     # It is deliberately not architecture metadata or a training-state field.
     nnue.set_ft_stats_after_mode(args.ft_stats_after_mode)
+    if args.disable_fc0_shared_factor is not None:
+      saved_fc0_disabled = getattr(nnue, "disable_fc0_shared_factor", False)
+      if args.resume_training_state and saved_fc0_disabled != args.disable_fc0_shared_factor:
+        raise ValueError("FC0 shared factor mismatch for training-state resume; use --resume-from-model")
+      nnue.set_fc0_shared_factor_disabled(args.disable_fc0_shared_factor)
     nnue.ft_optimizer_name = args.ft_optimizer
     nnue.other_optimizer_name = args.other_optimizer
     if not args.resume_training_state or args.optimizer_layout is not None:
@@ -1809,6 +1845,10 @@ def main():
     if args.reinit_groups:
       nnue.reinitialize_optimizer_subgroups(
           args.reinit_groups, args.reinit_seed)
+    if getattr(nnue, "disable_fc0_shared_factor", False):
+      nnue.set_fc0_shared_factor_disabled(True)
+    print("FC0 shared factor: " + ("folded independent (shared zero/frozen)"
+          if getattr(nnue, "disable_fc0_shared_factor", False) else "shared + specific"))
 
   nnue.ranking_disagreement_weight = args.ranking_disagreement_weight
   if (args.ranking_target3

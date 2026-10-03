@@ -8,6 +8,12 @@ import pytorch_lightning as pl
 import sys
 import json
 from pathlib import Path
+from fc0_shared_factor import (
+    TRAINING_KEY as FC0_SHARED_TRAINING_KEY, is_disabled as fc0_shared_disabled,
+    assert_zero_shared as assert_zero_fc0_shared,
+    set_disabled as set_fc0_shared_disabled,
+    load_checkpoint_policy as load_fc0_shared_policy,
+)
 from side_input import (
     SIDE_INPUT_SCHEMA_VERSION, SideInputType, SideInputFusion,
     input_dimensions as side_input_dimensions,
@@ -896,7 +902,8 @@ class LayerStacks(nn.Module):
 
         # --- PHASE 3: MainPath & Attention 制御 (全12バケット完全独立) ---
         l1c_main_all = self.l1(l1_main).reshape(-1, self.count, 32)  # [B, 12, 32]
-        l1f_ = self.l1_fact(l1_main)                                # [B, 32]
+        l1f_ = (l1c_main_all.new_zeros((l1_main.shape[0], 32))
+                if fc0_shared_disabled(self) else self.l1_fact(l1_main)) # [B, 32]
         if getattr(self, "capture_fm_shared_diagnostics", False):
             self.fm_shared_trace.update({"main_affine": l1c_main_all,
                                          "main_input": l1_main})
@@ -1336,6 +1343,18 @@ class NNUE(pl.LightningModule):
             self.complex_fm_diff_shared = "off"
         # Diagnostic execution policy is process-local, not pickle metadata.
         self.set_ft_stats_after_mode("periodic")
+        self.set_fc0_shared_factor_disabled(
+            getattr(self, "disable_fc0_shared_factor", False))
+
+    def set_fc0_shared_factor_disabled(self, disabled):
+        set_fc0_shared_disabled(self.layer_stacks, disabled)
+        self.disable_fc0_shared_factor = bool(disabled)
+        if disabled:
+            self.save_hyperparameters({"disable_fc0_shared_factor": True})
+        else:
+            self.hparams.pop("disable_fc0_shared_factor", None)
+        if getattr(self, "ema_model", None) is not None:
+            self.ema_model.set_fc0_shared_factor_disabled(disabled)
 
     def set_ft_stats_after_mode(self, mode):
         """Training diagnostics only; never saved in hparams/state/schema."""
@@ -1365,7 +1384,7 @@ class NNUE(pl.LightningModule):
         if getattr(self, "ema_model", None) is not None:
             self.ema_model = None
 
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off", ft_stats_after_mode="periodic"):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off", ft_stats_after_mode="periodic", disable_fc0_shared_factor=False):
         super(NNUE, self).__init__()
         self.set_ft_stats_after_mode(ft_stats_after_mode)
         # Optional training-only attenuation for pairs whose raw teacher and
@@ -1481,6 +1500,7 @@ class NNUE(pl.LightningModule):
         )
         if self.complex_fm_diff_shared != "off":
             self.save_hyperparameters({"complex_fm_diff_shared": self.complex_fm_diff_shared})
+        self.set_fc0_shared_factor_disabled(disable_fc0_shared_factor)
         self.start_lambda = start_lambda
         self.end_lambda = end_lambda
         self.gamma = gamma
@@ -1657,6 +1677,8 @@ class NNUE(pl.LightningModule):
                 parameter.requires_grad_(trainable)
         self.freeze_ft_router = (
             layout["ft"] == "frozen" and layout["router"] == "frozen")
+        if getattr(self, "disable_fc0_shared_factor", False):
+            set_fc0_shared_disabled(self.layer_stacks, True)
 
     def reinitialize_optimizer_subgroups(self, groups, seed):
         """Restore selected groups to the exact values produced by __init__."""
@@ -1687,6 +1709,7 @@ class NNUE(pl.LightningModule):
                 pair_relation_side_input=self.pair_relation_side_input,
                 pair_relation_schema_version=self.pair_relation_schema_version,
                 complex_fm_diff_shared=self.complex_fm_diff_shared,
+                disable_fc0_shared_factor=getattr(self, "disable_fc0_shared_factor", False),
             )
         source = dict(fresh.named_parameters())
         with torch.no_grad():
@@ -6913,6 +6936,7 @@ class NNUE(pl.LightningModule):
                 pair_relation_side_input=self.pair_relation_side_input,
                 pair_relation_schema_version=self.pair_relation_schema_version,
                 complex_fm_diff_shared=self.complex_fm_diff_shared,
+                disable_fc0_shared_factor=getattr(self, "disable_fc0_shared_factor", False),
             ).to(self.device)
 
             # strict=False を追加して不一致キーを無視
@@ -6965,7 +6989,12 @@ class NNUE(pl.LightningModule):
                     encoding="utf-8")
 
     def on_save_checkpoint(self, checkpoint):
-        """Persist every architecture choice needed for an exact reload."""
+        """Persist architecture and separate training-only ablation policy."""
+        if getattr(self, "disable_fc0_shared_factor", False):
+            assert_zero_fc0_shared(self.layer_stacks)
+            checkpoint[FC0_SHARED_TRAINING_KEY] = {"version": 1, "disabled": True}
+        else:
+            checkpoint.pop(FC0_SHARED_TRAINING_KEY, None)
         if self.complex_fm_diff_shared != "off":
             checkpoint["complex_training_parameterization"] = {
                 "schema_version": 1, "fm_diff_shared": self.complex_fm_diff_shared,
@@ -7031,6 +7060,9 @@ class NNUE(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         """過去の余分な EMA キーを安全に削除"""
+        load_fc0_shared_policy(
+            checkpoint, getattr(self, "disable_fc0_shared_factor", False),
+            self.enforce_optimizer_checkpoint_match, self.num_ls_buckets)
         # Lightning merges CLI overrides into hyper_parameters before this
         # hook. The saved state/schema, not the merged hparams, is authoritative.
         saved_fm_shared = ("value" if
@@ -7154,7 +7186,8 @@ class NNUE(pl.LightningModule):
             self.ema_model = NNUE(
                 feature_set=self.feature_set,
                 **nnue_architecture_kwargs(nnue_architecture_metadata(self)),
-                complex_fm_diff_shared="value")
+                complex_fm_diff_shared="value",
+                disable_fc0_shared_factor=getattr(self, "disable_fc0_shared_factor", False))
             self.ema_model.eval()
             for parameter in self.ema_model.parameters():
                 parameter.requires_grad_(False)
@@ -7167,6 +7200,8 @@ class NNUE(pl.LightningModule):
 
     def _optimizer_parameter_groups(self):
         """Return disjoint FT/Other groups in the exact legacy order."""
+        if getattr(self, "disable_fc0_shared_factor", False):
+            set_fc0_shared_disabled(self.layer_stacks, True)
         LR = self.lr
         ft_groups = [
             {'params': [self.input.weight], 'lr': LR * 1.0, 'weight_decay': 0.0},
