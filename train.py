@@ -800,6 +800,13 @@ def main():
       help=("Experiment-only: freeze input.weight/input.bias/input.v and "
             "Router weight/bias, excluding them from the optimizer."))
   parser.add_argument(
+      "--ft-stats-after-mode", choices=("periodic", "every_batch"),
+      default="periodic",
+      help=("Complex-only after-optimizer FT diagnostics: periodic computes "
+            "diagnostics/TensorBoard metrics every 500 steps (recommended/default); "
+            "every_batch computes/records every batch (debug, much slower). "
+            "Process-local on resume; ignored by Simple."))
+  parser.add_argument(
       "--side-input", choices=("none", "safe_escape", "mobility_tactical_v1", "mobility_tactical_v2"), default=None,
       help=("Optional dense/context side input. Omitted means none for a new "
             "model and preserves the saved architecture when resuming."))
@@ -909,7 +916,13 @@ def main():
       help="Directory for --position-milestones checkpoints.")
 
   features.add_argparse_args(parser)
+  parser.add_argument("--ft-grouped-backward-backend", choices=("sort", "count_prefix", "count_prefix_early", "count_prefix_active"),
+                      default="sort", help="Experimental Complex FT grouping backend; default remains sort.")
   args = parser.parse_args()
+  if args.architecture != "complex" and args.ft_grouped_backward_backend != "sort":
+    raise ValueError("--ft-grouped-backward-backend count_prefix is Complex-only")
+  from feature_transformer import set_grouped_backward_backend
+  set_grouped_backward_backend(args.ft_grouped_backward_backend)
 
   requested_reinit_groups = tuple(
       group.strip() for group in args.reinit_groups.split(",")
@@ -1764,6 +1777,9 @@ def main():
         args.simple_validation_cohort_report)
 
   if not simple_architecture:
+    # Apply the current process policy after ALL fresh/.pt/.ckpt/resume paths.
+    # It is deliberately not architecture metadata or a training-state field.
+    nnue.set_ft_stats_after_mode(args.ft_stats_after_mode)
     nnue.ft_optimizer_name = args.ft_optimizer
     nnue.other_optimizer_name = args.other_optimizer
     if not args.resume_training_state or args.optimizer_layout is not None:

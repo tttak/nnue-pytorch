@@ -1334,6 +1334,15 @@ class NNUE(pl.LightningModule):
         super().__setstate__(state)
         if not hasattr(self, "complex_fm_diff_shared"):
             self.complex_fm_diff_shared = "off"
+        # Diagnostic execution policy is process-local, not pickle metadata.
+        self.set_ft_stats_after_mode("periodic")
+
+    def set_ft_stats_after_mode(self, mode):
+        """Training diagnostics only; never saved in hparams/state/schema."""
+        if mode not in ("periodic", "every_batch"):
+            raise ValueError(
+                "ft_stats_after_mode must be periodic or every_batch")
+        self.ft_stats_after_mode = mode
 
     def set_fm_diff_shared(self, mode):
         """Model-only migration; effective affine preserved in either direction."""
@@ -1356,8 +1365,9 @@ class NNUE(pl.LightningModule):
         if getattr(self, "ema_model", None) is not None:
             self.ema_model = None
 
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off"):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off", ft_stats_after_mode="periodic"):
         super(NNUE, self).__init__()
+        self.set_ft_stats_after_mode(ft_stats_after_mode)
         # Optional training-only attenuation for pairs whose raw teacher and
         # alternate ranking teacher order disagree.  1.0 is exactly legacy.
         self.ranking_disagreement_weight = 1.0
@@ -6629,6 +6639,15 @@ class NNUE(pl.LightningModule):
         caches = getattr(self, "_ft_stat_cache", None)
 
         if caches is None:
+            return
+
+        # AFTER diagnostics default to the existing 500-step log cadence.
+        # BEFORE still samples every
+        # update (including its RNG consumption); AFTER itself consumes no RNG.
+        # Match the existing console cadence, not Trainer.log_every_n_steps.
+        if (getattr(self, "ft_stats_after_mode", "periodic") == "periodic"
+                and self.global_step % 500 != 0):
+            self._ft_stat_cache = None
             return
 
         INPUT_WEIGHT = self.input.weight

@@ -6,6 +6,65 @@ import math
 
 
 _GROUPED_BW_TIMING_ENABLED = False
+_FT_GROUPED_BACKWARD_BACKEND = "sort"
+
+
+def set_grouped_backward_backend(backend):
+    """Process-local execution choice; not a model/serialization contract."""
+    if backend not in ("sort", "count_prefix", "count_prefix_early", "count_prefix_active"):
+        raise ValueError("Unknown Complex FT grouped backend")
+    global _FT_GROUPED_BACKWARD_BACKEND
+    _FT_GROUPED_BACKWARD_BACKEND = backend
+
+
+def _count_prefix_backward(ctx, grad0, grad1, fm=False):
+    import ft_count_prefix as grouping
+    if torch.are_deterministic_algorithms_enabled():
+        raise RuntimeError("count_prefix uses unordered atomic scatter; select sort for deterministic mode")
+    timing = _GROUPED_BW_TIMING_ENABLED
+    scope = "FM" if fm else "Main"
+    grad0, grad1 = grad0.contiguous(), grad1.contiguous()
+    if fm:
+        i0, i1 = ctx.saved_tensors
+        F, width = ctx.num_inputs, ctx.factor_dim
+    else:
+        i0, v0, i1, v1, weight, bias = ctx.saved_tensors
+        F, width = weight.shape
+    # Fixed F metadata: empty groups also run the unchanged reduction kernel.
+    # Grad zero-fill is retained; no CPU read of the valid/unique occurrence count.
+    a = torch.cuda.Event(enable_timing=True) if timing else None
+    b = torch.cuda.Event(enable_timing=True) if timing else None
+    if timing:a.record()
+    gradient = torch.zeros((F, width), dtype=torch.float32, device=i0.device)
+    bias_grad = None if fm else grad0.sum(dim=0) + grad1.sum(dim=0)
+    if timing:
+        b.record();grouping.TIMING[scope].setdefault("gradient_prepare", []).append((a,b))
+    with grouping.workspace_scope(i0.device):
+        occurrences, features, starts, counts = grouping.group(i0, i1, F, scope, timing)
+        mode = ctx.grouped_backend
+        if mode == "count_prefix":
+            kernel = (make_fm_embedding_grouped_backward_kernel(i0.shape[1], width) if fm
+                      else make_double_feature_transformer_slice_backward_kernel(i0.shape[1], width))
+        else:
+            kernel = grouping.make_scheduled_reducer(i0.shape[1], width, fm, mode)
+        active_count = None
+        if mode == "count_prefix_active":
+            features, active_count = grouping.compact_active(counts, scope, timing)
+        args = (occurrences.data_ptr(), features.data_ptr(), starts.data_ptr(), counts.data_ptr())
+        if not fm:args += (v0.data_ptr(), v1.data_ptr())
+        args += (grad0.data_ptr(), grad1.data_ptr(), gradient.data_ptr(), i0.shape[0])
+        grid = F
+        if active_count is not None:
+            args = args[:-1] + (active_count.data_ptr(), args[-1])
+            grid = min(F, 32 * torch.cuda.get_device_properties(i0.device).multi_processor_count)
+        with grouping.stream_context(i0.device):
+            grouping._stage(scope, "grouped_kernel", timing, lambda:kernel(grid=(grid,), args=args))
+    if not fm:
+        # Keep the existing CPU debug RNG draw, so choosing a backend does not
+        # shift branch-drop/data/model RNG consumption downstream.
+        if torch.rand(()) < 0.001:
+            print(f"[Grouped BW count_prefix] occurrence capacity={2*i0.numel():,} feature space={F:,}")
+    return (None, None, gradient) if fm else (None, None, None, None, gradient, bias_grad)
 
 _GROUPED_BW_TIMING = {
     "prepare": [],
@@ -510,6 +569,7 @@ void fm_embedding_grouped_backward(
 class FMEmbeddingGroupedFunction(autograd.Function):
     @staticmethod
     def forward(ctx, feature_indices_0, feature_indices_1, v):
+        ctx.grouped_backend = _FT_GROUPED_BACKWARD_BACKEND
         assert len(feature_indices_0.shape) == 2
         assert len(feature_indices_1.shape) == 2
         assert feature_indices_0.shape == feature_indices_1.shape
@@ -565,6 +625,8 @@ class FMEmbeddingGroupedFunction(autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output_0, grad_output_1):
+        if getattr(ctx, "grouped_backend", "sort") != "sort":
+            return _count_prefix_backward(ctx, grad_output_0, grad_output_1, fm=True)
         global _GROUPED_BW_TIMING_ENABLED
         global _FM_GROUPED_BW_TIMING
 
@@ -827,6 +889,7 @@ class DoubleFeatureTransformerSliceFunction(autograd.Function):
 
     @staticmethod
     def forward(ctx, feature_indices_0, feature_values_0, feature_indices_1, feature_values_1, weight, bias):
+        ctx.grouped_backend = _FT_GROUPED_BACKWARD_BACKEND
         ctx.save_for_backward(feature_indices_0, feature_values_0, feature_indices_1, feature_values_1, weight, bias)
 
         assert len(feature_indices_0.shape) == 2
@@ -904,6 +967,8 @@ class DoubleFeatureTransformerSliceFunction(autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output_0, grad_output_1):
+        if getattr(ctx, "grouped_backend", "sort") != "sort":
+            return _count_prefix_backward(ctx, grad_output_0, grad_output_1)
         global _GROUPED_BW_TIMING_ENABLED
         global _GROUPED_BW_TIMING
 
