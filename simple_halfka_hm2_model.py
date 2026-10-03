@@ -17,6 +17,7 @@ import pytorch_lightning as pl
 import torch
 from torch import nn
 import torch.nn.functional as F
+from simple_bucket_execution import DEFAULT_MODE, METADATA_ATTRIBUTE, validate_mode, execute_heads
 from simple_frequency_aware_optimizer import FrequencyAwareAdamW
 from simple_quant_boundary import (
     MODES as QUANT_BOUNDARY_MODES, FORMULA_VERSION as QUANT_BOUNDARY_VERSION,
@@ -830,6 +831,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_ft_init="legacy",
         simple_local_pair_feature="off",
         simple_bucket_mode="k3k3",
+        simple_bucket_execution=DEFAULT_MODE,
         simple_ft_frequency_lr="off",
         simple_ft_frequency_table=None,
         simple_pp3wide_init="zero",
@@ -844,6 +846,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         **unused,
     ):
         super().__init__()
+        self.set_bucket_execution(simple_bucket_execution)
         if feature_set.name != FEATURE_NAME or feature_set.num_features != FT_INPUTS:
             raise ValueError(
                 f"simple architecture requires {FEATURE_NAME}/{FT_INPUTS}, got "
@@ -1146,7 +1149,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         self.pairwise_ft_grad_scale = 1.0
         self.listwise_ft_grad_scale = 1.0
         self.ranking_disagreement_weight = 1.0
-        self.save_hyperparameters(ignore=("feature_set", "unused"))
+        self.save_hyperparameters(ignore=("feature_set", "unused", "simple_bucket_execution"))
         if self.simple_qat_hysteresis == "off":
             for key in ("simple_qat_hysteresis", "simple_qat_hysteresis_cooldown",
                         "simple_qat_hysteresis_band", "simple_qat_hysteresis_restore_margin",
@@ -1299,6 +1302,18 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             raise ValueError(f"simple checkpoint requires {FEATURE_NAME}")
         self.feature_set = feature_set
 
+    def set_bucket_execution(self, mode):
+        # Runtime policy only: deliberately absent from hparams/state/schema.
+        self.simple_bucket_execution = validate_mode(mode)
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        # Metadata belongs to this batch's bucket tensor, not mutable model state.
+        metadata = getattr(batch[8], METADATA_ATTRIBUTE, None)
+        result = super().transfer_batch_to_device(batch, device, dataloader_idx)
+        if metadata is not None:
+            setattr(result[8], METADATA_ATTRIBUTE, metadata.to(device))
+        return result
+
     def forward(self, us, them, white_indices, white_values, black_indices,
                 black_values, layer_stack_indices, ply=None, material=None,
                 pp3wide_white_indices=None,
@@ -1361,31 +1376,38 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                      if collect and self.use_shared_psqt else None)
         psqt_shortcut = (transformed.new_empty(transformed.shape[0])
                          if collect and self.use_shared_psqt else None)
-        for bucket, stack in enumerate(self.layer_stacks):
-            mask = buckets == bucket
-            if mask.any():
-                if collect:
-                    bucket_out, bucket_diagnostics = stack(
-                        transformed[mask],
-                        None if side_h is None else side_h[mask],
-                        None if pp_fc0_residual is None
-                        else pp_fc0_residual[mask],
-                        collect_diagnostics=True,
-                        qat_mode=self.simple_qat_mode)
-                    out[mask] = bucket_out
-                    if self.use_shared_psqt:
-                        psqt_deep[mask] = bucket_diagnostics["deep"].view(-1)
-                        psqt_shortcut[mask] = (
-                            bucket_diagnostics["shortcut"].view(-1))
-                    for name, value in bucket_diagnostics.items():
-                        diagnostic_parts.setdefault(name, []).append(value)
-                else:
-                    out[mask] = stack(
-                        transformed[mask],
-                        None if side_h is None else side_h[mask],
-                        None if pp_fc0_residual is None
-                        else pp_fc0_residual[mask],
-                        qat_mode=self.simple_qat_mode)
+        metadata = getattr(layer_stack_indices, METADATA_ATTRIBUTE, None)
+        if getattr(self, "simple_bucket_execution", DEFAULT_MODE) == "index_reuse" and metadata is not None:
+            out = execute_heads(self, transformed, side_h, pp_fc0_residual,
+                                metadata, collect, out, diagnostic_parts,
+                                psqt_deep, psqt_shortcut)
+        else:
+            # Exact legacy path; metadata-free callers safely keep this path.
+            for bucket, stack in enumerate(self.layer_stacks):
+                mask = buckets == bucket
+                if mask.any():
+                    if collect:
+                        bucket_out, bucket_diagnostics = stack(
+                            transformed[mask],
+                            None if side_h is None else side_h[mask],
+                            None if pp_fc0_residual is None
+                            else pp_fc0_residual[mask],
+                            collect_diagnostics=True,
+                            qat_mode=self.simple_qat_mode)
+                        out[mask] = bucket_out
+                        if self.use_shared_psqt:
+                            psqt_deep[mask] = bucket_diagnostics["deep"].view(-1)
+                            psqt_shortcut[mask] = (
+                                bucket_diagnostics["shortcut"].view(-1))
+                        for name, value in bucket_diagnostics.items():
+                            diagnostic_parts.setdefault(name, []).append(value)
+                    else:
+                        out[mask] = stack(
+                            transformed[mask],
+                            None if side_h is None else side_h[mask],
+                            None if pp_fc0_residual is None
+                            else pp_fc0_residual[mask],
+                            qat_mode=self.simple_qat_mode)
         psqt_snapshot = None
         if self.use_shared_psqt:
             white_psqt, black_psqt = self.shared_psqt(

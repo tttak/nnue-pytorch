@@ -69,7 +69,7 @@ class SparseBatch(ctypes.Structure):
                     simple_pp3wide=False, simple_localpair64=False,
                     simple_ksg_localpair64=False,
                     simple_gs_localpair64=False,
-                    simple_gs_localpair32_d1=False):
+                    simple_gs_localpair32_d1=False, simple_bucket_execution="mask"):
         white_values = torch.from_numpy(np.ctypeslib.as_array(self.white_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         black_values = torch.from_numpy(np.ctypeslib.as_array(self.black_values, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
         white_indices = torch.from_numpy(np.ctypeslib.as_array(self.white, shape=(self.size, self.max_active_features))).pin_memory().to(device=device, non_blocking=True)
@@ -95,6 +95,13 @@ class SparseBatch(ctypes.Structure):
             layer_stack_indices = torch.from_numpy(np.ctypeslib.as_array(
                 ptr, shape=(self.size,))).long().pin_memory().to(
                     device=device, non_blocking=True)
+        if simple_bucket_execution != "mask":
+            from simple_bucket_execution import make_metadata, METADATA_ATTRIBUTE, validate_mode
+            validate_mode(simple_bucket_execution)
+            # Reuse native CPU ids; no CUDA tensor is copied back to host.
+            cpu_ptr = self.layer_stack_indices if simple_bucket_mode == "k3k3" else ptr
+            metadata = make_metadata(np.ctypeslib.as_array(cpu_ptr, shape=(self.size,)), device)
+            setattr(layer_stack_indices, METADATA_ATTRIBUTE, metadata)
         material = torch.from_numpy(np.ctypeslib.as_array(self.material, shape=(self.size, 1))).pin_memory().to(device=device, non_blocking=True)
         kif_group_id = torch.from_numpy(np.ctypeslib.as_array(self.kif_group_id, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
         ply = torch.from_numpy(np.ctypeslib.as_array(self.ply, shape=(self.size,))).long().pin_memory().to(device=device, non_blocking=True)
@@ -311,7 +318,8 @@ class TrainingDataProvider:
                 simple_localpair64=self.simple_localpair64,
                 simple_ksg_localpair64=self.simple_ksg_localpair64,
                 simple_gs_localpair64=self.simple_gs_localpair64,
-                simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
+                simple_gs_localpair32_d1=self.simple_gs_localpair32_d1,
+                simple_bucket_execution=getattr(self, "simple_bucket_execution", "mask"))
             self.destroy_part(v)
             return tensors
         else:
@@ -667,7 +675,9 @@ class SparseBatchDataset(torch.utils.data.IterableDataset):
     self.simple_gs_localpair32_d1 = bool(simple_gs_localpair32_d1)
 
   def __iter__(self):
-    return SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input, simple_bucket_mode=self.simple_bucket_mode, simple_pp3wide=self.simple_pp3wide, simple_localpair64=self.simple_localpair64, simple_ksg_localpair64=self.simple_ksg_localpair64, simple_gs_localpair64=self.simple_gs_localpair64, simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
+    provider = SparseBatchProvider(self.feature_set, self.filename1, self.filename2, self.filename3, self.train1_rate, self.train2_rate, self.skiprate, self.mirror, self.batch_size, cyclic=self.cyclic, num_workers=self.num_workers, filtered=self.filtered, random_fen_skipping=self.random_fen_skipping, device=self.device, ranking_target3=self.ranking_target3, side_input=self.side_input, pair_relation_side_input=self.pair_relation_side_input, simple_bucket_mode=self.simple_bucket_mode, simple_pp3wide=self.simple_pp3wide, simple_localpair64=self.simple_localpair64, simple_ksg_localpair64=self.simple_ksg_localpair64, simple_gs_localpair64=self.simple_gs_localpair64, simple_gs_localpair32_d1=self.simple_gs_localpair32_d1)
+    provider.simple_bucket_execution = getattr(self, "simple_bucket_execution", "mask")
+    return provider
 
 class FixedNumBatchesDataset(Dataset):
   def __init__(self, dataset, num_batches):

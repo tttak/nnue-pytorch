@@ -525,7 +525,7 @@ class TextLogPrintTee:
       self._stream.close()
       self._closed = True
 
-def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_bucket_mode="k3k3", simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False):
+def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filename, feature_set, num_workers, batch_size, filtered, random_fen_skipping, main_device, epoch_size, train1_rate, train2_rate, skiprate, mirror, ranking_target3=None, side_input="none", pair_relation_side_input=False, simple_bucket_mode="k3k3", simple_pp3wide=False, simple_localpair64=False, simple_ksg_localpair64=False, simple_gs_localpair64=False, simple_gs_localpair32_d1=False, simple_bucket_execution="mask"):
   # Epoch and validation sizes are arbitrary
   val_size = 1000000
   features_name = feature_set.name
@@ -533,6 +533,8 @@ def data_loader_cc(train_filename1, train_filename2, train_filename3, val_filena
                                                    filtered=filtered, random_fen_skipping=random_fen_skipping, device=main_device, ranking_target3=ranking_target3, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_bucket_mode=simple_bucket_mode, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
   val_infinite = nnue_dataset.SparseBatchDataset(features_name, val_filename, val_filename, val_filename, train1_rate, train2_rate, skiprate, 0.00, batch_size, filtered=filtered,
                                                    random_fen_skipping=random_fen_skipping, device=main_device, side_input=side_input, pair_relation_side_input=pair_relation_side_input, simple_bucket_mode=simple_bucket_mode, simple_pp3wide=simple_pp3wide, simple_localpair64=simple_localpair64, simple_ksg_localpair64=simple_ksg_localpair64, simple_gs_localpair64=simple_gs_localpair64, simple_gs_localpair32_d1=simple_gs_localpair32_d1)
+  train_infinite.simple_bucket_execution = simple_bucket_execution
+  val_infinite.simple_bucket_execution = simple_bucket_execution
   # num_workers has to be 0 for sparse, and 1 for dense
   # it currently cannot work in parallel mode but it shouldn't need to
   train = DataLoader(nnue_dataset.FixedNumBatchesDataset(train_infinite, (epoch_size + batch_size - 1) // batch_size), batch_size=None, batch_sampler=None)
@@ -716,6 +718,12 @@ def main():
       "--simple-bucket-mode",
       choices=("k3k3", "phase9", "kingfree_tree"), default="k3k3",
       help="Simple 9-stack routing contract (Experiment 130).")
+  parser.add_argument(
+      "--simple-bucket-execution", choices=("mask", "index_reuse"), default=None,
+      help=("Simple-only process-local execution: index_reuse = stable CPU bucket "
+            "partition + reused GPU indices, exact fast path (Simple default); "
+            "mask = legacy/reference. Complex remains mask when omitted. "
+            "Not saved in checkpoint architecture; current CLI/default wins on resume."))
   parser.add_argument(
       "--simple-bucket-migration", choices=("auto", "native", "clone_b08"),
       default="auto",
@@ -919,6 +927,10 @@ def main():
   parser.add_argument("--ft-grouped-backward-backend", choices=("sort", "count_prefix", "count_prefix_early", "count_prefix_active"),
                       default="sort", help="Experimental Complex FT grouping backend; default remains sort.")
   args = parser.parse_args()
+  from simple_bucket_execution import resolve_mode
+  args.simple_bucket_execution = resolve_mode(args.simple_bucket_execution, args.architecture)
+  if args.architecture != "halfka_hm2_simple" and args.simple_bucket_execution != "mask":
+    raise ValueError("--simple-bucket-execution index_reuse is Simple-only")
   if args.architecture != "complex" and args.ft_grouped_backward_backend != "sort":
     raise ValueError("--ft-grouped-backward-backend count_prefix is Complex-only")
   from feature_transformer import set_grouped_backward_backend
@@ -1554,6 +1566,9 @@ def main():
         resume_overrides["simple_local_pair_feature"] = (
             args.simple_local_pair_feature)
         resume_overrides["simple_bucket_mode"] = args.simple_bucket_mode
+        # Runtime policy always comes from this process, even if an external
+        # checkpoint happens to contain a stale execution hparam.
+        resume_overrides["simple_bucket_execution"] = args.simple_bucket_execution
         resume_overrides["simple_pp3wide_init"] = args.simple_pp3wide_init
         resume_overrides["simple_pp3wide_nonzero_rate"] = (
             args.simple_pp3wide_nonzero_rate)
@@ -1833,6 +1848,10 @@ def main():
         args.enable_ft_loss_contribution_measurement)
     nnue.capture_training_loss_components = bool(args.uncertainty_report)
 
+  if simple_architecture:
+    # Apply AFTER any model/ckpt/PT load: CLI/default wins on all resume paths.
+    nnue.set_bucket_execution(args.simple_bucket_execution)
+    print(f"Simple bucket execution: {args.simple_bucket_execution} (process-local)")
   print("Feature set: {}".format(feature_set.name))
   print("Num real features: {}".format(feature_set.num_real_features))
   print("Num virtual features: {}".format(feature_set.num_virtual_features))
@@ -1918,7 +1937,7 @@ def main():
   else:
     print('Using c++ data loader')
     local_pair_type = getattr(nnue, "simple_local_pair_feature", "off")
-    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), getattr(nnue, "simple_bucket_mode", "k3k3"), local_pair_type in (PP3WIDE_TYPE, PP3WIDE64_TYPE), local_pair_type == LOCALPAIR64_TYPE, local_pair_type == KSG_LOCALPAIR64_TYPE, local_pair_type in (GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE), local_pair_type == GS_LOCALPAIR32_D1_TYPE)
+    train, val = data_loader_cc(args.train1, args.train2, args.train3, args.val, feature_set, args.num_workers, batch_size, args.smart_fen_skipping, args.random_fen_skipping, main_device, args.epoch_size, args.train1_rate, args.train2_rate, args.skiprate, args.mirror, args.ranking_target3, getattr(nnue, "side_input_type", "none"), getattr(nnue, "pair_relation_side_input", False), getattr(nnue, "simple_bucket_mode", "k3k3"), local_pair_type in (PP3WIDE_TYPE, PP3WIDE64_TYPE), local_pair_type == LOCALPAIR64_TYPE, local_pair_type == KSG_LOCALPAIR64_TYPE, local_pair_type in (GS_LOCALPAIR64_TYPE, GS_LOCALPAIR32_TYPE), local_pair_type == GS_LOCALPAIR32_D1_TYPE, args.simple_bucket_execution if simple_architecture else "mask")
 
   torch.set_float32_matmul_precision('high')
   interrupt_controller.install()
