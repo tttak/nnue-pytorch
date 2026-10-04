@@ -28,6 +28,7 @@ from simple_quant_hysteresis import (
     DEFAULT_COOLDOWN, DEFAULT_BAND, DEFAULT_MARGIN,
 )
 from simple_training_compatibility import validate_hysteresis_options
+import simple_head_shared_factor as head_shared
 
 import model as complex_model
 from simple_pp3wide import (
@@ -843,6 +844,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         simple_localpair64_table_nonzero_rate=0.05,
         simple_localpair64_proj_nonzero_rate=0.05,
         simple_localpair64_seed=122,
+        enable_fc1_shared_factor=False,
+        enable_output_shared_factor=False,
+        enforce_head_shared_resume_match=False,
         **unused,
     ):
         super().__init__()
@@ -1167,6 +1171,24 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                     "simple_quant_boundary_output_weight",
                     "enforce_quant_boundary_resume_match"):
                 self.hparams.pop(key, None)
+
+        self.enforce_head_shared_resume_match = bool(enforce_head_shared_resume_match)
+        self.fc1_shared_factor = None
+        self.fc2_shared_factor = None
+        self.set_head_shared_factors(enable_fc1_shared_factor, enable_output_shared_factor)
+
+    def set_head_shared_factors(self, fc1, output):
+        if (fc1 or output) and (self.simple_quant_boundary_reg != "off"
+                                or self.simple_qat_hysteresis != "off"):
+            raise ValueError("Simple head shared factors require boundary/hysteresis OFF")
+        head_shared.set_mode(self, "fc1", bool(fc1))
+        head_shared.set_mode(self, "fc2", bool(output))
+        self.hparams["enable_fc1_shared_factor"] = bool(fc1)
+        self.hparams["enable_output_shared_factor"] = bool(output)
+
+    def head_shared_settings(self):
+        return {"fc1": getattr(self, "fc1_shared_factor", None) is not None,
+                "output": getattr(self, "fc2_shared_factor", None) is not None}
 
     def architecture_metadata(self, transplant_source=None, mapping_version=None):
         use_side_input = bool(getattr(self, "use_side_input", False))
@@ -1801,6 +1823,10 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         """Apply the dense int8 serializer range before the forward pass."""
         captured = {}
         for group in self.weight_clipping:
+            layer_name = {"FC0": "fc0", "FC1": "fc1", "Output": "fc2"}.get(group["name"])
+            if layer_name is not None:
+                # Recompute effective tensors, never retain a stale parametrization result.
+                group["params"] = [getattr(s, layer_name).weight for s in self.layer_stacks]
             low = float(group["min_weight"])
             high = float(group["max_weight"])
             if capture:
@@ -1808,8 +1834,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                     [p.detach().reshape(-1) for p in group["params"]])
                 outside_low = flat < low
                 outside_high = flat > high
-            for parameter in group["params"]:
-                parameter.clamp_(low, high)
+            if layer_name is not None:
+                for stack in self.layer_stacks:
+                    head_shared.clip_effective(getattr(stack, layer_name), low, high)
+            else:
+                for parameter in group["params"]:
+                    parameter.clamp_(low, high)
             if capture:
                 clipped = flat.clamp(low, high)
                 eps = 0.5 / HIDDEN_WEIGHT_SCALE
@@ -2079,11 +2109,11 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 biases = torch.cat([layer.bias.detach().reshape(-1)
                                     for layer in layers])
                 weight_grads = [
-                    layer.weight.grad.detach().reshape(-1)
-                    for layer in layers if layer.weight.grad is not None]
+                    head_shared.original(layer, "weight").grad.detach().reshape(-1)
+                    for layer in layers if head_shared.original(layer, "weight").grad is not None]
                 bias_grads = [
-                    layer.bias.grad.detach().reshape(-1)
-                    for layer in layers if layer.bias.grad is not None]
+                    head_shared.original(layer, "bias").grad.detach().reshape(-1)
+                    for layer in layers if head_shared.original(layer, "bias").grad is not None]
                 layer_stats[label] = self._layer_stat_row(
                     weights, biases,
                     torch.cat(weight_grads) if weight_grads else None,
@@ -2691,6 +2721,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
     def configure_optimizers(self):
         # A fresh optimizer is intentional for transplanted checkpoints.
         downstream = list(self.layer_stacks.parameters())
+        for shared in (self.fc1_shared_factor, self.fc2_shared_factor):
+            if shared is not None:
+                downstream.extend(shared.parameters())
         if self.side_proj is not None:
             downstream.extend(self.side_proj.parameters())
         if self.shared_psqt is not None:
@@ -2735,6 +2768,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             getattr(self, "transplant_mapping_version", None))
         checkpoint["architecture"] = metadata
         checkpoint["nnue_architecture"] = metadata
+        checkpoint["simple_head_shared_settings"] = self.head_shared_settings()
         if self.simple_qat_hysteresis != "off":
             # Training-only settings, separate from exported architecture/hash.
             checkpoint["quant_hysteresis_settings"] = self.hysteresis_settings()
@@ -2747,6 +2781,9 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 "version": HYSTERESIS_VERSION, "coverage": "touched_only"}
 
     def on_load_checkpoint(self, checkpoint: Dict[str, Any]):
+        saved_shared = checkpoint.get("simple_head_shared_settings", {"fc1": False, "output": False})
+        if self.enforce_head_shared_resume_match and saved_shared != self.head_shared_settings():
+            raise ValueError("Simple head shared training-state mismatch; use --resume-from-model")
         saved_hysteresis = checkpoint.get("quant_hysteresis_settings", {"mode": "off"})
         expected_hysteresis = self.hysteresis_settings()
         mismatch = (saved_hysteresis.get("mode") != self.simple_qat_hysteresis or
@@ -2947,3 +2984,4 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
                 current["shared_psqt.scale"].detach().clone())
         self.transplant_source = metadata.get("transplant_source")
         self.transplant_mapping_version = metadata.get("transplant_mapping_version")
+        head_shared.migrate_state(self, checkpoint["state_dict"])

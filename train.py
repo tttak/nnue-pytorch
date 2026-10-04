@@ -724,6 +724,11 @@ def main():
             "partition + reused GPU indices, exact fast path (Simple default); "
             "mask = legacy/reference. Complex remains mask when omitted. "
             "Not saved in checkpoint architecture; current CLI/default wins on resume."))
+  for name in ("fc1", "output"):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--enable-{name}-shared-factor", dest=f"enable_{name}_shared_factor", action="store_true")
+    group.add_argument(f"--disable-{name}-shared-factor", dest=f"enable_{name}_shared_factor", action="store_false")
+    parser.set_defaults(**{f"enable_{name}_shared_factor": None})
   parser.add_argument(
       "--simple-bucket-migration", choices=("auto", "native", "clone_b08"),
       default="auto",
@@ -938,6 +943,9 @@ def main():
   args = parser.parse_args()
   from simple_bucket_execution import resolve_mode
   args.simple_bucket_execution = resolve_mode(args.simple_bucket_execution, args.architecture)
+  if args.architecture != "halfka_hm2_simple" and any(
+      getattr(args, f"enable_{name}_shared_factor") is not None for name in ("fc1", "output")):
+    raise ValueError("FC1/Output shared factors are Simple-only")
   if args.architecture != "complex" and args.disable_fc0_shared_factor is not None:
     raise ValueError("FC0 shared-factor ablation is Complex-only")
   if args.architecture != "halfka_hm2_simple" and args.simple_bucket_execution != "mask":
@@ -1185,6 +1193,9 @@ def main():
           args.simple_base_bucket_importance
           if simple_architecture else False),
       simple_qat_mode=(simple_qat_mode if simple_architecture else "off"),
+      **({"enable_fc1_shared_factor": bool(args.enable_fc1_shared_factor),
+          "enable_output_shared_factor": bool(args.enable_output_shared_factor)}
+         if simple_architecture else {}),
       simple_quant_boundary_reg=(args.simple_quant_boundary_reg
                                  if simple_architecture else "off"),
       simple_quant_boundary_band=args.simple_quant_boundary_band,
@@ -1570,6 +1581,11 @@ def main():
       if not simple_architecture and args.disable_fc0_shared_factor is not None:
         resume_overrides["disable_fc0_shared_factor"] = args.disable_fc0_shared_factor
       if simple_architecture:
+        for name in ("fc1", "output"):
+          requested = getattr(args, f"enable_{name}_shared_factor")
+          if requested is not None:
+            resume_overrides[f"enable_{name}_shared_factor"] = requested
+        resume_overrides["enforce_head_shared_resume_match"] = bool(args.resume_training_state)
         resume_overrides["use_bucket_importance_base_loss"] = bool(
             args.simple_base_bucket_importance)
         resume_overrides["use_shared_psqt"] = bool(args.use_shared_psqt)
@@ -1817,6 +1833,13 @@ def main():
 
   if simple_architecture:
     # Logging cadence is runtime policy, not part of the network schema.
+    settings = nnue.head_shared_settings()
+    requested = {name: (settings[name] if getattr(args, f"enable_{name}_shared_factor") is None
+                        else getattr(args, f"enable_{name}_shared_factor"))
+                 for name in ("fc1", "output")}
+    if args.resume_training_state and requested != settings:
+      raise ValueError("Simple head shared training-state mismatch; use --resume-from-model")
+    nnue.set_head_shared_factors(requested["fc1"], requested["output"])
     # Apply it uniformly to fresh, weight-only and training-state resumes.
     nnue.simple_debug_log_interval = int(args.simple_debug_log_interval)
     nnue.simple_validation_cohort_report = bool(
