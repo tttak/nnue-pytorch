@@ -898,6 +898,11 @@ def main():
       help=("Relative pair/list contribution when raw and alternate ranking "
             "targets disagree (default: 1.0)."))
   parser.add_argument(
+      "--pairwise-lambda-mode", choices=("coupled", "score_fixed"), default=None,
+      help=("Pairwise target policy: coupled (default for new/legacy models) "
+            "or score_fixed (pairwise only uses lambda=1; base/listwise unchanged). "
+            "Omitted on resume retains checkpoint policy."))
+  parser.add_argument(
       "--consensus-aux-mode", default="none",
       choices=("none", "off", "uniform", "sign", "gap_top", "gap_piecewise"),
       help=("Experiment-only DL-consensus auxiliary mode. 'off' consumes "
@@ -1145,8 +1150,8 @@ def main():
         "pair relation side input requires the C++ training data loader; "
         "remove --py-data")
 
-  start_lambda = args.start_lambda or args.lambda_
-  end_lambda = args.end_lambda or args.lambda_
+  start_lambda = args.lambda_ if args.start_lambda is None else args.start_lambda
+  end_lambda = args.lambda_ if args.end_lambda is None else args.end_lambda
   max_epoch = args.max_epochs or 800
   if simple_architecture and simple_any_experimental_path:
     # Model construction happens before the common pl.seed_everything() call
@@ -1874,6 +1879,16 @@ def main():
     print("FC0 shared factor: " + ("folded independent (shared zero/frozen)"
           if getattr(nnue, "disable_fc0_shared_factor", False) else "shared + specific"))
 
+  from pairwise_lambda_policy import set_mode as set_pairwise_lambda_mode
+  saved_pairwise_mode = getattr(nnue, "pairwise_lambda_mode", "coupled")
+  if (args.resume_training_state and args.pairwise_lambda_mode is not None
+      and saved_pairwise_mode != args.pairwise_lambda_mode):
+    raise ValueError(
+        "pairwise lambda mode mismatch for training-state resume; "
+        "use --resume-from-model to change the training contract")
+  set_pairwise_lambda_mode(
+      nnue, args.pairwise_lambda_mode or saved_pairwise_mode)
+  print(f"Pairwise lambda mode: {nnue.pairwise_lambda_mode}")
   nnue.ranking_disagreement_weight = args.ranking_disagreement_weight
   if (args.ranking_target3
       and (args.consensus_aux_mode == "none"

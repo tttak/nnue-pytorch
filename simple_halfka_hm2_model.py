@@ -847,6 +847,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         enable_fc1_shared_factor=False,
         enable_output_shared_factor=False,
         enforce_head_shared_resume_match=False,
+        pairwise_lambda_mode="coupled",
         **unused,
     ):
         super().__init__()
@@ -1009,6 +1010,8 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
             SimpleStack(side_dim)
             for _ in range(LAYER_STACKS))
         self.start_lambda = float(start_lambda)
+        from pairwise_lambda_policy import set_mode
+        set_mode(self, pairwise_lambda_mode)
         self.end_lambda = float(end_lambda)
         self.max_epoch = int(max_epoch)
         self.lr = float(lr)
@@ -1660,8 +1663,12 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         sorted_data = self._prepare_sorted_data(
             ranking_indices, target, qf, score, ranking_target,
             ranking_score, pred_cp, bucket.view(-1).long(), material, ply)
+        from pairwise_lambda_policy import prepare
+        pairwise_data = prepare(
+            self, sorted_data, self._lambda(), ranking_indices, pf, ranking_pf,
+            qf, score, ranking_score, pred_cp, bucket.view(-1).long(), material, ply)
         pair_loss, pair_metrics = self._compute_pairwise_loss(
-            sorted_data, ranking_indices.numel(), pred_cp.device,
+            pairwise_data, ranking_indices.numel(), pred_cp.device,
             collect_metrics=(not self.training or self._simple_debug_capture))
         listwise_loss, pt_range = self._compute_listwise_loss(
             sorted_data, ranking_indices.numel(), pred_cp.device)

@@ -1384,7 +1384,7 @@ class NNUE(pl.LightningModule):
         if getattr(self, "ema_model", None) is not None:
             self.ema_model = None
 
-    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off", ft_stats_after_mode="periodic", disable_fc0_shared_factor=False):
+    def __init__(self, feature_set, start_lambda=1.0, end_lambda=1.0, max_epoch=800, gamma=0.992, lr=8.75e-4, epoch_size=100_000_000, batch_size=16384, in_scaling=240, out_scaling=280, offset=270, offset1=270, offset2=270, adjust_loss=0.1, remove_abs_sqr_l2=True, remove_main_sqr_l2=False, phase_output_dimensions=None, l3_dimensions=L3, cross_output_dimensions=COMPACT128_CROSS_OUTPUT_DIMENSIONS, l2_fm_diff_indices=COMPACT128_FM_DIFF_UNITS, l2_fm_abs_raw_indices=COMPACT128_FM_ABS_RAW_UNITS, lca_qk_indices=None, lca_value_indices=None, ft_optimizer="adamw8bit", other_optimizer="adamw8bit", enforce_optimizer_checkpoint_match=False, freeze_ft_router=False, optimizer_layout=None, reinit_groups=None, reinit_seed=None, side_input_type="none", side_input_dim=8, side_input_fusion="l2_residual", safe_escape_experiment=False, pair_relation_side_input=False, pair_relation_schema_version=PAIR_RELATION_SCHEMA_VERSION, complex_fm_diff_shared="off", ft_stats_after_mode="periodic", disable_fc0_shared_factor=False, pairwise_lambda_mode="coupled"):
         super(NNUE, self).__init__()
         self.set_ft_stats_after_mode(ft_stats_after_mode)
         # Optional training-only attenuation for pairs whose raw teacher and
@@ -1502,6 +1502,8 @@ class NNUE(pl.LightningModule):
             self.save_hyperparameters({"complex_fm_diff_shared": self.complex_fm_diff_shared})
         self.set_fc0_shared_factor_disabled(disable_fc0_shared_factor)
         self.start_lambda = start_lambda
+        from pairwise_lambda_policy import set_mode
+        set_mode(self, pairwise_lambda_mode)
         self.end_lambda = end_lambda
         self.gamma = gamma
         self.lr = lr
@@ -2995,6 +2997,7 @@ class NNUE(pl.LightningModule):
                 )
             else:
                 ranking_pt = pt
+                ranking_pf = pf
 
             consensus_aux_loss = qf.new_zeros(())
             if self.training and self.consensus_aux_mode not in ("none", "off"):
@@ -3169,6 +3172,11 @@ class NNUE(pl.LightningModule):
                 ply,
             )
         self.print_mem("After Prepare Sorted Data")
+        from pairwise_lambda_policy import prepare
+        pairwise_data = prepare(
+            self, sorted_data, actual_lambda, pairwise_indices, pf, ranking_pf,
+            qf, score, ranking_score if use_alternate_ranking else score,
+            scorenet, active_indices, material, ply)
 
         collect_pair_metrics = (
             (self.training and self.global_step % 500 == 0)
@@ -3177,7 +3185,7 @@ class NNUE(pl.LightningModule):
 
         with torch.profiler.record_function("NNUE/pairwise_loss"):
             pairwise_loss, pair_metrics = self._compute_pairwise_loss(
-                sorted_data,
+                pairwise_data,
                 n_pairwise,
                 pt.device,
                 collect_metrics=collect_pair_metrics,
