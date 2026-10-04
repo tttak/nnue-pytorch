@@ -1399,7 +1399,7 @@ class SimpleHalfKAHM2NNUE(pl.LightningModule):
         psqt_shortcut = (transformed.new_empty(transformed.shape[0])
                          if collect and self.use_shared_psqt else None)
         metadata = getattr(layer_stack_indices, METADATA_ATTRIBUTE, None)
-        if getattr(self, "simple_bucket_execution", DEFAULT_MODE) == "index_reuse" and metadata is not None:
+        if getattr(self, "simple_bucket_execution", DEFAULT_MODE) in ("index_reuse", "grouped_reuse") and metadata is not None:
             out = execute_heads(self, transformed, side_h, pp_fc0_residual,
                                 metadata, collect, out, diagnostic_parts,
                                 psqt_deep, psqt_shortcut)

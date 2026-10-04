@@ -719,9 +719,10 @@ def main():
       choices=("k3k3", "phase9", "kingfree_tree"), default="k3k3",
       help="Simple 9-stack routing contract (Experiment 130).")
   parser.add_argument(
-      "--simple-bucket-execution", choices=("mask", "index_reuse"), default=None,
-      help=("Simple-only process-local execution: index_reuse = stable CPU bucket "
-            "partition + reused GPU indices, exact fast path (Simple default); "
+      "--simple-bucket-execution", choices=("mask", "index_reuse", "grouped_reuse"), default=None,
+      help=("Simple-only process-local execution: grouped_reuse = stable CPU "
+            "partition + one-gather/split/restore (Simple default); "
+            "index_reuse = per-head gather/restore fallback; "
             "mask = legacy/reference. Complex remains mask when omitted. "
             "Not saved in checkpoint architecture; current CLI/default wins on resume."))
   for name in ("fc1", "output"):
@@ -949,7 +950,7 @@ def main():
   if args.architecture != "complex" and args.disable_fc0_shared_factor is not None:
     raise ValueError("FC0 shared-factor ablation is Complex-only")
   if args.architecture != "halfka_hm2_simple" and args.simple_bucket_execution != "mask":
-    raise ValueError("--simple-bucket-execution index_reuse is Simple-only")
+    raise ValueError("--simple-bucket-execution index_reuse/grouped_reuse is Simple-only")
   if args.architecture != "complex" and args.ft_grouped_backward_backend != "sort":
     raise ValueError("--ft-grouped-backward-backend count_prefix is Complex-only")
   from feature_transformer import set_grouped_backward_backend
